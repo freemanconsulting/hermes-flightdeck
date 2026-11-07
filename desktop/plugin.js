@@ -501,17 +501,18 @@ function ServerCard({ server, models, labels, now }) {
             value: server.prefill_tps != null ? `${fmtRate(server.prefill_tps)} tok/s` : '—',
             title: 'prompt tokens processed per second before the first token'
           }),
-          wholeResponse
-            ? jsx(Metric, {
-                label: 'latency p50',
-                value: fmtMs(latency),
-                title: 'request duration (median) — this server returns whole responses'
-              })
-            : jsx(Metric, {
-                label: 'p50 TTFT',
-                value: fmtMs(ttft),
-                title: 'time to first token (median)'
-              }),
+          jsx(Metric, {
+            label: 'latency p50',
+            value: fmtMs(latency),
+            title: 'request duration (median)'
+          }),
+          jsx(Metric, {
+            label: 'TTFT p50',
+            value: fmtMs(ttft),
+            title: `${wholeResponse
+              ? 'time to first token (median) — not applicable: this server returns whole responses'
+              : 'time to first token (median)'}${busiest && busiest.provider_aliases && busiest.provider_aliases.length > 1 ? ` · providers: ${busiest.provider_aliases.join(', ')}` : ''}`
+          }),
           jsx(Metric, {
             label: 'in flight',
             value: server.in_flight != null ? server.in_flight : '—',
@@ -640,17 +641,18 @@ function CloudCard({ model, labels, now, windowSeconds }) {
             value: model.requests_1m != null ? model.requests_1m : '—',
             title: 'requests per minute in the window'
           }),
-          wholeResponse
-            ? jsx(Metric, {
-                label: 'latency p50',
-                value: fmtMs(model.latency_ms_p50),
-                title: 'request duration (median) — this lane returns whole responses'
-              })
-            : jsx(Metric, {
-                label: 'p50 TTFT',
-                value: fmtMs(model.ttft_ms_p50),
-                title: 'time to first token (median)'
-              }),
+          jsx(Metric, {
+            label: 'latency p50',
+            value: fmtMs(model.latency_ms_p50),
+            title: 'request duration (median)'
+          }),
+          jsx(Metric, {
+            label: 'TTFT p50',
+            value: fmtMs(model.ttft_ms_p50),
+            title: wholeResponse
+              ? 'time to first token (median) — not applicable: this lane returns whole responses'
+              : 'time to first token (median)'
+          }),
           jsx(Metric, {
             label: 'decode',
             value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—',
@@ -731,9 +733,12 @@ function NoServerCard({ model, labels, now }) {
           }),
           jsx('span', {
             className: 'text-[0.8125rem] font-semibold tracking-tight text-(--ui-text-primary)',
+            title: model.provider_aliases && model.provider_aliases.length > 1
+              ? `providers: ${model.provider_aliases.join(', ')}`
+              : undefined,
             children: `${model.provider} / ${model.model}`
           }),
-          jsx(Badge, { variant: 'outline', size: 'xs', children: 'no server gauge' }),
+          jsx(Badge, { variant: 'outline', size: 'xs', children: 'no server metrics' }),
           jsx('span', {
             className: 'ml-auto truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
             children: model.base_url
@@ -754,17 +759,18 @@ function NoServerCard({ model, labels, now }) {
             value: model.requests_1m != null ? model.requests_1m : '—',
             title: 'requests per minute in the window'
           }),
-          wholeResponse
-            ? jsx(Metric, {
-                label: 'latency p50',
-                value: fmtMs(model.latency_ms_p50),
-                title: 'request duration (median) — this lane returns whole responses'
-              })
-            : jsx(Metric, {
-                label: 'p50 TTFT',
-                value: fmtMs(model.ttft_ms_p50),
-                title: 'time to first token (median)'
-              }),
+          jsx(Metric, {
+            label: 'latency p50',
+            value: fmtMs(model.latency_ms_p50),
+            title: 'request duration (median)'
+          }),
+          jsx(Metric, {
+            label: 'TTFT p50',
+            value: fmtMs(model.ttft_ms_p50),
+            title: wholeResponse
+              ? 'time to first token (median) — not applicable: this lane returns whole responses'
+              : 'time to first token (median)'
+          }),
           jsx(Metric, {
             label: 'decode',
             value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—',
@@ -1175,7 +1181,8 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
   const unreachable = Array.isArray(snapshot.unreachable) ? snapshot.unreachable : []
   const source = snapshot.servers_source || 'none'
   const cloud = models.filter(model => model.lane === 'cloud')
-  const orphan = models.filter(model => model.lane !== 'cloud' && !model.server_name)
+  const orphan = models.filter(model => model.lane !== 'cloud' &&
+    (model.metrics === 'none' || !model.server_name))
   const queued = servers.reduce((sum, server) => sum + (server.waiting || 0), 0)
   const used = servers.reduce((sum, server) => sum + (server.running || 0), 0)
   const total = servers.reduce((sum, server) => sum + (server.slots || 0), 0)
@@ -1279,8 +1286,8 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
         : null,
       orphan.length
         ? jsx(Section, {
-            label: 'No server',
-            meta: 'base_url matches no declared server',
+            label: 'Local · no server metrics',
+            meta: 'private base_url with no server card',
             children: jsx('div', {
               className: 'grid gap-2 xl:grid-cols-2',
               children: orphan.map(model => jsx(NoServerCard, { model, labels, now }, model.key))

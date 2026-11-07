@@ -12,10 +12,26 @@ import ipaddress
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
+
+try:  # plugin loader: package context
+    from ._siblings import load as _load_sibling
+except ImportError:  # loaded standalone by path (dashboard, plugin_api)
+    import importlib.util as _util
+    _siblings_module = sys.modules.get("flightdeck__siblings")
+    if _siblings_module is None:
+        _spec = _util.spec_from_file_location(
+            "flightdeck__siblings", Path(__file__).resolve().parent / "_siblings.py")
+        if _spec is None or _spec.loader is None:
+            raise ImportError("cannot load flightdeck _siblings.py")
+        _siblings_module = _util.module_from_spec(_spec)
+        sys.modules["flightdeck__siblings"] = _siblings_module
+        _spec.loader.exec_module(_siblings_module)
+    _load_sibling = _siblings_module.load
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +273,31 @@ def _union_servers(sources: list[tuple[str, dict]], *, declared: bool) -> list[d
                             "base_url": base_url,
                             "kind": "auto",
                         })
+            # Auxiliary lanes are private endpoints too, and often the only
+            # place a small local model appears (e.g. 127.0.0.1:18436).
+            auxiliary = data.get("auxiliary")
+            if isinstance(auxiliary, dict):
+                for key, entry in auxiliary.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    urls = [entry.get("base_url")]
+                    chain = entry.get("fallback_chain")
+                    if isinstance(chain, list):
+                        for item in chain:
+                            if isinstance(item, dict):
+                                urls.append(item.get("base_url"))
+                    for api in urls:
+                        if not api or not _private_url(api):
+                            continue
+                        base_url = normalize_base_url(api)
+                        if base_url:
+                            entries.append({
+                                "name": str(key),
+                                "title": None,
+                                "key": str(key),
+                                "base_url": base_url,
+                                "kind": "auto",
+                            })
         for entry in entries:
             base_url = entry.get("base_url") or ""
             if not base_url:
@@ -311,10 +352,7 @@ def discover(conn: Any = None, *, config: Optional[dict] = None,
     """
     moment = float(now if now is not None else time.time())
     if conn is not None:
-        try:
-            from . import store as _store
-        except ImportError:
-            import store as _store
+        _store = _load_sibling("store", __package__)
         cached = _store.meta_get(conn, DISCOVERY_CACHE_KEY)
         if cached:
             try:

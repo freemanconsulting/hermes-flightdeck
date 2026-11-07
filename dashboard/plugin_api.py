@@ -13,6 +13,7 @@ through ``_load_sibling`` — never a bare ``import api`` that only works in tes
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import time
 from contextlib import contextmanager
@@ -21,12 +22,26 @@ from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Query
 
+logger = logging.getLogger("flightdeck")
+_WARN_AT = 0.0
+WARN_INTERVAL_SECONDS = 60.0
+
 _ROOT = Path(__file__).resolve().parent.parent
 _MODULES: dict[str, Any] = {}
 _LAST_SWEEP = 0.0
 SWEEP_INTERVAL_SECONDS = 60.0
 
 router = APIRouter()
+
+
+def _warn(message: str) -> None:
+    """WARNING at most once a minute: a broken sibling must not spam the log."""
+    global _WARN_AT
+    moment = time.monotonic()
+    if moment - _WARN_AT < WARN_INTERVAL_SECONDS:
+        return
+    _WARN_AT = moment
+    logger.warning(message, exc_info=True)
 
 
 def _load_sibling(name: str) -> Any:
@@ -80,7 +95,7 @@ def _settings(conn: Any) -> dict:
         try:
             return dict(config.load(conn=conn))
         except Exception:
-            pass
+            _warn("flightdeck: settings load failed; serving an empty server list")
     return {"servers": [], "poll_interval_seconds": 5, "probe_timeout_seconds": 2.0}
 
 
@@ -115,8 +130,8 @@ def _maybe_sweep(conn: Any) -> None:
         store.sweep(conn, retention_hours=settings.get("retention_hours", 24),
                     rollup_days=settings.get("rollup_days", 7))
     except Exception:
-        # A sweep failure must never fail the page.
-        pass
+        # A sweep failure must never fail the page, but it must not vanish.
+        _warn("flightdeck: store sweep failed")
 
 
 @router.get("/snapshot")

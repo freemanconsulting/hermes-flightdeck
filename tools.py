@@ -8,7 +8,24 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+from pathlib import Path
 from typing import Any, Optional
+
+try:  # plugin loader: package context
+    from ._siblings import load as _load_sibling
+except ImportError:  # loaded standalone by path (dashboard, plugin_api)
+    import importlib.util as _util
+    _siblings_module = sys.modules.get("flightdeck__siblings")
+    if _siblings_module is None:
+        _spec = _util.spec_from_file_location(
+            "flightdeck__siblings", Path(__file__).resolve().parent / "_siblings.py")
+        if _spec is None or _spec.loader is None:
+            raise ImportError("cannot load flightdeck _siblings.py")
+        _siblings_module = _util.module_from_spec(_spec)
+        sys.modules["flightdeck__siblings"] = _siblings_module
+        _spec.loader.exec_module(_siblings_module)
+    _load_sibling = _siblings_module.load
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +33,7 @@ _WINDOWS = {"1m": 60, "5m": 300}
 
 
 def _api():
-    try:
-        from . import api as _module
-    except ImportError:
-        import api as _module
-    return _module
+    return _load_sibling("api", __package__)
 
 
 def _window_seconds(window: Any) -> int:

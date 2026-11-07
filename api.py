@@ -410,6 +410,30 @@ def _request_row(row: dict) -> dict:
     }
 
 
+def _is_private_url(base_url: str | None) -> bool:
+    """Loopback/RFC1918/link-local endpoint: a local lane even with no card."""
+    config = _config_module()
+    if config is None:
+        return False
+    try:
+        return bool(config.is_private_host(urllib.parse.urlsplit(str(base_url or "")).hostname))
+    except ValueError:
+        return False
+
+
+def _lane_for(base_url: str | None, server_by_url: dict[str, dict]) -> str:
+    """``local`` or ``cloud``: a server card decides, else the address does.
+
+    A private or loopback base_url is a local lane even when no server card
+    matched (the server may be declared in another profile or only in
+    ``auxiliary``); it then renders as "no server metrics", never as cloud.
+    """
+    card = server_by_url.get(normalize_base_url(base_url))
+    if card is not None:
+        return "local" if card.get("kind") != "cloud" else "cloud"
+    return "local" if _is_private_url(base_url) else "cloud"
+
+
 def _server_name_for(base_url: str | None, server_by_url: dict[str, dict],
                      provider: str | None) -> str:
     card = server_by_url.get(normalize_base_url(base_url))
@@ -436,17 +460,26 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
     bucket_count = max(1, int(window_seconds) // bucket_seconds)
     since = now - float(window_seconds)
     groups: dict[tuple, list[dict]] = {}
+    aliases: dict[tuple, list[str]] = {}
     for row in rows:
-        groups.setdefault(
-            (row.get("model") or "", row.get("provider") or "", normalize_base_url(row.get("base_url"))),
-            [],
-        ).append(row)
+        base_url = normalize_base_url(row.get("base_url"))
+        provider = str(row.get("provider") or "")
+        # Local lanes group by endpoint + model: callers report different
+        # provider names for the same local server (custom vs studio-ds4).
+        # Cloud lanes keep the provider in the key; it is their identity.
+        lane = _lane_for(base_url, server_by_url)
+        key = (row.get("model") or "", "" if lane == "local" else provider, base_url)
+        groups.setdefault(key, []).append(row)
+        if lane == "local" and provider and provider not in aliases.setdefault(key, []):
+            aliases[key].append(provider)
 
     cards = []
-    for (model, provider, base_url), items in groups.items():
+    for (model, key_provider, base_url), items in groups.items():
         server = server_by_url.get(base_url)
+        lane = _lane_for(base_url, server_by_url)
+        provider_aliases = aliases.get((model, key_provider, base_url), [])
+        provider = key_provider or (provider_aliases[0] if provider_aliases else "")
         server_name = _server_name_for(base_url, server_by_url, provider)
-        lane = "local" if server is not None and server.get("kind") != "cloud" else "cloud"
 
         in_flight = sum(1 for row in items if row.get("status") == "in-flight")
         requests_1m = sum(1 for row in items if (_num(row.get("started_at")) or 0) >= now - 60)
@@ -540,9 +573,11 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
             "key": f"{server_name}|{model}",
             "model": model,
             "provider": provider,
+            "provider_aliases": provider_aliases,
             "base_url": base_url,
             "server_name": server_name,
-            "kind": server.get("kind") if server is not None else "cloud",
+            "kind": server.get("kind") if server is not None else ("local" if lane == "local" else "cloud"),
+            "metrics": "server" if server is not None else "none",
             "lane": lane,
             "in_flight": in_flight,
             "requests_1m": requests_1m,

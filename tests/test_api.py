@@ -81,7 +81,8 @@ def test_snapshot_shape_is_pinned(conn):
 
     ds4_model = model(payload, f"ds4|{make_example.DS4_MODEL}")
     assert list(ds4_model) == [
-        "key", "model", "provider", "base_url", "server_name", "kind", "lane", "in_flight",
+        "key", "model", "provider", "provider_aliases", "base_url", "server_name", "kind", "metrics",
+        "lane", "in_flight",
         "requests_1m", "requests_5m", "errors_5m", "errors_429_5m", "streamed", "non_streamed",
         "requests_buckets", "ttft_ms_p50", "ttft_ms_p95", "latency_ms_p50", "latency_ms_p95",
         "decode_tps", "prefill_tps", "rate_kind", "tokens", "slots", "agents", "quota",
@@ -547,3 +548,39 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
     assert module.request_detail("default|4242|d1")["derived"]["ttft_ms"] == 200.0
     assert asyncio.run(module.health())["rows"] == 11
     assert asyncio.run(module.refresh()) == {"ok": True, "probed": 3}
+
+
+# --- lane classification and provider aliasing -------------------------------
+
+def test_private_url_without_a_server_card_is_a_local_lane(conn):
+    make_example.insert_request(
+        conn, id="default|4242|aux1", session_id="s1", api_request_id="aux1",
+        model="Qwen3.5-9B", provider="aux", base_url="http://127.0.0.1:18436/v1",
+        started_at=NOW - 10, status="in-flight",
+    )
+    payload = snapshot(conn)
+    card = next(item for item in payload["models"] if item["model"] == "Qwen3.5-9B")
+    assert card["lane"] == "local"
+    assert card["metrics"] == "none"
+    assert card["server_name"] == "aux"
+    assert not any(item["model"] == "Qwen3.5-9B" and item["lane"] == "cloud"
+                   for item in payload["models"])
+
+
+def test_local_lanes_group_by_base_url_and_model_not_provider(conn):
+    for index, provider in enumerate(("custom", "studio-ds4")):
+        make_example.insert_request(
+            conn, id=f"default|4242|p{index}", session_id="s1", api_request_id=f"p{index}",
+            model="ds4", provider=provider, base_url="http://127.0.0.1:18012/v1",
+            started_at=NOW - 20 - index, status="in-flight",
+        )
+    studio = {"name": "studio-ds4", "base_url": "http://127.0.0.1:18012", "kind": "tensorfold",
+              "healthy": True, "models": ["ds4"], "running": 1, "waiting": 0, "slots": 4,
+              "decode_tps": None, "prefill_tps": None,
+              "sampled_at": api._now_iso(NOW), "error": None}
+    payload = snapshot(conn, servers=make_example.server_samples() + [studio])
+    cards = [item for item in payload["models"] if item["base_url"] == "http://127.0.0.1:18012"]
+    assert len(cards) == 1
+    assert cards[0]["server_name"] == "studio-ds4"
+    assert cards[0]["provider_aliases"] == ["custom", "studio-ds4"]
+    assert cards[0]["in_flight"] == 2

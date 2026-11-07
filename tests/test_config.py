@@ -133,3 +133,27 @@ providers:
         assert config.discover(conn, now=111.0)[0]["name"] == "late"
     finally:
         conn.close()
+
+
+def test_discover_collects_auxiliary_private_base_urls(tmp_path, monkeypatch):
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", """
+providers:
+  main:
+    api: http://127.0.0.1:18010/v1
+    name: ds4
+auxiliary:
+  vision:
+    base_url: http://127.0.0.1:18436/v1
+    fallback_chain:
+      - base_url: http://192.168.1.60:18011/v1
+      - base_url: https://api.openai.com/v1
+""")
+
+    servers = config.discover(config=None)
+
+    assert [server["base_url"] for server in servers] == [
+        "http://127.0.0.1:18010", "http://127.0.0.1:18436", "http://192.168.1.60:18011",
+    ]
+    assert servers[1]["name"] == "vision"
+    assert servers[2]["name"] == "vision"

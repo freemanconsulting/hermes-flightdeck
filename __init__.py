@@ -10,9 +10,14 @@ from __future__ import annotations
 import logging
 
 try:  # plugin loader: package context with the plugin dir on __path__
-    from . import hooks, schemas, store, tools
+    from ._siblings import load as _load_sibling
 except ImportError:  # imported as a top-level module (tests, tooling)
-    import hooks, schemas, store, tools
+    from _siblings import load as _load_sibling
+
+hooks = _load_sibling("hooks", __package__)
+schemas = _load_sibling("schemas", __package__)
+store = _load_sibling("store", __package__)
+tools = _load_sibling("tools", __package__)
 
 logger = logging.getLogger(__name__)
 

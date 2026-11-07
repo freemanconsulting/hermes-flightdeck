@@ -15,8 +15,25 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import sys
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
+
+try:  # plugin loader: package context
+    from ._siblings import load as _load_sibling
+except ImportError:  # loaded standalone by path (dashboard, plugin_api)
+    import importlib.util as _util
+    _siblings_module = sys.modules.get("flightdeck__siblings")
+    if _siblings_module is None:
+        _spec = _util.spec_from_file_location(
+            "flightdeck__siblings", Path(__file__).resolve().parent / "_siblings.py")
+        if _spec is None or _spec.loader is None:
+            raise ImportError("cannot load flightdeck _siblings.py")
+        _siblings_module = _util.module_from_spec(_spec)
+        sys.modules["flightdeck__siblings"] = _siblings_module
+        _spec.loader.exec_module(_siblings_module)
+    _load_sibling = _siblings_module.load
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +97,7 @@ def _wrap(ctx: Any, conn: Any, fn: Callable[..., Any]) -> Callable[..., None]:
 
 def register_all(ctx: Any, conn: Any, settings: Optional[dict] = None) -> list:
     """Register the seven observer hooks; returns the registration handles."""
-    try:
-        from . import store as _store
-    except ImportError:
-        import store as _store
+    _store = _load_sibling("store", __package__)
     handlers = {
         "pre_api_request": _store.record_pre,
         "post_api_request": _store.record_post,
