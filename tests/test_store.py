@@ -329,3 +329,27 @@ def test_meta_roundtrip(conn):
     store.meta_set(conn, "last_sweep", 123.5)
     assert store.meta_get(conn, "last_sweep") == "123.5"
     assert store.meta_get(conn, "missing", "fallback") == "fallback"
+
+
+def test_sweep_twice_is_idempotent_over_overlapping_rows(conn):
+    """A second sweep re-aggregates buckets it already rolled up: upsert, not crash."""
+    # Two requests in one minute (bucket 1) and one in the next (bucket 2).
+    for request_id, started_at in (("a", NOW - 3700), ("b", NOW - 3695), ("c", NOW - 3650)):
+        store.record_pre(conn, **pre_kwargs(api_request_id=request_id, started_at=started_at))
+        store.record_post(conn, **post_kwargs(
+            api_request_id=request_id, started_at=started_at,
+            first_chunk_at=started_at + 0.2, ended_at=started_at + 1.5))
+
+    first = store.sweep(conn, retention_hours=24, now=NOW)
+    rows_first = conn.execute(
+        "SELECT * FROM rollups_minute ORDER BY bucket_ts").fetchall()
+    second = store.sweep(conn, retention_hours=24, now=NOW)
+    rows_second = conn.execute(
+        "SELECT * FROM rollups_minute ORDER BY bucket_ts").fetchall()
+
+    assert first["rolled_up"] == second["rolled_up"] == 2  # two minute buckets
+    assert [tuple(row) for row in rows_second] == [tuple(row) for row in rows_first]
+    assert [row["requests"] for row in rows_second] == [2, 1]
+    assert sum(row["prompt_tokens"] for row in rows_second) == 3 * 1600
+    assert sum(row["completion_sum"] for row in rows_second) == 3 * 200
+    assert sum(row["ttft_count"] for row in rows_second) == 3

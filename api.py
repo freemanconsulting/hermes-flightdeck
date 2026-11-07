@@ -352,6 +352,8 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
         cards.append({
             "name": sample.get("name") or _host_port(base_url),
             "title": sample.get("title"),
+            "aux": sample.get("aux"),
+            "roles": list(sample.get("roles") or []),
             "base_url": base_url,
             "kind": sample.get("kind") or "unknown",
             "healthy": None if healthy is None else bool(healthy),

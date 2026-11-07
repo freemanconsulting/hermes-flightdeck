@@ -149,6 +149,18 @@ def _probeable(server: dict[str, Any]) -> bool:
     return base_url.startswith("http://") or base_url.startswith("https://")
 
 
+def _apply_server_fields(sample: dict[str, Any], server: dict[str, Any]) -> None:
+    """The server entry owns the card label, tooltip and aux flag; a probe's name
+    is a model id or a URL and must never overwrite them (DESIGN §7.2)."""
+    if server.get("name"):
+        sample["name"] = server["name"]
+    if server.get("title"):
+        sample["title"] = server["title"]
+    if server.get("aux"):
+        sample["aux"] = True
+        sample["roles"] = list(server.get("roles") or [])
+
+
 async def _one(server: dict[str, Any], ttl: float, timeout: float,
                 conn: sqlite3.Connection | None) -> tuple[str, dict[str, Any]]:
     base_url = (server.get("base_url") or "").rstrip("/")
@@ -156,17 +168,14 @@ async def _one(server: dict[str, Any], ttl: float, timeout: float,
     async with lock:
         cached = _CACHE.get(base_url)
         if cached is not None and (time.monotonic() - cached["at"]) < ttl:
-            return base_url, cached["sample"]
+            sample = dict(cached["sample"])
+            _apply_server_fields(sample, server)
+            return base_url, sample
 
         snap = await asyncio.to_thread(_servers_module().probe, base_url, timeout)
         sample = _sample_dict(snap)
         sample["base_url"] = base_url
-        # The server entry owns the card label and tooltip; a probe's name is a
-        # model id or a URL and must never overwrite them (DESIGN §7.2).
-        if server.get("name"):
-            sample["name"] = server["name"]
-        if server.get("title"):
-            sample["title"] = server["title"]
+        _apply_server_fields(sample, server)
         _derive_rates(_LAST.get(base_url), sample)
         _LAST[base_url] = sample
         _CACHE[base_url] = {"at": time.monotonic(), "sample": sample}

@@ -6,10 +6,12 @@ helper), so the expected numbers are fixed and readable.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -67,10 +69,12 @@ def test_snapshot_shape_is_pinned(conn):
 
     ds4 = card(payload, "ds4")
     assert list(ds4) == [
-        "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
+        "name", "title", "aux", "roles", "base_url", "kind", "healthy", "models", "running",
+        "waiting", "slots",
         "decode_tps", "prefill_tps", "in_flight", "unattributed", "over_attributed",
         "agents", "requests", "samples", "error", "sampled_at",
     ]
+    assert ds4["aux"] is None and ds4["roles"] == []
     assert ds4["title"].startswith("Studio DeepSeek")
     assert ds4["base_url"] == DS4
     assert ds4["in_flight"] == 3
@@ -637,3 +641,36 @@ def test_hidden_servers_never_render(conn):
     assert [card["name"] for card in payload["servers"]] == ["ds4", "anthropic"]
     assert payload["hidden_servers"] == ["GN100"]
     assert not any(model["server_name"] == "GN100" for model in payload["models"])
+
+
+def test_aux_server_card_keeps_the_aux_flag_and_roles(conn):
+    """The desktop badge reads ``server.aux``; the flag must survive the card build."""
+    helper = {"name": "qwen3.5-9b", "title": "helper model for: skills_hub · 127.0.0.1:18436",
+              "aux": True, "roles": ["skills_hub"], "base_url": "http://127.0.0.1:18436",
+              "kind": "llamacpp", "healthy": True, "models": ["Qwen3.5-9B"],
+              "running": 0, "waiting": 0, "slots": 4, "decode_tps": None, "prefill_tps": None,
+              "sampled_at": api._now_iso(NOW), "error": None}
+    payload = snapshot(conn, servers=make_example.server_samples() + [helper])
+
+    card_ = card(payload, "qwen3.5-9b")
+    assert card_["aux"] is True
+    assert card_["roles"] == ["skills_hub"]
+    assert card(payload, "ds4")["aux"] is None  # a provider card is not an aux card
+
+
+def test_poller_cache_hit_still_applies_the_aux_fields():
+    """A cached probe sample is reused, but the server entry still owns aux/name."""
+    base_url = "http://127.0.0.1:18436"
+    poller._CACHE[base_url] = {"at": time.monotonic(),
+                               "sample": {"base_url": base_url, "name": "probe-name"}}
+    try:
+        _, sample = asyncio.run(poller._one(
+            {"base_url": base_url, "name": "qwen3.5-9b", "title": "helper model for: skills_hub",
+             "aux": True, "roles": ["skills_hub"]},
+            ttl=5, timeout=1, conn=None))
+    finally:
+        poller._CACHE.pop(base_url, None)
+
+    assert sample["name"] == "qwen3.5-9b"
+    assert sample["aux"] is True
+    assert sample["roles"] == ["skills_hub"]

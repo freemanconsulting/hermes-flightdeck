@@ -503,15 +503,26 @@ def close_stale(conn: sqlite3.Connection, stale_after: float = 300.0,
 # ─── sweep: rollups + retention ─────────────────────────────────────────────
 
 
-_ROLLUP_SQL = """
-INSERT INTO rollups_minute (
-  bucket_ts, profile, model, provider, base_url, kind, requests, errors, errors_429,
-  prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens,
-  ttft_sum_ms, ttft_count, decode_ms_sum, decode_ms_count, completion_sum
+_ROLLUP_COLUMNS = (
+    "bucket_ts", "profile", "model", "provider", "base_url", "kind", "requests", "errors",
+    "errors_429", "prompt_tokens", "cached_tokens", "completion_tokens", "reasoning_tokens",
+    "ttft_sum_ms", "ttft_count", "decode_ms_sum", "decode_ms_count", "completion_sum",
 )
+
+# A sweep re-aggregates every finished minute still in ``requests``, so a bucket
+# it already rolled up comes back with the same (or corrected) totals.  The
+# insert must therefore be an upsert: a plain INSERT hits the rollups_minute
+# primary key on the second sweep and crashes the whole sweep.
+_ROLLUP_UPSERT_SET = ",\n  ".join(
+    f"{column} = excluded.{column}" for column in _ROLLUP_COLUMNS[5:]
+)
+
+_ROLLUP_SQL = f"""
+INSERT INTO rollups_minute ({', '.join(_ROLLUP_COLUMNS)})
 SELECT
   CAST(started_at / 60 AS INTEGER) * 60 AS bucket_ts,
-  profile, COALESCE(model, '') AS model, provider, base_url,
+  profile, COALESCE(model, '') AS model,
+  COALESCE(provider, '') AS provider, COALESCE(base_url, '') AS base_url,
   CASE WHEN COUNT(DISTINCT kind) = 1 THEN MIN(kind) ELSE 'mixed' END AS kind,
   COUNT(*) AS requests,
   SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
@@ -527,7 +538,10 @@ SELECT
   SUM(COALESCE(completion_tokens, 0))
 FROM requests
 WHERE status IN ('done', 'error', 'abandoned') AND started_at < ?
-GROUP BY bucket_ts, profile, model, provider, base_url
+GROUP BY bucket_ts, profile, COALESCE(model, ''), COALESCE(provider, ''),
+         COALESCE(base_url, '')
+ON CONFLICT(bucket_ts, profile, model, provider, base_url) DO UPDATE SET
+  {_ROLLUP_UPSERT_SET}
 """
 
 

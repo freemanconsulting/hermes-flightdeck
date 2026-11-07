@@ -1,5 +1,6 @@
 """Machine-wide discovery: every profile's config.yaml, not just the active one."""
 
+import json
 from pathlib import Path
 
 import config
@@ -203,3 +204,61 @@ auxiliary:
 
     assert servers[0]["name"] == "studio-ds4"
     assert "aux" not in servers[0]
+
+
+# The real machine's auxiliary block: provider `custom`, a GGUF model name and
+# `/v1` base_urls, with the same endpoint shared by many role keys.
+_REAL_AUX_ROLES = (
+    "skills_hub", "approval", "mcp", "title_generation", "tts_audio_tags",
+    "triage_specifier", "profile_describer", "monitor", "web_extract",
+    "flush_memories", "session_search",
+)
+
+
+def _real_auxiliary_yaml() -> str:
+    lanes = "\n".join(
+        f"  {role}:\n    provider: custom\n    model: Qwen3.5-9B.Q6_K.gguf\n"
+        f"    base_url: http://127.0.0.1:18436/v1\n    api_key: ''\n    timeout: 30"
+        for role in _REAL_AUX_ROLES
+    )
+    return "auxiliary:\n" + lanes + "\n"
+
+
+def test_auxiliary_custom_provider_lanes_name_the_model_once(tmp_path, monkeypatch):
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", _real_auxiliary_yaml())
+
+    servers = config.discover(config=None)
+
+    helper = [server for server in servers if server["base_url"] == "http://127.0.0.1:18436"]
+    assert len(helper) == 1  # one endpoint, one card, however many roles use it
+    assert helper[0]["name"] == "qwen3.5-9b"  # the model, never the role key
+    assert helper[0]["aux"] is True
+    assert helper[0]["roles"] == list(_REAL_AUX_ROLES)
+    assert helper[0]["title"] == (
+        "helper model for: " + ", ".join(_REAL_AUX_ROLES) + " · 127.0.0.1:18436"
+    )
+
+
+def test_stale_discovery_cache_shape_is_ignored(tmp_path, monkeypatch):
+    """A cache row from an older build (role-key name, no aux/roles) is not served."""
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", _real_auxiliary_yaml())
+    conn = store.open_store(root / "requests.db")
+    try:
+        stale = {"at": 100.0, "servers": [{
+            "name": "skills_hub", "title": None, "key": "skills_hub",
+            "base_url": "http://127.0.0.1:18436", "kind": "auto",
+            "profiles": ["default"],
+        }]}
+        store.meta_set(conn, config.DISCOVERY_CACHE_KEY, json.dumps(stale))
+
+        servers = config.discover(conn, now=100.5)  # inside the 60 s TTL
+
+        assert servers[0]["name"] == "qwen3.5-9b"
+        assert servers[0]["aux"] is True
+        payload = json.loads(store.meta_get(conn, config.DISCOVERY_CACHE_KEY))
+        assert payload["version"] == config.DISCOVERY_CACHE_VERSION
+        assert payload["servers"][0]["name"] == "qwen3.5-9b"
+    finally:
+        conn.close()

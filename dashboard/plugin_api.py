@@ -34,14 +34,25 @@ SWEEP_INTERVAL_SECONDS = 60.0
 router = APIRouter()
 
 
-def _warn(message: str) -> None:
-    """WARNING at most once a minute: a broken sibling must not spam the log."""
+def _warn(message: str, exc: BaseException | None = None) -> None:
+    """WARNING at most once a minute: a broken sibling must not spam the log.
+
+    The exception is passed in explicitly rather than relying on the ambient
+    ``sys.exc_info()``: a second failure outside an ``except`` block would log
+    ``NoneType: None`` at best, and a logging backend that subscripts the
+    exception tuple turns that into a TypeError.  Logging must never raise out
+    of a handled failure.
+    """
     global _WARN_AT
     moment = time.monotonic()
     if moment - _WARN_AT < WARN_INTERVAL_SECONDS:
         return
     _WARN_AT = moment
-    logger.warning(message, exc_info=True)
+    info = (type(exc), exc, exc.__traceback__) if exc is not None else None
+    try:
+        logger.warning(message, exc_info=info)
+    except Exception:
+        pass
 
 
 def _load_sibling(name: str) -> Any:
@@ -94,8 +105,8 @@ def _settings(conn: Any) -> dict:
     if config is not None:
         try:
             return dict(config.load(conn=conn))
-        except Exception:
-            _warn("flightdeck: settings load failed; serving an empty server list")
+        except Exception as exc:
+            _warn("flightdeck: settings load failed; serving an empty server list", exc)
     return {"servers": [], "poll_interval_seconds": 5, "probe_timeout_seconds": 2.0}
 
 
@@ -129,9 +140,9 @@ def _maybe_sweep(conn: Any) -> None:
     try:
         store.sweep(conn, retention_hours=settings.get("retention_hours", 24),
                     rollup_days=settings.get("rollup_days", 7))
-    except Exception:
+    except Exception as exc:
         # A sweep failure must never fail the page, but it must not vanish.
-        _warn("flightdeck: store sweep failed")
+        _warn("flightdeck: store sweep failed", exc)
 
 
 @router.get("/snapshot")

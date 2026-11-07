@@ -37,7 +37,8 @@ except ImportError:  # loaded standalone by path (dashboard, plugin_api)
 logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "flightdeck"
-DISCOVERY_CACHE_KEY = "discovery_cache"
+DISCOVERY_CACHE_VERSION = 2
+DISCOVERY_CACHE_KEY = f"discovery_cache:v{DISCOVERY_CACHE_VERSION}"
 DISCOVERY_TTL_SECONDS = 60.0
 DISCOVERY_EMPTY_TTL_SECONDS = 10.0
 ROOT_PROFILE_LABEL = "default"
@@ -422,6 +423,34 @@ def _settings_from_ctx(ctx: Any) -> dict:
     return settings
 
 
+def _cached_discovery_servers(payload: Any) -> Optional[list[dict]]:
+    """Validate a cached discovery payload; ``None`` means "ignore the cache".
+
+    The cache row is written by whichever build the live dashboard loaded, so
+    a payload from an older build (e.g. auxiliary rows named after the role key
+    with no ``aux``/``roles``) must never be served.  The key is versioned and
+    the shape is checked: both guards are needed because a stale row can be
+    rewritten by an old process still running in the background.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != DISCOVERY_CACHE_VERSION:
+        return None
+    servers = payload.get("servers")
+    if not isinstance(servers, list):
+        return None
+    for server in servers:
+        if not isinstance(server, dict):
+            return None
+        if not str(server.get("base_url") or "").strip():
+            return None
+        if not str(server.get("name") or "").strip():
+            return None
+        if server.get("aux") and not server.get("roles"):
+            return None
+    return servers
+
+
 def discover(conn: Any = None, *, config: Optional[dict] = None,
              now: Optional[float] = None) -> list[dict]:
     """Provider base_urls from every profile's config; private addresses only.
@@ -433,24 +462,27 @@ def discover(conn: Any = None, *, config: Optional[dict] = None,
     config shows up quickly.
     """
     moment = float(now if now is not None else time.time())
+    _store = None
     if conn is not None:
         _store = _load_sibling("store", __package__)
         cached = _store.meta_get(conn, DISCOVERY_CACHE_KEY)
         if cached:
             try:
                 payload = json.loads(cached)
-                cached_servers = list(payload.get("servers") or [])
-                age = moment - float(payload.get("at", 0))
-                ttl = DISCOVERY_TTL_SECONDS if cached_servers else DISCOVERY_EMPTY_TTL_SECONDS
-                if age < ttl:
-                    return cached_servers
+                cached_servers = _cached_discovery_servers(payload)
+                if cached_servers is not None:
+                    age = moment - float(payload.get("at", 0))
+                    ttl = (DISCOVERY_TTL_SECONDS if cached_servers
+                           else DISCOVERY_EMPTY_TTL_SECONDS)
+                    if age < ttl:
+                        return cached_servers
             except (TypeError, ValueError, AttributeError):
                 pass
     servers = _union_servers(_config_sources(config), declared=False)
-    if conn is not None:
+    if _store is not None:
         try:
-            _store.meta_set(conn, DISCOVERY_CACHE_KEY,
-                            json.dumps({"at": moment, "servers": servers}))
+            _store.meta_set(conn, DISCOVERY_CACHE_KEY, json.dumps(
+                {"version": DISCOVERY_CACHE_VERSION, "at": moment, "servers": servers}))
         except Exception:
             logger.debug("flightdeck: discovery cache write failed", exc_info=True)
     return servers
