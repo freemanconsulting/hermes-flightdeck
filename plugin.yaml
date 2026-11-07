@@ -1,0 +1,58 @@
+name: flightdeck
+version: "0.1.0"
+description: "Live air-traffic control for Hermes agents and model servers: see every agent, subagent and cron run talking to a model right now, which model and server it is on, and how loaded each local model server is (slots in use, queue, prefill/decode tok/s, time to first token) — by agent and by model. Observer hooks write request rows to one shared local SQLite store; a poller reads each configured server's metrics; the Desktop plugin renders the fleet; fleet_status lets the agent pick a lane with free capacity."
+author: "Nous Research"
+provides_tools:
+  - fleet_status
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_auxiliary_call
+  - post_auxiliary_call
+  - subagent_start
+  - subagent_stop
+config_schema:
+  servers:
+    type: array
+    description: "Model servers to poll, per profile. Empty means auto-discover from the profile's provider list (private addresses only)."
+    items:
+      type: object
+      properties:
+        name:
+          type: string
+        base_url:
+          type: string
+        kind:
+          type: string
+          enum: [auto, tensorfold, vllm, sglang, llamacpp, ollama, openai, cloud]
+          default: auto
+      required: [base_url]
+  auto_discover:
+    type: boolean
+    default: true
+  poll_interval_seconds:
+    type: integer
+    default: 5
+    minimum: 2
+  probe_timeout_seconds:
+    type: number
+    default: 2.0
+  stale_after_seconds:
+    type: integer
+    default: 300
+  retention_hours:
+    type: integer
+    default: 24
+  rollup_days:
+    type: integer
+    default: 7
+  show_cloud:
+    type: boolean
+    default: true
+  show_chip:
+    type: boolean
+    default: true
+  show_quota:
+    type: boolean
+    default: true

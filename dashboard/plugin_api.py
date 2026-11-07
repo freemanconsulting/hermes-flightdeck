@@ -1,0 +1,174 @@
+"""Flightdeck dashboard backend, mounted at ``/api/plugins/flightdeck/`` (DESIGN §9).
+
+Thin: parse the query, call ``api.py``, return.  Handlers that only touch SQLite
+are plain ``def`` (FastAPI runs them in its threadpool); the poller path is
+``async`` so a probe never blocks the threadpool.  No websocket in v1.
+
+The mount imports this file standalone by path (``hermes_cli.web_server_dashboard``:
+``spec_from_file_location`` -> ``exec_module`` -> ``app.include_router(router,
+prefix="/api/plugins/flightdeck")``), so plugin-root siblings are loaded by path
+through ``_load_sibling`` — never a bare ``import api`` that only works in tests.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+from fastapi import APIRouter, HTTPException, Query
+
+_ROOT = Path(__file__).resolve().parent.parent
+_MODULES: dict[str, Any] = {}
+_LAST_SWEEP = 0.0
+SWEEP_INTERVAL_SECONDS = 60.0
+
+router = APIRouter()
+
+
+def _load_sibling(name: str) -> Any:
+    """Load a plugin-root module by path, once, under a plugin-scoped name."""
+    module = _MODULES.get(name)
+    if module is not None:
+        return module
+    module_name = f"flightdeck_{name}"
+    module = sys.modules.get(module_name)
+    if module is None:
+        path = _ROOT / f"{name}.py"
+        if not path.exists():
+            return None
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    _MODULES[name] = module
+    return module
+
+
+def _api() -> Any:
+    module = _load_sibling("api")
+    if module is None:
+        raise HTTPException(status_code=503, detail="flightdeck api.py is unavailable")
+    return module
+
+
+@contextmanager
+def _conn() -> Iterator[Any]:
+    """One store connection per request, closed when the handler returns."""
+    store = _load_sibling("store")
+    if store is None:
+        raise HTTPException(status_code=503, detail="flightdeck store.py is unavailable")
+    conn = store.open_store()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _window_seconds(window: str | None) -> int:
+    return 60 if (window or "").strip() == "1m" else 300
+
+
+def _settings(conn: Any) -> dict:
+    config = _load_sibling("config")
+    if config is not None:
+        try:
+            return dict(config.load(conn=conn))
+        except Exception:
+            pass
+    return {"servers": [], "poll_interval_seconds": 5, "probe_timeout_seconds": 2.0}
+
+
+async def _poll(conn: Any, *, force: bool = False) -> dict:
+    poller = _load_sibling("poller")
+    if poller is None:
+        return {}
+    settings = _settings(conn)
+    servers = list(settings.get("servers") or [])
+    if not servers:
+        return {}
+    if force:
+        poller.clear_cache()
+    return await poller.poll(
+        servers, ttl=settings.get("poll_interval_seconds", 5),
+        timeout=settings.get("probe_timeout_seconds", 2.0), conn=conn,
+    )
+
+
+def _maybe_sweep(conn: Any) -> None:
+    """Retention at most once per 60 s from the backend (DESIGN §9.2)."""
+    global _LAST_SWEEP
+    moment = time.monotonic()
+    if moment - _LAST_SWEEP < SWEEP_INTERVAL_SECONDS:
+        return
+    _LAST_SWEEP = moment
+    store = _load_sibling("store")
+    if store is None or not hasattr(store, "sweep"):
+        return
+    settings = _settings(conn)
+    try:
+        store.sweep(conn, retention_hours=settings.get("retention_hours", 24),
+                    rollup_days=settings.get("rollup_days", 7))
+    except Exception:
+        # A sweep failure must never fail the page.
+        pass
+
+
+@router.get("/snapshot")
+async def snapshot(window: str = Query("5m", description="1m or 5m")):
+    """The page's one call: full §9.1 payload."""
+    seconds = _window_seconds(window)
+    with _conn() as conn:
+        _maybe_sweep(conn)
+        samples = await _poll(conn)
+        return _api().build_snapshot(seconds, servers=samples, conn=conn)
+
+
+@router.get("/agents")
+def agents(window: str = Query("5m", description="1m or 5m")):
+    with _conn() as conn:
+        return _api().build_agents(_window_seconds(window), conn=conn)
+
+
+@router.get("/models")
+async def models(window: str = Query("5m", description="1m or 5m")):
+    with _conn() as conn:
+        samples = await _poll(conn)
+        return _api().build_models(_window_seconds(window), servers=samples, conn=conn)
+
+
+@router.get("/servers")
+async def servers():
+    """Chip call: server cards only, no hook join."""
+    with _conn() as conn:
+        samples = await _poll(conn)
+        return _api().build_servers(servers=samples, conn=conn)
+
+
+@router.get("/request/{request_id}")
+def request_detail(request_id: str):
+    with _conn() as conn:
+        payload = _api().build_request(request_id, conn=conn)
+    if payload.get("request") is None:
+        raise HTTPException(status_code=404, detail="request not found")
+    return payload
+
+
+@router.get("/health")
+async def health():
+    with _conn() as conn:
+        samples = await _poll(conn)
+        return _api().build_health(conn=conn, samples=samples)
+
+
+@router.post("/refresh")
+async def refresh():
+    """Explicit click only: force a probe past the TTL."""
+    with _conn() as conn:
+        samples = await _poll(conn, force=True)
+        return {"ok": True, "probed": len(samples)}

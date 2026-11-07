@@ -1,0 +1,329 @@
+{
+  "generated_at": 1794076800.0,
+  "window": {
+    "seconds": 300,
+    "since": 1794076500.0
+  },
+  "totals": {
+    "in_flight": 6,
+    "requests_1m": 6,
+    "requests_5m": 11,
+    "errors_5m": 1
+  },
+  "servers": [
+    {
+      "name": "ds4",
+      "base_url": "http://127.0.0.1:18010",
+      "kind": "tensorfold",
+      "healthy": true,
+      "models": [
+        "qwen38-27b-q4-q8kv-mtp3"
+      ],
+      "running": 3,
+      "waiting": 0,
+      "slots": 4,
+      "decode_tps": 42.1,
+      "prefill_tps": 3100.0,
+      "in_flight": 3,
+      "unattributed": 0,
+      "over_attributed": 0,
+      "agents": [
+        {
+          "profile": "default",
+          "session_id": "s1",
+          "label": "",
+          "kind": "session",
+          "model": "qwen38-27b-q4-q8kv-mtp3",
+          "requests": 2,
+          "oldest_started_at": 1794076788.0
+        },
+        {
+          "profile": "default",
+          "session_id": "s2",
+          "label": "",
+          "kind": "subagent",
+          "model": "qwen38-27b-q4-q8kv-mtp3",
+          "requests": 1,
+          "oldest_started_at": 1794076791.0
+        }
+      ],
+      "samples": [
+        [
+          1794076790.0,
+          40.2,
+          2900.0
+        ],
+        [
+          1794076795.0,
+          42.1,
+          3100.0
+        ],
+        [
+          1794076800.0,
+          42.1,
+          3100.0
+        ]
+      ],
+      "error": null,
+      "sampled_at": "2026-11-07T18:40:00Z"
+    },
+    {
+      "name": "GN100",
+      "base_url": "http://127.0.0.1:18009",
+      "kind": "tensorfold",
+      "healthy": true,
+      "models": [
+        "qwen38-flash-next-tf-fp4"
+      ],
+      "running": 5,
+      "waiting": 2,
+      "slots": 5,
+      "decode_tps": 18.4,
+      "prefill_tps": 900.0,
+      "in_flight": 2,
+      "unattributed": 3,
+      "over_attributed": 0,
+      "agents": [
+        {
+          "profile": "default",
+          "session_id": "s1",
+          "label": "",
+          "kind": "session",
+          "model": "qwen38-flash-next-tf-fp4",
+          "requests": 1,
+          "oldest_started_at": 1794076770.0
+        },
+        {
+          "profile": "default",
+          "session_id": "cron-nightly-1",
+          "label": "",
+          "kind": "cron",
+          "model": "qwen38-flash-next-tf-fp4",
+          "requests": 1,
+          "oldest_started_at": 1794076780.0
+        }
+      ],
+      "samples": [
+        [
+          1794076790.0,
+          17.0,
+          850.0
+        ],
+        [
+          1794076795.0,
+          18.4,
+          900.0
+        ],
+        [
+          1794076800.0,
+          18.4,
+          900.0
+        ]
+      ],
+      "error": null,
+      "sampled_at": "2026-11-07T18:40:00Z"
+    },
+    {
+      "name": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "kind": "cloud",
+      "healthy": null,
+      "models": [],
+      "running": null,
+      "waiting": null,
+      "slots": null,
+      "decode_tps": null,
+      "prefill_tps": null,
+      "in_flight": 1,
+      "unattributed": null,
+      "over_attributed": null,
+      "agents": [
+        {
+          "profile": "default",
+          "session_id": "s1",
+          "label": "",
+          "kind": "session",
+          "model": "claude-opus-5-5",
+          "requests": 1,
+          "oldest_started_at": 1794076794.0
+        }
+      ],
+      "samples": [],
+      "error": null,
+      "sampled_at": "2026-11-07T18:40:00Z"
+    }
+  ],
+  "models": [
+    {
+      "key": "ds4|qwen38-27b-q4-q8kv-mtp3",
+      "model": "qwen38-27b-q4-q8kv-mtp3",
+      "provider": "main-llm",
+      "base_url": "http://127.0.0.1:18010",
+      "server_name": "ds4",
+      "kind": "tensorfold",
+      "lane": "local",
+      "in_flight": 3,
+      "requests_1m": 3,
+      "requests_5m": 6,
+      "errors_5m": 1,
+      "errors_429_5m": 1,
+      "ttft_ms_p50": 100.0,
+      "ttft_ms_p95": 200.0,
+      "decode_tps": 42.1,
+      "prefill_tps": 3100.0,
+      "rate_kind": "decode",
+      "tokens": {
+        "prompt": 18000,
+        "cached": 14000,
+        "completion": 1200,
+        "reasoning": 0
+      },
+      "slots": {
+        "used": 3,
+        "total": 4,
+        "queue": 0
+      },
+      "agents": [
+        {
+          "profile": "default",
+          "session_id": "s1",
+          "label": "",
+          "in_flight": 2
+        },
+        {
+          "profile": "default",
+          "session_id": "s2",
+          "label": "",
+          "in_flight": 1
+        }
+      ],
+      "quota": null
+    },
+    {
+      "key": "GN100|qwen38-flash-next-tf-fp4",
+      "model": "qwen38-flash-next-tf-fp4",
+      "provider": "gn100",
+      "base_url": "http://127.0.0.1:18009",
+      "server_name": "GN100",
+      "kind": "tensorfold",
+      "lane": "local",
+      "in_flight": 2,
+      "requests_1m": 2,
+      "requests_5m": 3,
+      "errors_5m": 0,
+      "errors_429_5m": 0,
+      "ttft_ms_p50": 500.0,
+      "ttft_ms_p95": 500.0,
+      "decode_tps": 18.4,
+      "prefill_tps": 900.0,
+      "rate_kind": "decode",
+      "tokens": {
+        "prompt": 30000,
+        "cached": 24000,
+        "completion": 1500,
+        "reasoning": 0
+      },
+      "slots": {
+        "used": 5,
+        "total": 5,
+        "queue": 2
+      },
+      "agents": [
+        {
+          "profile": "default",
+          "session_id": "cron-nightly-1",
+          "label": "",
+          "in_flight": 1
+        },
+        {
+          "profile": "default",
+          "session_id": "s1",
+          "label": "",
+          "in_flight": 1
+        }
+      ],
+      "quota": null
+    },
+    {
+      "key": "anthropic|claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "server_name": "anthropic",
+      "kind": "cloud",
+      "lane": "cloud",
+      "in_flight": 1,
+      "requests_1m": 1,
+      "requests_5m": 2,
+      "errors_5m": 0,
+      "errors_429_5m": 0,
+      "ttft_ms_p50": 900.0,
+      "ttft_ms_p95": 900.0,
+      "decode_tps": 176.5,
+      "prefill_tps": 6666.7,
+      "rate_kind": "decode",
+      "tokens": {
+        "prompt": 18000,
+        "cached": 12000,
+        "completion": 900,
+        "reasoning": 0
+      },
+      "slots": null,
+      "agents": [
+        {
+          "profile": "default",
+          "session_id": "s1",
+          "label": "",
+          "in_flight": 1
+        }
+      ],
+      "quota": null
+    }
+  ],
+  "agents": [
+    {
+      "profile": "default",
+      "session_id": "s1",
+      "label": "",
+      "kind": "session",
+      "parent_session_id": null,
+      "cron_job": null,
+      "in_flight": 4,
+      "requests_5m": 9,
+      "errors_5m": 1,
+      "models": [
+        "ds4",
+        "anthropic",
+        "GN100"
+      ],
+      "oldest_started_at": 1794076770.0,
+      "children": [
+        {
+          "session_id": "s2",
+          "label": "",
+          "kind": "subagent",
+          "role": "general",
+          "goal": "metrics adapters",
+          "in_flight": 1,
+          "requests_5m": 1
+        }
+      ]
+    },
+    {
+      "profile": "default",
+      "session_id": "cron-nightly-1",
+      "label": "",
+      "kind": "cron",
+      "parent_session_id": null,
+      "cron_job": "nightly-briefing",
+      "in_flight": 1,
+      "requests_5m": 1,
+      "errors_5m": 0,
+      "models": [
+        "GN100"
+      ],
+      "oldest_started_at": 1794076780.0,
+      "children": []
+    }
+  ]
+}

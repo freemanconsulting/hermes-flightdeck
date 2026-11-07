@@ -1,4 +1,4 @@
-"""Fixture-driven tests for flightdeck.servers.
+"""Fixture-driven tests for servers.py (the plugin-root metrics adapter).
 
 Every kind test goes through detect_kind() and normalize() on real captured or
 documented responses; no test reaches into helper internals.  Fixture
@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from flightdeck.servers import (
+from servers import (
     Snapshot,
     detect_kind,
     normalize,
