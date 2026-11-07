@@ -29,6 +29,10 @@ _MODULES: dict[str, Any] = {}
 
 WINDOWS = {"1m": 60, "5m": 300}
 
+#: The one clock every builder defaults to.  Tests monkeypatch this so seeded
+#: rows and handler windows share a moment instead of racing the wall clock.
+_now = time.time
+
 
 # ---------------------------------------------------------------------------
 # Plugin-root sibling loading (same path loader as poller.py / plugin_api.py)
@@ -221,11 +225,15 @@ def _default_servers(conn: sqlite3.Connection | None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _server_cards(samples: list[dict], rows: list[dict], in_flight: list[dict],
+def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list[dict],
                   sample_rows: list[dict], now: float) -> list[dict]:
     by_url: dict[str, list[dict]] = {}
     for row in in_flight:
         by_url.setdefault(normalize_base_url(row.get("base_url")), []).append(row)
+
+    lane_rows: dict[str, list[dict]] = {}
+    for row in request_rows:
+        lane_rows.setdefault(normalize_base_url(row.get("base_url")), []).append(row)
 
     history: dict[str, list[dict]] = {}
     for row in sample_rows:
@@ -276,6 +284,10 @@ def _server_cards(samples: list[dict], rows: list[dict], in_flight: list[dict],
                 entry["oldest_started_at"] = started
 
         in_flight_count = len(held)
+        # The swim-lane's rows: in-flight plus ended in the last 60 s, newest
+        # first, capped per server (DESIGN §9.1).
+        lane = sorted(lane_rows.get(base_url, []),
+                      key=lambda item: _num(item.get("started_at")) or 0, reverse=True)[:50]
         cards.append({
             "name": sample.get("name") or base_url,
             "base_url": base_url,
@@ -291,6 +303,7 @@ def _server_cards(samples: list[dict], rows: list[dict], in_flight: list[dict],
             "unattributed": None if running is None else max(0, running - in_flight_count),
             "over_attributed": None if running is None else max(0, in_flight_count - running),
             "agents": list(held_agents.values()),
+            "requests": [_request_row(row) for row in lane],
             "samples": [[item.get("ts"), item.get("decode_tps"), item.get("prefill_tps")]
                         for item in past[-60:]],
             "error": sample.get("error"),
@@ -305,6 +318,34 @@ def _row_kind(row: dict) -> str:
     if row.get("cron_job_id") or row.get("cron_job_name"):
         return "cron"
     return "session"
+
+
+def _request_rows(conn: sqlite3.Connection, now: float) -> list[dict]:
+    """Rows the swim-lane draws: every in-flight row plus rows ended in the last 60 s."""
+    return _dict_rows(conn.execute(
+        "SELECT * FROM requests WHERE status = 'in-flight' "
+        "OR (ended_at IS NOT NULL AND ended_at >= ?) ORDER BY started_at DESC",
+        (float(now) - 60.0,),
+    ))
+
+
+def _request_row(row: dict) -> dict:
+    """One §9.1 `requests` entry — exactly the shape desktop/plugin.js reads."""
+    return {
+        "id": row.get("id"),
+        "profile": row.get("profile") or "",
+        "session_id": row.get("session_id"),
+        "parent_session_id": row.get("parent_session_id"),
+        "kind": _row_kind(row),
+        "model": row.get("model"),
+        "started_at": _num(row.get("started_at")),
+        "first_chunk_at": _num(row.get("first_chunk_at")),
+        "ended_at": _num(row.get("ended_at")),
+        "status": row.get("status"),
+        "prompt_tokens": _int_or_none(row.get("prompt_tokens")),
+        "cached_tokens": _int_or_none(row.get("cached_tokens")),
+        "completion_tokens": _int_or_none(row.get("completion_tokens")),
+    }
 
 
 def _server_name_for(base_url: str | None, server_by_url: dict[str, dict],
@@ -521,7 +562,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     """The §9.1 snapshot.  ``servers`` is already-polled samples (dict or list);
     None means poll the declared servers synchronously; [] means no server cards."""
     conn = conn if conn is not None else _open_conn()
-    now = time.time() if now is None else float(now)
+    now = _now() if now is None else float(now)
     since = now - float(window_seconds)
 
     if servers is None:
@@ -544,7 +585,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     in_flight = _in_flight_rows(conn)
     sample_rows = _server_samples_since(conn, since)
 
-    server_cards = _server_cards(samples, rows, in_flight, sample_rows, now)
+    server_cards = _server_cards(samples, _request_rows(conn, now), in_flight, sample_rows, now)
     model_cards = _model_cards(rows, server_cards, now)
     agent_nodes = _agent_tree(rows, _subagent_links(conn),
                               {normalize_base_url(card["base_url"]): card for card in server_cards})
@@ -570,7 +611,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
 def build_agents(window_seconds: int = 300, *, conn: sqlite3.Connection | None = None,
                  now: float | None = None) -> dict:
     conn = conn if conn is not None else _open_conn()
-    now = time.time() if now is None else float(now)
+    now = _now() if now is None else float(now)
     rows = _window_rows(conn, now - float(window_seconds))
     return {"agents": _agent_tree(rows, _subagent_links(conn))}
 

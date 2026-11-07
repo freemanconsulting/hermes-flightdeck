@@ -490,6 +490,11 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
       "in_flight": 3, "unattributed": 0, "over_attributed": 0,
       "agents": [{"profile": "default", "session_id": "s1", "label": "", "kind": "session",
                   "model": "qwen38-27b-q4-q8kv-mtp3", "requests": 2, "oldest_started_at": 1762540759.0}],
+      "requests": [{"id": "default|4242|r2", "profile": "default", "session_id": "s1",
+                    "parent_session_id": null, "kind": "session", "model": "qwen38-27b-q4-q8kv-mtp3",
+                    "started_at": 1762540796.0, "first_chunk_at": null, "ended_at": null,
+                    "status": "in-flight", "prompt_tokens": null, "cached_tokens": null,
+                    "completion_tokens": null}],
       "samples": [[1762540740.0, 40.2, 2900.0], [1762540745.0, 42.1, 3100.0]],
       "error": null, "sampled_at": "2026-11-07T16:00:00Z"
     }
@@ -526,6 +531,13 @@ Rules the backend guarantees: `label` is always `""` (the UI fills it from `sess
 `child_goal`); `lane` ∈ `local`|`cloud`; `slots` is `null` for cloud and for kinds without a gauge;
 `quota` is always `null` from the backend (the UI fills it from `session.stats`); numbers are `null` when
 unknown, never `0`-as-unknown.
+
+`requests` (per server card) is the swim-lane's per-request rows: **every in-flight row for that server
+plus every row that ended in the last 60 s**, newest first by `started_at`, capped at 50 per server. Each
+row is `{id, profile, session_id, parent_session_id, kind, model, started_at, first_chunk_at, ended_at,
+status, prompt_tokens, cached_tokens, completion_tokens}`; `kind` ∈ `session`|`subagent`|`cron`; times are
+epoch seconds; token counts are `null` when unknown. Cloud model entries carry no `requests` — the swim-lane
+draws local servers only (`kind !== "cloud"`), so cloud lanes stay hook-derived cards.
 
 ### 9.2 Polling, caching, retention
 

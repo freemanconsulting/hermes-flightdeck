@@ -67,7 +67,7 @@ def test_snapshot_shape_is_pinned(conn):
     assert list(ds4) == [
         "name", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "in_flight", "unattributed", "over_attributed",
-        "agents", "samples", "error", "sampled_at",
+        "agents", "requests", "samples", "error", "sampled_at",
     ]
     assert ds4["base_url"] == DS4
     assert ds4["in_flight"] == 3
@@ -95,6 +95,44 @@ def test_snapshot_shape_is_pinned(conn):
     assert agent["label"] == ""
     assert agent["children"][0]["kind"] == "subagent"
     assert agent["children"][0]["role"] == "general"
+
+
+# --- §9.1 per-request rows (the swim-lane) -----------------------------------
+
+
+def test_server_requests_rows_shape_and_selection(conn):
+    """`requests`: every in-flight row plus rows ended in the last 60 s, newest first."""
+    make_example.insert_request(
+        conn, id="default|4242|d3", session_id="s1", api_request_id="d3",
+        model=make_example.DS4_MODEL, provider="main-llm", base_url=DS4 + "/v1",
+        started_at=NOW - 40, first_chunk_at=NOW - 39.5, ended_at=NOW - 5,
+        status="done", prompt_tokens=1000, cached_tokens=200, completion_tokens=50,
+    )
+    ds4 = card(snapshot(conn), "ds4")
+    rows = ds4["requests"]
+    assert list(rows[0]) == [
+        "id", "profile", "session_id", "parent_session_id", "kind", "model", "started_at",
+        "first_chunk_at", "ended_at", "status", "prompt_tokens", "cached_tokens",
+        "completion_tokens",
+    ]
+    assert [row["id"] for row in rows] == [
+        "default|4242|r2", "default|4242|r3", "default|4242|r1", "default|4242|d3",
+    ]
+    assert rows[0]["profile"] == "default"
+    assert rows[0]["kind"] == "session"
+    assert rows[0]["status"] == "in-flight"
+    assert rows[0]["ended_at"] is None
+    assert rows[0]["first_chunk_at"] is None
+    assert rows[1]["kind"] == "subagent"  # r3 carries subagent_id
+    assert rows[3]["status"] == "done"
+    assert rows[3]["first_chunk_at"] == NOW - 39.5
+    assert (rows[3]["prompt_tokens"], rows[3]["cached_tokens"],
+            rows[3]["completion_tokens"]) == (1000, 200, 50)
+    # d1/d2 ended more than 60 s before NOW; GN100 rows are a different server.
+    ids = [row["id"] for row in rows]
+    assert "default|4242|d1" not in ids and "default|4242|d2" not in ids
+    assert "default|4242|g1" not in ids
+    assert card(snapshot(conn), "GN100")["requests"][0]["id"] == "default|4242|k1"
 
 
 # --- §8 formulas ------------------------------------------------------------
@@ -323,6 +361,9 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
     monkeypatch.setattr(module, "_conn", fake_conn)
     monkeypatch.setattr(module, "_poll", fake_poll)
     monkeypatch.setattr(module, "_maybe_sweep", lambda conn: None)
+    # One clock: the handlers' api module windows on the same moment the rows
+    # were seeded at, instead of racing the wall clock (the old flake).
+    monkeypatch.setattr(module._api(), "_now", lambda: NOW)
 
     payload = asyncio.run(module.snapshot("5m"))
     assert list(payload) == ["generated_at", "window", "totals", "servers", "models", "agents"]

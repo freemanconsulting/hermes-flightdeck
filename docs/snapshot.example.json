@@ -47,6 +47,53 @@
           "oldest_started_at": 1794076791.0
         }
       ],
+      "requests": [
+        {
+          "id": "default|4242|r2",
+          "profile": "default",
+          "session_id": "s1",
+          "parent_session_id": null,
+          "kind": "session",
+          "model": "qwen38-27b-q4-q8kv-mtp3",
+          "started_at": 1794076796.0,
+          "first_chunk_at": null,
+          "ended_at": null,
+          "status": "in-flight",
+          "prompt_tokens": null,
+          "cached_tokens": null,
+          "completion_tokens": null
+        },
+        {
+          "id": "default|4242|r3",
+          "profile": "default",
+          "session_id": "s2",
+          "parent_session_id": "s1",
+          "kind": "subagent",
+          "model": "qwen38-27b-q4-q8kv-mtp3",
+          "started_at": 1794076791.0,
+          "first_chunk_at": null,
+          "ended_at": null,
+          "status": "in-flight",
+          "prompt_tokens": null,
+          "cached_tokens": null,
+          "completion_tokens": null
+        },
+        {
+          "id": "default|4242|r1",
+          "profile": "default",
+          "session_id": "s1",
+          "parent_session_id": null,
+          "kind": "session",
+          "model": "qwen38-27b-q4-q8kv-mtp3",
+          "started_at": 1794076788.0,
+          "first_chunk_at": null,
+          "ended_at": null,
+          "status": "in-flight",
+          "prompt_tokens": null,
+          "cached_tokens": null,
+          "completion_tokens": null
+        }
+      ],
       "samples": [
         [
           1794076790.0,
@@ -103,6 +150,38 @@
           "oldest_started_at": 1794076780.0
         }
       ],
+      "requests": [
+        {
+          "id": "default|4242|k1",
+          "profile": "default",
+          "session_id": "cron-nightly-1",
+          "parent_session_id": null,
+          "kind": "cron",
+          "model": "qwen38-flash-next-tf-fp4",
+          "started_at": 1794076780.0,
+          "first_chunk_at": null,
+          "ended_at": null,
+          "status": "in-flight",
+          "prompt_tokens": null,
+          "cached_tokens": null,
+          "completion_tokens": null
+        },
+        {
+          "id": "default|4242|g1",
+          "profile": "default",
+          "session_id": "s1",
+          "parent_session_id": null,
+          "kind": "session",
+          "model": "qwen38-flash-next-tf-fp4",
+          "started_at": 1794076770.0,
+          "first_chunk_at": null,
+          "ended_at": null,
+          "status": "in-flight",
+          "prompt_tokens": null,
+          "cached_tokens": null,
+          "completion_tokens": null
+        }
+      ],
       "samples": [
         [
           1794076790.0,
@@ -146,6 +225,23 @@
           "model": "claude-opus-5-5",
           "requests": 1,
           "oldest_started_at": 1794076794.0
+        }
+      ],
+      "requests": [
+        {
+          "id": "default|4242|c1",
+          "profile": "default",
+          "session_id": "s1",
+          "parent_session_id": null,
+          "kind": "session",
+          "model": "claude-opus-5-5",
+          "started_at": 1794076794.0,
+          "first_chunk_at": null,
+          "ended_at": null,
+          "status": "in-flight",
+          "prompt_tokens": null,
+          "cached_tokens": null,
+          "completion_tokens": null
         }
       ],
       "samples": [],
