@@ -1,0 +1,1 @@
+{"status": "ok", "model": "qwen38-flash-next-tf-fp4", "model_ids": ["qwen38-flash-next-tf-fp4"], "max_batch_size": 5, "warming": false, "memory": {"active": 98642907936, "cache": 0, "peak": 108580588870}, "live": {"connections": 0, "waiting": 0, "decode_tokens_per_second": 0.0, "prefill_tokens_per_second": 0.0}, "version": "1.1.4", "backend": "cuda", "device": "NVIDIA GB10"}

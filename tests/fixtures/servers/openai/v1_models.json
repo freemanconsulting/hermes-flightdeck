@@ -1,0 +1,17 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen3-8B",
+      "object": "model",
+      "created": 1740000000,
+      "owned_by": "vllm"
+    },
+    {
+      "id": "Qwen/Qwen3-8B-embedding",
+      "object": "model",
+      "created": 1740000000,
+      "owned_by": "vllm"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="Qwen/Qwen3-8B"} 3.0
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="Qwen/Qwen3-8B"} 2.0
+# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model_name="Qwen/Qwen3-8B"} 0.42
+# HELP vllm:prompt_tokens Number of prefill tokens processed.
+# TYPE vllm:prompt_tokens counter
+vllm:prompt_tokens{model_name="Qwen/Qwen3-8B"} 128734.0
+# HELP vllm:prompt_tokens_cached Number of cached prompt tokens (local + external).
+# TYPE vllm:prompt_tokens_cached counter
+vllm:prompt_tokens_cached{model_name="Qwen/Qwen3-8B"} 98012.0
+# HELP vllm:generation_tokens Number of generation tokens processed.
+# TYPE vllm:generation_tokens counter
+vllm:generation_tokens{model_name="Qwen/Qwen3-8B"} 45211.0
+# HELP vllm:prefix_cache_hits Prefix cache hits, in terms of number of cached tokens.
+# TYPE vllm:prefix_cache_hits counter
+vllm:prefix_cache_hits{model_name="Qwen/Qwen3-8B"} 98012.0
+# HELP vllm:request_success Count of successfully processed requests.
+# TYPE vllm:request_success counter
+vllm:request_success{model_name="Qwen/Qwen3-8B"} 812.0
+# HELP vllm:time_to_first_token_seconds Histogram of time to first token in seconds.
+# TYPE vllm:time_to_first_token_seconds histogram
+vllm:time_to_first_token_seconds_sum{model_name="Qwen/Qwen3-8B"} 41.2
+vllm:time_to_first_token_seconds_count{model_name="Qwen/Qwen3-8B"} 812.0

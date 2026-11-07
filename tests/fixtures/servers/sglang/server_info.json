@@ -1,0 +1,14 @@
+{
+  "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+  "tokenizer_path": "meta-llama/Llama-3.1-8B-Instruct",
+  "max_total_num_tokens": 123859,
+  "max_req_input_len": 16384,
+  "max_running_requests": 128,
+  "status": "ready",
+  "startup_time": 12.34,
+  "server_args": {
+    "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+    "tp_size": 1,
+    "port": 30000
+  }
+}

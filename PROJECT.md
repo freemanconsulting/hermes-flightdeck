@@ -26,6 +26,11 @@ cloud) and per-request attribution.
   pages, a status-bar chip ("ds4 3/4 · GN100 5/5 · 2 queued"), and an agent tool `fleet_status` so Hermes can
   pick a lane with free capacity.
 
+## Product direction (Aubrey, 2026-11-07)
+- Hero = local model servers: capacity, queue, prefill/decode, who holds each slot.
+- Cloud lanes (Anthropic, OpenAI/Codex, aux calls like Haiku compression) appear in the same views so the
+  whole ecosystem is visible at once; their numbers come from hook rows only, labeled "Hermes traffic only".
+
 ## Working rules
 - Subagents for this project run on **ds4** (`delegate_task option=general`), per Aubrey 2026-11-07. Not GN100.
 - Repo: local git here (Forgejo post-commit pushes the current branch; never commit on main; work on
