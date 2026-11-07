@@ -181,22 +181,25 @@ def _hermes_root() -> Path:
 
 
 def _read_yaml_config(path: Path) -> dict:
-    """Parse one config.yaml read-only; unreadable or non-mapping files are {}."""
+    """Parse one config.yaml read-only; unreadable or non-mapping files are {}.
+
+    PyYAML is a Hermes dependency, so it is the only parser used. If it is ever
+    missing, skip the YAML profiles rather than importing Hermes core (catalog
+    rule 9: public surfaces only).
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except Exception:
         return {}
     try:
         import yaml
-
+    except ImportError:
+        logger.debug("flightdeck: PyYAML unavailable; skipping %s", path)
+        return {}
+    try:
         data = yaml.safe_load(text)
     except Exception:
-        try:
-            import hermes_yaml as yaml
-
-            data = yaml.safe_load(text)
-        except Exception:
-            return {}
+        return {}
     return data if isinstance(data, dict) else {}
 
 
@@ -346,7 +349,9 @@ def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> d
     source = "declared" if servers else "none"
     if not servers and _as_bool(settings.get("auto_discover"), True):
         servers = discover(conn, now=now)
-        source = "discovered" if servers else "none"
+        # "discovered" even when the search found nothing: the UI needs to tell
+        # "discovery is on and found no servers" from "nothing declared".
+        source = "discovered"
     return {
         "servers": servers,
         "servers_source": source,

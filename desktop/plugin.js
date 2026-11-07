@@ -62,9 +62,15 @@ function fmtMs(value) {
 
 function fmtTokens(value) {
   if (value == null) return '—'
-  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}m`
+  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`
   if (value >= 1000) return `${Math.round(value / 1000)}k`
   return fmtInt(value)
+}
+
+// Token counts carry their unit; M/k keep their case so M never reads as minutes.
+function tokenText(value) {
+  if (value == null) return '—'
+  return `${fmtTokens(value)} tok`
 }
 
 function fmtElapsed(seconds) {
@@ -104,6 +110,11 @@ function fmtAgo(tsSeconds, now) {
   if (s < 60) return `${s}s ago`
   if (s < 3600) return `${Math.round(s / 60)}m ago`
   return `${(s / 3600).toFixed(1)}h ago`
+}
+
+// Real plurals: "1 server", "2 servers" — never "2 server(s)".
+function plural(count, word) {
+  return `${count} ${word}${count === 1 ? '' : 's'}`
 }
 
 function profileTone(name) {
@@ -267,9 +278,10 @@ function Stat({ label, value, tone }) {
   })
 }
 
-function Metric({ label, value, accent }) {
+function Metric({ label, value, accent, title }) {
   return jsxs('span', {
     className: 'inline-flex items-baseline gap-1',
+    title: title || undefined,
     children: [
       jsx('span', { className: 'text-(--ui-text-quaternary)', children: label }),
       jsx('span', {
@@ -370,36 +382,40 @@ function Sparkline({ samples }) {
   })
 }
 
-function MiniRate({ oneMin, fiveMin }) {
-  const avg = fiveMin != null ? fiveMin / 5 : null
-  const max = Math.max(oneMin || 0, avg || 0, 1)
-  const bar = (label, value, tone) =>
-    jsxs(
-      'div',
-      {
-        className: 'flex items-center gap-2 text-[0.6rem]',
-        children: [
-          jsx('span', { className: 'w-10 shrink-0 text-(--ui-text-quaternary)', children: label }),
-          jsx('div', {
-            className: 'h-1.5 flex-1 overflow-hidden rounded-full bg-(--ui-bg-tertiary)',
-            children: jsx('div', {
-              className: cn('h-full rounded-full transition-all duration-500', tone),
-              style: { width: `${Math.max(2, Math.round(((value || 0) / max) * 100))}%` }
-            })
-          }),
-          jsx('span', {
-            className: 'w-8 shrink-0 text-right tabular-nums text-(--ui-text-tertiary)',
-            children: fmtRate(value)
-          })
-        ]
-      },
-      label
-    )
-  return jsxs('div', {
-    className: 'flex flex-col gap-1',
+// Requests per 15 s bucket over the window. Bars, not a gauge: no track, no
+// full-width fill, nothing that can read as utilization when nothing is in flight.
+function RequestSparkline({ buckets }) {
+  const series = useMemo(() => {
+    if (!Array.isArray(buckets) || !buckets.length) return null
+    const max = Math.max(...buckets, 1)
+    const step = 100 / buckets.length
+    const width = Math.max(1, step * 0.62)
+    return buckets.map((count, i) => ({
+      x: i * step + (step - width) / 2,
+      width,
+      height: Math.max(count > 0 ? 1.5 : 0, (count / max) * 18),
+      count
+    }))
+  }, [buckets])
+
+  if (!series) return null
+  return jsxs('svg', {
+    viewBox: '0 0 100 20',
+    preserveAspectRatio: 'none',
+    className: 'h-5 w-full',
+    'aria-hidden': 'true',
     children: [
-      bar('now', oneMin, 'bg-(--ui-accent)'),
-      bar('5m avg', avg, 'bg-(--ui-text-quaternary)')
+      jsx('line', {
+        x1: 0, y1: 19.5, x2: 100, y2: 19.5,
+        stroke: 'var(--ui-stroke-secondary)', strokeWidth: 0.5,
+        vectorEffect: 'non-scaling-stroke'
+      }),
+      series.map(bar =>
+        jsx('rect', {
+          x: bar.x, y: 20 - bar.height, width: bar.width, height: bar.height,
+          fill: 'var(--ui-accent)', opacity: bar.count > 0 ? 0.7 : 0
+        }, `bucket-${bar.x}`)
+      )
     ]
   })
 }
@@ -419,6 +435,10 @@ function ServerCard({ server, models, labels, now }) {
   const serverModels = Array.isArray(models) ? models.filter(m => m.server_name === server.name) : []
   const busiest = serverModels.slice().sort((a, b) => (b.in_flight || 0) - (a.in_flight || 0))[0]
   const ttft = server.ttft_ms_p50 != null ? server.ttft_ms_p50 : busiest ? busiest.ttft_ms_p50 : null
+  const latency = server.latency_ms_p50 != null ? server.latency_ms_p50 : busiest ? busiest.latency_ms_p50 : null
+  // A server whose rows are mostly whole-response has no honest TTFT or decode
+  // rate; its busiest lane's latency is the number to show instead.
+  const wholeResponse = busiest ? (busiest.non_streamed || 0) > (busiest.streamed || 0) : false
 
   return jsxs('article', {
     className: 'flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2.5',
@@ -470,10 +490,33 @@ function ServerCard({ server, models, labels, now }) {
       jsxs('div', {
         className: 'flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[0.6875rem]',
         children: [
-          jsx(Metric, { label: 'decode', value: `${fmtRate(server.decode_tps)} tok/s`, accent: true }),
-          jsx(Metric, { label: 'prefill', value: `${fmtRate(server.prefill_tps)} tok/s` }),
-          jsx(Metric, { label: 'p50 TTFT', value: fmtMs(ttft) }),
-          jsx(Metric, { label: 'in flight', value: server.in_flight != null ? server.in_flight : '—' })
+          jsx(Metric, {
+            label: 'decode',
+            value: server.decode_tps != null ? `${fmtRate(server.decode_tps)} tok/s` : '—',
+            accent: true,
+            title: 'output tokens per second while streaming'
+          }),
+          jsx(Metric, {
+            label: 'prefill',
+            value: server.prefill_tps != null ? `${fmtRate(server.prefill_tps)} tok/s` : '—',
+            title: 'prompt tokens processed per second before the first token'
+          }),
+          wholeResponse
+            ? jsx(Metric, {
+                label: 'latency p50',
+                value: fmtMs(latency),
+                title: 'request duration (median) — this server returns whole responses'
+              })
+            : jsx(Metric, {
+                label: 'p50 TTFT',
+                value: fmtMs(ttft),
+                title: 'time to first token (median)'
+              }),
+          jsx(Metric, {
+            label: 'in flight',
+            value: server.in_flight != null ? server.in_flight : '—',
+            title: 'requests the server counts as running right now'
+          })
         ]
       }),
       jsxs('div', {
@@ -550,12 +593,16 @@ function ServerCard({ server, models, labels, now }) {
   })
 }
 
-function CloudCard({ model, labels, now }) {
+function CloudCard({ model, labels, now, windowSeconds }) {
   const quotaQ = useQuota(model.provider)
   const quota = quotaLine(quotaQ.data, model.provider)
   const plan = planLine(quotaQ.data)
   const inFlight = model.in_flight || 0
   const tokens = model.tokens || {}
+  const streamed = model.streamed || 0
+  const nonStreamed = model.non_streamed || 0
+  const wholeResponse = nonStreamed > streamed
+  const cachedPct = tokens.prompt ? Math.round((tokens.cached || 0) / tokens.prompt * 100) : null
 
   return jsxs('article', {
     className: 'flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2.5',
@@ -582,20 +629,47 @@ function CloudCard({ model, labels, now }) {
       jsxs('div', {
         className: 'flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[0.6875rem]',
         children: [
-          jsx(Metric, { label: 'in flight', value: inFlight, accent: inFlight > 0 }),
-          jsx(Metric, { label: 'req/min', value: model.requests_1m != null ? model.requests_1m : '—' }),
-          jsx(Metric, { label: 'p50 TTFT', value: fmtMs(model.ttft_ms_p50) }),
           jsx(Metric, {
-            label: 'out',
-            value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—'
+            label: 'in flight',
+            value: inFlight,
+            accent: inFlight > 0,
+            title: 'requests running right now'
           }),
           jsx(Metric, {
-            label: 'tokens',
-            value: `in ${fmtTokens(tokens.prompt)}${tokens.cached ? ` (${fmtTokens(tokens.cached)} cached)` : ''} · out ${fmtTokens(tokens.completion)}`
+            label: 'req/min',
+            value: model.requests_1m != null ? model.requests_1m : '—',
+            title: 'requests per minute in the window'
+          }),
+          wholeResponse
+            ? jsx(Metric, {
+                label: 'latency p50',
+                value: fmtMs(model.latency_ms_p50),
+                title: 'request duration (median) — this lane returns whole responses'
+              })
+            : jsx(Metric, {
+                label: 'p50 TTFT',
+                value: fmtMs(model.ttft_ms_p50),
+                title: 'time to first token (median)'
+              }),
+          jsx(Metric, {
+            label: 'decode',
+            value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—',
+            title: 'output tokens per second while streaming'
+          }),
+          jsx(Metric, {
+            label: 'input',
+            value: `${tokenText(tokens.prompt)}${cachedPct ? ` · ${cachedPct}% cached` : ''}`,
+            title: 'prompt tokens sent to the model; cached share was reused, not reprocessed'
+          }),
+          jsx(Metric, {
+            label: 'output',
+            value: tokenText(tokens.completion),
+            title: 'completion tokens generated'
           }),
           jsx(Metric, {
             label: 'errors',
-            value: `${model.errors_5m != null ? model.errors_5m : 0}${model.errors_429_5m ? ` · ${model.errors_429_5m} × 429` : ''}`
+            value: `${model.errors_5m != null ? model.errors_5m : 0}${model.errors_429_5m ? ` · ${model.errors_429_5m} × 429` : ''}`,
+            title: 'failed requests in the window; 429s are rate limits'
           })
         ]
       }),
@@ -611,15 +685,21 @@ function CloudCard({ model, labels, now }) {
       jsxs('div', {
         className: 'flex items-end gap-3 border-t border-(--ui-stroke-secondary) pt-1.5',
         children: [
-          jsx('div', {
-            className: 'min-w-0 flex-1',
-            children: jsx(MiniRate, { oneMin: model.requests_1m, fiveMin: model.requests_5m })
+          jsxs('div', {
+            className: 'min-w-0 flex-1 flex flex-col gap-0.5',
+            children: [
+              jsx('span', {
+                className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+                children: `requests, last ${fmtDuration(windowSeconds)}`
+              }),
+              jsx(RequestSparkline, { buckets: model.requests_buckets })
+            ]
           }),
           jsxs('div', {
             className: 'flex flex-col gap-0.5 text-[0.6rem] text-(--ui-text-quaternary)',
             children: [
               jsx('span', {
-                children: `${model.agents ? model.agents.length : 0} agent(s) holding`
+                children: `${model.agents ? model.agents.length : 0} agent${model.agents && model.agents.length === 1 ? '' : 's'} holding`
               }),
               jsx('span', {
                 children: model.agents && model.agents.length
@@ -637,6 +717,8 @@ function CloudCard({ model, labels, now }) {
 function NoServerCard({ model, labels, now }) {
   const inFlight = model.in_flight || 0
   const tokens = model.tokens || {}
+  const wholeResponse = (model.non_streamed || 0) > (model.streamed || 0)
+  const cachedPct = tokens.prompt ? Math.round((tokens.cached || 0) / tokens.prompt * 100) : null
   return jsxs('article', {
     className: 'flex flex-col gap-2 rounded-lg border border-dashed border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2.5',
     children: [
@@ -661,16 +743,42 @@ function NoServerCard({ model, labels, now }) {
       jsxs('div', {
         className: 'flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[0.6875rem]',
         children: [
-          jsx(Metric, { label: 'in flight', value: inFlight, accent: inFlight > 0 }),
-          jsx(Metric, { label: 'req/min', value: model.requests_1m != null ? model.requests_1m : '—' }),
-          jsx(Metric, { label: 'p50 TTFT', value: fmtMs(model.ttft_ms_p50) }),
           jsx(Metric, {
-            label: 'out',
-            value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—'
+            label: 'in flight',
+            value: inFlight,
+            accent: inFlight > 0,
+            title: 'requests running right now'
           }),
           jsx(Metric, {
-            label: 'tokens',
-            value: `in ${fmtTokens(tokens.prompt)} · out ${fmtTokens(tokens.completion)}`
+            label: 'req/min',
+            value: model.requests_1m != null ? model.requests_1m : '—',
+            title: 'requests per minute in the window'
+          }),
+          wholeResponse
+            ? jsx(Metric, {
+                label: 'latency p50',
+                value: fmtMs(model.latency_ms_p50),
+                title: 'request duration (median) — this lane returns whole responses'
+              })
+            : jsx(Metric, {
+                label: 'p50 TTFT',
+                value: fmtMs(model.ttft_ms_p50),
+                title: 'time to first token (median)'
+              }),
+          jsx(Metric, {
+            label: 'decode',
+            value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—',
+            title: 'output tokens per second while streaming'
+          }),
+          jsx(Metric, {
+            label: 'input',
+            value: `${tokenText(tokens.prompt)}${cachedPct ? ` · ${cachedPct}% cached` : ''}`,
+            title: 'prompt tokens sent to the model; cached share was reused, not reprocessed'
+          }),
+          jsx(Metric, {
+            label: 'output',
+            value: tokenText(tokens.completion),
+            title: 'completion tokens generated'
           })
         ]
       }),
@@ -1027,7 +1135,7 @@ function AgentTree({ agents, labels, now }) {
                 }),
                 jsx('span', {
                   className: 'text-[0.65rem] tabular-nums text-(--ui-text-quaternary)',
-                  children: `${roots.length} session(s) · ${inFlight} in flight · ${requests} req/5m`
+                  children: `${plural(roots.length, 'session')} · ${inFlight} in flight · ${requests} req/5m`
                 })
               ]
             }),
@@ -1065,16 +1173,31 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
   )
   const models = Array.isArray(snapshot.models) ? snapshot.models : []
   const unreachable = Array.isArray(snapshot.unreachable) ? snapshot.unreachable : []
+  const source = snapshot.servers_source || 'none'
   const cloud = models.filter(model => model.lane === 'cloud')
   const orphan = models.filter(model => model.lane !== 'cloud' && !model.server_name)
   const queued = servers.reduce((sum, server) => sum + (server.waiting || 0), 0)
   const used = servers.reduce((sum, server) => sum + (server.running || 0), 0)
   const total = servers.reduce((sum, server) => sum + (server.slots || 0), 0)
+  // One honest sentence for "no cards": servers configured but dead, discovery
+  // on and empty, or nothing declared at all — never "add one" while discovery
+  // is already looking.
+  const noServersText = servers.length
+    ? null
+    : unreachable.length
+      ? `${unreachable.length} local server${unreachable.length === 1 ? '' : 's'} configured, none reachable`
+      : source === 'discovered'
+        ? "No local model servers found in any profile's providers. Declare one under Settings → Plugins → Flightdeck."
+        : 'No local model server declared. Add one under Settings → Plugins → Flightdeck.'
 
   if (!servers.length && !models.length) {
     return jsx(EmptyState, {
-      title: 'No model traffic in the last 5 minutes.',
-      description: 'Declare a model server in Settings → Plugins, or start a session that calls a model.',
+      title: unreachable.length
+        ? 'No local servers reachable.'
+        : source === 'discovered'
+          ? 'No local model servers found.'
+          : 'No model traffic in the last 5 minutes.',
+      description: noServersText || 'Declare a model server in Settings → Plugins, or start a session that calls a model.',
       className: 'py-10'
     })
   }
@@ -1085,8 +1208,8 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
       jsx(Section, {
         label: 'Local servers',
         meta: servers.length
-          ? `${servers.length} server(s) · ${used}/${total} slots · ${queued} queued`
-          : 'none declared',
+          ? `${servers.length} server${servers.length === 1 ? '' : 's'} · ${used}/${total} slots · ${queued} queued`
+          : 'none reachable',
         children: jsxs('div', {
           className: 'flex flex-col gap-2',
           children: [
@@ -1097,7 +1220,7 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
                 })
               : jsx('div', {
                   className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-quaternary)',
-                  children: 'No local model server declared. Add one under Settings → Plugins → Flightdeck.'
+                  children: noServersText
                 }),
             unreachable.length
               ? jsxs('details', {
@@ -1150,7 +1273,7 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
             meta: 'Hermes traffic only — hook rows, no server gauge',
             children: jsx('div', {
               className: 'grid gap-2 xl:grid-cols-2',
-              children: cloud.map(model => jsx(CloudCard, { model, labels, now }, model.key))
+              children: cloud.map(model => jsx(CloudCard, { model, labels, now, windowSeconds }, model.key))
             })
           })
         : null,
@@ -1190,6 +1313,9 @@ function FlightdeckPage() {
   const labelQ = useSessionLabels(profiles)
   const labels = labelQ.data || {}
   const totals = (snapshot && snapshot.totals) || {}
+  const reachableServers = snapshot && Array.isArray(snapshot.servers)
+    ? snapshot.servers.filter(server => server && !server.error).length
+    : 0
 
   const header = jsxs('div', {
     className: 'flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-(--ui-stroke-secondary) px-3 py-2',
@@ -1254,7 +1380,7 @@ function FlightdeckPage() {
       }),
       snapshot
         ? jsx('span', {
-            children: `· ${snapshot.servers ? snapshot.servers.length : 0} server(s) · ${snapshot.models ? snapshot.models.length : 0} model lane(s) · ${snapshot.agents ? snapshot.agents.length : 0} session(s)`
+            children: `· ${plural(reachableServers, 'server')} · ${plural(snapshot.models ? snapshot.models.length : 0, 'lane')} · ${plural(snapshot.agents ? snapshot.agents.length : 0, 'session')}`
           })
         : null,
       jsx('span', {

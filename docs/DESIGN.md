@@ -35,7 +35,7 @@ Flightdeck                                                    By agent | By mode
  └────────────────────────────────────────────────────────────────────────────────────────────┘
  CLOUD LANES (Hermes traffic only)
  ┌ anthropic / claude-opus-5-5 ──────────────────────────────────────────────────────────────┐
- │ 1 in flight  12 req/min  p50 TTFT 900ms  42 tok/s out  0 errors  0 × 429                     │
+ │ 1 in flight  12 req/min  p50 TTFT 900ms  decode 42 tok/s  0 errors  0 × 429                      │
  │ quota: 42/100 req/min, resets in 37s (live session)                                          │
  └────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -391,6 +391,9 @@ in the window is not a card: it goes to `snapshot["unreachable"]` as
 `{name, base_url, error, since}` (`since` = the last good sample's epoch, else the failed probe's
 `sampled_at`). Declared servers always stay in `servers`, reachable or not. `fleet_status` lanes and
 `fleet_status_text` skip unreachable servers; the status chip shows healthy local servers only.
+`/servers` (`build_servers`) applies the same rule and returns `unreachable` too, so a chip or any
+consumer of that endpoint never sees a dead port as a fleet member; the dashboard passes the real
+`servers_source`, so a declared server keeps its card.
 
 ### 7.3 Polling
 
@@ -464,9 +467,12 @@ All times are epoch seconds; all rates are per second unless labelled.
 | Running / waiting | server gauge (`Snapshot.running`, `.waiting`) | local servers only |
 | **Unattributed** | `max(0, running - in_flight_rows_for_base_url)` | the share of server slots no Flightdeck row claims: other profiles without the plugin, other machines, non-Hermes clients. Rendered as a gray row "not observed by Flightdeck". |
 | Over-attributed | `max(0, in_flight_rows - running)` | rows the server does not count (queued, or done-but-not-closed); shown as a footnote, not an error |
-| TTFT | `first_chunk_at - started_at` (ms) | `None` when `first_chunk_at` is null (non-streamed, or aux rows — `auxiliary_hooks.py:143-185` has no first-chunk field) |
+| TTFT | `first_chunk_at - started_at` (ms) | `None` when `first_chunk_at` is null, or when the row is non-streamed (below) — `auxiliary_hooks.py:143-185` has no first-chunk field |
 | Prefill tok/s | `(prompt_tokens - cached_tokens) / TTFT_seconds` | `None` when TTFT ≤ 0 or prompt null; cached prompt is not prefill work |
-| Decode tok/s | `completion_tokens / (ended_at - first_chunk_at)` | `None` when no first chunk; then `completion_tokens / api_duration` with `rate_kind='request'` (whole-request rate, labelled "request rate", never "decode") |
+| **Streamed vs non-streamed** | streamed iff `(ended_at - first_chunk_at) >= 0.25 s` **and** `>= 0.10 × (ended_at - started_at)` | providers that return the whole body at once set `first_chunk_at ≈ ended_at`, so a decode rate there is meaningless; such a row is non-streamed and carries no decode number |
+| Decode tok/s | `completion_tokens / (ended_at - first_chunk_at)` over streamed rows only | `None` when no streamed rows; never `completion_tokens / (ended_at - started_at)` labelled decode |
+| Latency | `ended_at - started_at` (ms) | the honest number for a non-streamed row; p50/p95 over finished rows, shown in place of TTFT when most rows are non-streamed |
+| Requests per 15 s bucket | `COUNT(*) WHERE started_at in [since + 15·i, since + 15·(i+1))` | the cloud card's sparkline; `ceil(window / 15)` buckets, sum equals the window request count |
 | Rolling 1m/5m | `COUNT(*) WHERE started_at >= now - 60/300` | rows, not tokens; per model, per agent, per server |
 | Error rate | `COUNT(status='error') / COUNT(*)` over the window | 429s counted separately by `status_code=429` |
 | Capacity | `slots` (max batch/slots) from the server | `None` for kinds that do not report it; no invented denominator |
@@ -501,6 +507,7 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
   "generated_at": 1762540800.123,
   "window": {"seconds": 300, "since": 1762540500.123},
   "totals": {"in_flight": 5, "requests_1m": 18, "requests_5m": 63, "errors_5m": 3},
+  "servers_source": "discovered",
   "servers": [
     {
       "name": "ds4", "title": "Studio DeepSeek-V4.1-Flash (M5 Ultra, TensorFold fork)",
@@ -531,7 +538,10 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
       "server_name": "ds4", "kind": "tensorfold", "lane": "local",
       "in_flight": 2, "requests_1m": 12, "requests_5m": 41,
       "errors_5m": 2, "errors_429_5m": 1,
+      "streamed": 9, "non_streamed": 1,
+      "requests_buckets": [0, 1, 2, 3, 4, 3, 2, 1, 0, 2, 3, 4, 3, 2, 1, 0, 2, 3, 4, 1],
       "ttft_ms_p50": 210.0, "ttft_ms_p95": 900.0,
+      "latency_ms_p50": 4200.0, "latency_ms_p95": 12700.0,
       "decode_tps": 42.1, "prefill_tps": 3100.0, "rate_kind": "decode",
       "tokens": {"prompt": 812000, "cached": 640000, "completion": 21000, "reasoning": 0},
       "slots": {"used": 3, "total": 4, "queue": 0},
@@ -558,7 +568,15 @@ Rules the backend guarantees: `label` is always `""` (the UI fills it from `sess
 unknown, never `0`-as-unknown. `name` is the short card label (declared name → provider key → host:port);
 `title` is `null` or the provider's prose name, for the card tooltip only. `unreachable` is always present
 (`[]` when none): discovered servers that are unreachable and served no request in the window, as
-`{name, base_url, error, since}`. Declared servers never move there.
+`{name, base_url, error, since}`. Declared servers never move there. `servers_source` is
+`declared`|`discovered`|`none` — `discovered` even when discovery found nothing, so the UI can tell
+"discovery is on and empty" from "nothing declared".
+
+Each model card carries `streamed` / `non_streamed` (finished rows split by the §8 rule), `ttft_ms_p50/p95`
+(streamed rows only, `null` when none), `latency_ms_p50/p95` (all finished rows), and `requests_buckets`
+(requests per 15 s bucket over the window, `ceil(window/15)` integers summing to the window count). A
+non-streamed lane has `decode_tps: null` and the UI shows `latency p50` in place of `TTFT`; there is no
+whole-request rate labelled decode.
 
 `requests` (per server card) is the swim-lane's per-request rows: **every in-flight row for that server
 plus every row that ended in the last 60 s**, newest first by `started_at`, capped at 50 per server. Each
@@ -637,9 +655,11 @@ no declared server (still hook-derived). Each **local** card:
 - decode/prefill sparkline over the last 5 minutes from `samples`.
 
 Each **cloud** card: provider/model header with a `Hermes traffic only` badge, in-flight count,
-requests/min, p50 TTFT, output tok/s, tokens, errors and 429s, and the quota line from §7.4 when
-`session.stats` matches. No slot bar, no sparkline of server load — only a request-rate sparkline from
-rollups, which is honest because it is our own traffic.
+`req/min`, `p50 TTFT` (or `latency p50` when most rows are non-streamed), `decode` tok/s (`—` when
+non-streamed), `input … tok · n% cached`, `output … tok`, errors and 429s, and the quota line from §7.4
+when `session.stats` matches. No slot bar and no utilization gauge: the footer is a **requests, last 5m**
+sparkline (requests per 15 s bucket from window rows) beside the plain req/min figure, so a quiet lane
+never reads as a full bar.
 
 ### 10.4 Status chip
 

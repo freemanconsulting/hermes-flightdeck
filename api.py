@@ -161,6 +161,36 @@ def _round(value: float | None, digits: int = 1) -> float | None:
     return None if value is None else round(float(value), digits)
 
 
+#: A response is "streamed" only when its decode span is long enough to mean
+#: something and covers most of the request.  Providers that return the whole
+#: body at once set first_chunk_at ≈ ended_at, so completion/(ended-first) is a
+#: bogus rate: those rows are non-streamed and carry no decode number at all
+#: (DESIGN §8).
+MIN_DECODE_SECONDS = 0.25
+MIN_DECODE_SHARE = 0.10
+
+
+def _decode_span(started: float | None, first: float | None,
+                 ended: float | None) -> float | None:
+    """Decode seconds for one row; ``None`` when the row is non-streamed."""
+    if started is None or first is None or ended is None:
+        return None
+    if first < started or ended <= first:
+        return None
+    span = ended - first
+    total = ended - started
+    if span < MIN_DECODE_SECONDS or span < MIN_DECODE_SHARE * total:
+        return None
+    return span
+
+
+def _latency(started: float | None, ended: float | None) -> float | None:
+    """Whole-request seconds (ended - started), the number a non-streamed row reports."""
+    if started is None or ended is None or ended <= started:
+        return None
+    return ended - started
+
+
 def _open_conn() -> sqlite3.Connection:
     store = _store_module()
     if store is None:
@@ -399,8 +429,12 @@ def _server_name_for(base_url: str | None, server_by_url: dict[str, dict],
 # ---------------------------------------------------------------------------
 
 
-def _model_cards(rows: list[dict], server_cards: list[dict], now: float) -> list[dict]:
+def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
+                 window_seconds: int = 300) -> list[dict]:
     server_by_url = {normalize_base_url(card["base_url"]): card for card in server_cards}
+    bucket_seconds = 15
+    bucket_count = max(1, int(window_seconds) // bucket_seconds)
+    since = now - float(window_seconds)
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
         groups.setdefault(
@@ -423,12 +457,13 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float) -> list
                             and (_num(row.get("started_at")) or 0) >= now - 300)
 
         ttfts = []
+        latencies = []
         decode_seconds = 0.0
         decode_tokens = 0.0
-        request_seconds = 0.0
-        request_tokens = 0.0
         prefill_seconds = 0.0
         prefill_tokens = 0.0
+        streamed = 0
+        non_streamed = 0
         for row in items:
             started = _num(row.get("started_at"))
             first = _num(row.get("first_chunk_at"))
@@ -436,17 +471,23 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float) -> list
             completion = _num(row.get("completion_tokens"))
             prompt = _num(row.get("prompt_tokens"))
             cached = _num(row.get("cached_tokens")) or 0.0
-            if started is not None and first is not None and first >= started:
+            latency = _latency(started, ended)
+            if latency is not None:
+                latencies.append(latency * 1000.0)
+            span = _decode_span(started, first, ended)
+            if span is not None and started is not None and first is not None:
+                streamed += 1
                 ttfts.append((first - started) * 1000.0)
-                if completion is not None and ended is not None and ended > first:
-                    decode_seconds += ended - first
+                if completion is not None:
+                    decode_seconds += span
                     decode_tokens += completion
                 if prompt is not None and first > started:
                     prefill_seconds += first - started
                     prefill_tokens += max(0.0, prompt - cached)
-            elif completion is not None and started is not None and ended is not None and ended > started:
-                request_seconds += ended - started
-                request_tokens += completion
+            elif ended is not None and started is not None and ended > started:
+                # Whole-response row: no TTFT, no decode rate. Its honest number
+                # is latency (ended - started), reported separately.
+                non_streamed += 1
 
         decode_tps = None
         prefill_tps = None
@@ -457,13 +498,18 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float) -> list
         elif decode_seconds > 0:
             decode_tps = decode_tokens / decode_seconds
             rate_kind = "decode"
-        elif request_seconds > 0:
-            decode_tps = request_tokens / request_seconds
-            rate_kind = "request"
         if server is not None and server.get("prefill_tps") is not None:
             prefill_tps = server.get("prefill_tps")
         elif prefill_seconds > 0:
             prefill_tps = prefill_tokens / prefill_seconds
+
+        buckets = [0] * bucket_count
+        for row in items:
+            started = _num(row.get("started_at"))
+            if started is None or started < since:
+                continue
+            index = int((started - since) / bucket_seconds)
+            buckets[min(max(index, 0), bucket_count - 1)] += 1
 
         tokens = {
             "prompt": sum(_int_or_none(row.get("prompt_tokens")) or 0 for row in items),
@@ -503,8 +549,13 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float) -> list
             "requests_5m": requests_5m,
             "errors_5m": errors_5m,
             "errors_429_5m": errors_429_5m,
+            "streamed": streamed,
+            "non_streamed": non_streamed,
+            "requests_buckets": buckets,
             "ttft_ms_p50": _round(_percentile(ttfts, 50), 1),
             "ttft_ms_p95": _round(_percentile(ttfts, 95), 1),
+            "latency_ms_p50": _round(_percentile(latencies, 50), 1),
+            "latency_ms_p95": _round(_percentile(latencies, 95), 1),
             "decode_tps": _round(decode_tps, 1),
             "prefill_tps": _round(prefill_tps, 1),
             "rate_kind": rate_kind,
@@ -590,9 +641,12 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
 
 
 def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
-                   conn: sqlite3.Connection | None = None, now: float | None = None) -> dict:
+                   conn: sqlite3.Connection | None = None, now: float | None = None,
+                   servers_source: str | None = None) -> dict:
     """The §9.1 snapshot.  ``servers`` is already-polled samples (dict or list);
-    None means poll the declared servers synchronously; [] means no server cards."""
+    None means poll the declared servers synchronously; [] means no server cards.
+    ``servers_source`` overrides the derived source — /servers passes
+    ``discovered`` so dead servers fold out of the chip too (DESIGN §7.2)."""
     conn = conn if conn is not None else _open_conn()
     now = _now() if now is None else float(now)
     since = now - float(window_seconds)
@@ -600,7 +654,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     if servers is None:
         settings = _settings(conn)
         declared = list(settings.get("servers") or [])
-        servers_source = str(settings.get("servers_source") or "declared")
+        derived_source = str(settings.get("servers_source") or "declared")
         poller = _poller_module()
         if poller is not None and declared:
             samples = list(poller.poll_sync(
@@ -611,10 +665,11 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
             samples = []
     elif isinstance(servers, dict):
         samples = [_sample_dict(value) for value in servers.values()]
-        servers_source = "declared"
+        derived_source = "declared"
     else:
         samples = [_sample_dict(value) for value in servers]
-        servers_source = "declared"
+        derived_source = "declared"
+    servers_source = derived_source if servers_source is None else str(servers_source)
 
     rows = _window_rows(conn, since)
     in_flight = _in_flight_rows(conn)
@@ -640,7 +695,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
             else:
                 kept.append(card)
         server_cards = kept
-    model_cards = _model_cards(rows, server_cards, now)
+    model_cards = _model_cards(rows, server_cards, now, window_seconds)
     agent_nodes = _agent_tree(rows, _subagent_links(conn),
                               {normalize_base_url(card["base_url"]): card for card in server_cards})
 
@@ -656,6 +711,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
         "generated_at": now,
         "window": {"seconds": int(window_seconds), "since": since},
         "totals": totals,
+        "servers_source": servers_source,
         "servers": server_cards,
         "unreachable": unreachable,
         "models": model_cards,
@@ -671,15 +727,25 @@ def build_agents(window_seconds: int = 300, *, conn: sqlite3.Connection | None =
     return {"agents": _agent_tree(rows, _subagent_links(conn))}
 
 def build_models(window_seconds: int = 300, *, servers: Any = None,
-                 conn: sqlite3.Connection | None = None, now: float | None = None) -> dict:
-    snapshot = build_snapshot(window_seconds, servers=servers, conn=conn, now=now)
+                 conn: sqlite3.Connection | None = None, now: float | None = None,
+                 servers_source: str | None = None) -> dict:
+    snapshot = build_snapshot(window_seconds, servers=servers, conn=conn, now=now,
+                              servers_source=servers_source)
     return {"models": snapshot["models"], "servers": snapshot["servers"]}
 
 
 def build_servers(*, servers: Any = None, conn: sqlite3.Connection | None = None,
-                  now: float | None = None) -> dict:
-    snapshot = build_snapshot(300, servers=servers, conn=conn, now=now)
-    return {"servers": snapshot["servers"]}
+                  now: float | None = None, servers_source: str | None = None) -> dict:
+    """Chip call: reachable server cards only, dead ones folded into `unreachable`.
+
+    The same §7.2 rule as the page: a server that is unreachable and served no
+    request in the window is noise, so a chip never shows a dead port as a fleet
+    member.  Defaults to the discovered rule; the dashboard passes the real
+    source so a declared server keeps its card.
+    """
+    snapshot = build_snapshot(300, servers=servers, conn=conn, now=now,
+                              servers_source=servers_source or "discovered")
+    return {"servers": snapshot["servers"], "unreachable": snapshot["unreachable"]}
 
 
 def build_request(request_id: str, *, conn: sqlite3.Connection | None = None) -> dict:
@@ -695,19 +761,25 @@ def build_request(request_id: str, *, conn: sqlite3.Connection | None = None) ->
     prompt = _num(row.get("prompt_tokens"))
     cached = _num(row.get("cached_tokens")) or 0.0
     completion = _num(row.get("completion_tokens"))
-    derived: dict[str, Any] = {"ttft_ms": None, "prefill_tps": None, "decode_tps": None, "rate_kind": None}
-    if started is not None and first is not None and first >= started:
+    derived: dict[str, Any] = {
+        "streamed": False, "ttft_ms": None, "latency_ms": None,
+        "prefill_tps": None, "decode_tps": None, "rate_kind": None,
+    }
+    latency = _latency(started, ended)
+    if latency is not None:
+        derived["latency_ms"] = _round(latency * 1000.0, 1)
+    span = _decode_span(started, first, ended)
+    if span is not None and started is not None and first is not None:
         ttft = first - started
+        derived["streamed"] = True
         derived["ttft_ms"] = _round(ttft * 1000.0, 1)
         if prompt is not None and ttft > 0:
             derived["prefill_tps"] = _round(max(0.0, prompt - cached) / ttft, 1)
-        if completion is not None and ended is not None and ended > first:
-            derived["decode_tps"] = _round(completion / (ended - first), 1)
+        if completion is not None:
+            derived["decode_tps"] = _round(completion / span, 1)
             derived["rate_kind"] = "decode"
-    if derived["decode_tps"] is None and completion is not None and started is not None \
-            and ended is not None and ended > started:
-        derived["decode_tps"] = _round(completion / (ended - started), 1)
-        derived["rate_kind"] = "request"
+    # A non-streamed row has no TTFT and no decode rate; `latency_ms` is its
+    # honest number. Never completion/(ended-started) labelled as decode.
     return {"request": row, "derived": derived}
 
 
@@ -754,6 +826,17 @@ def _ttft_for_server(snapshot: dict, name: str) -> float | None:
     return candidates[0]["ttft_ms_p50"]
 
 
+def _latency_for_server(snapshot: dict, name: str) -> float | None:
+    """p50 whole-request latency of the busiest lane on a server — the honest
+    number for a server whose responses are not streamed."""
+    candidates = [card for card in snapshot.get("models", [])
+                  if card.get("server_name") == name and card.get("latency_ms_p50") is not None]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda card: -(card.get("requests_5m") or 0))
+    return candidates[0]["latency_ms_p50"]
+
+
 def fleet_status(snapshot: dict | None = None, *, window_seconds: int = 300,
                  servers: Any = None, conn: sqlite3.Connection | None = None,
                  now: float | None = None) -> dict:
@@ -786,6 +869,7 @@ def fleet_status(snapshot: dict | None = None, *, window_seconds: int = 300,
             "in_flight": card.get("in_flight"),
             "unattributed": card.get("unattributed"),
             "ttft_ms_p50": _ttft_for_server(snapshot, card.get("name") or ""),
+            "latency_ms_p50": _latency_for_server(snapshot, card.get("name") or ""),
             "error": card.get("error"),
         }
         lane["verdict"] = _verdict(lane)
@@ -811,6 +895,8 @@ def fleet_status(snapshot: dict | None = None, *, window_seconds: int = 300,
             reason = f"{lane['free_slots']} of {lane['slots']['total']} slots free, queue empty"
             if lane.get("ttft_ms_p50") is not None:
                 reason += f", p50 TTFT {int(round(lane['ttft_ms_p50']))}ms"
+            elif lane.get("latency_ms_p50") is not None:
+                reason += f", p50 latency {int(round(lane['latency_ms_p50']))}ms"
             pick = {"lane": lane["name"], "reason": reason}
             break
 

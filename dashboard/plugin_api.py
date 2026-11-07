@@ -125,8 +125,10 @@ async def snapshot(window: str = Query("5m", description="1m or 5m")):
     seconds = _window_seconds(window)
     with _conn() as conn:
         _maybe_sweep(conn)
+        settings = _settings(conn)
         samples = await _poll(conn)
-        return _api().build_snapshot(seconds, servers=samples, conn=conn)
+        return _api().build_snapshot(seconds, servers=samples, conn=conn,
+                                     servers_source=settings.get("servers_source"))
 
 
 @router.get("/agents")
@@ -138,16 +140,20 @@ def agents(window: str = Query("5m", description="1m or 5m")):
 @router.get("/models")
 async def models(window: str = Query("5m", description="1m or 5m")):
     with _conn() as conn:
+        settings = _settings(conn)
         samples = await _poll(conn)
-        return _api().build_models(_window_seconds(window), servers=samples, conn=conn)
+        return _api().build_models(_window_seconds(window), servers=samples, conn=conn,
+                                   servers_source=settings.get("servers_source"))
 
 
 @router.get("/servers")
 async def servers():
     """Chip call: server cards only, no hook join."""
     with _conn() as conn:
+        settings = _settings(conn)
         samples = await _poll(conn)
-        return _api().build_servers(servers=samples, conn=conn)
+        return _api().build_servers(servers=samples, conn=conn,
+                                    servers_source=settings.get("servers_source"))
 
 
 @router.get("/request/{request_id}")

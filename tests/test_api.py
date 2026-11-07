@@ -58,7 +58,9 @@ def model(snapshot_payload, key):
 
 def test_snapshot_shape_is_pinned(conn):
     payload = snapshot(conn)
-    assert list(payload) == ["generated_at", "window", "totals", "servers", "unreachable", "models", "agents"]
+    assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
+                             "unreachable", "models", "agents"]
+    assert payload["servers_source"] == "declared"
     assert payload["window"] == {"seconds": 300, "since": NOW - 300}
     assert list(payload["totals"]) == ["in_flight", "requests_1m", "requests_5m", "errors_5m"]
     assert payload["totals"] == {"in_flight": 6, "requests_1m": 6, "requests_5m": 11, "errors_5m": 1}
@@ -80,9 +82,9 @@ def test_snapshot_shape_is_pinned(conn):
     ds4_model = model(payload, f"ds4|{make_example.DS4_MODEL}")
     assert list(ds4_model) == [
         "key", "model", "provider", "base_url", "server_name", "kind", "lane", "in_flight",
-        "requests_1m", "requests_5m", "errors_5m", "errors_429_5m", "ttft_ms_p50",
-        "ttft_ms_p95", "decode_tps", "prefill_tps", "rate_kind", "tokens", "slots",
-        "agents", "quota",
+        "requests_1m", "requests_5m", "errors_5m", "errors_429_5m", "streamed", "non_streamed",
+        "requests_buckets", "ttft_ms_p50", "ttft_ms_p95", "latency_ms_p50", "latency_ms_p95",
+        "decode_tps", "prefill_tps", "rate_kind", "tokens", "slots", "agents", "quota",
     ]
     assert ds4_model["lane"] == "local"
     assert ds4_model["quota"] is None
@@ -253,6 +255,86 @@ def test_request_detail_derives_per_request_numbers(conn):
     assert payload["derived"]["decode_tps"] == 444.4
     assert payload["derived"]["rate_kind"] == "decode"
     assert api.build_request("nope", conn=conn)["request"] is None
+
+
+# --- §8 non-streamed rows: no bogus decode rate -------------------------------
+
+
+def test_non_streamed_row_has_latency_not_decode(conn):
+    """A provider that returns the whole body at once: first_chunk ≈ ended."""
+    make_example.insert_request(
+        conn, id="default|4242|opus1", session_id="s1", api_request_id="opus1",
+        model=make_example.CLOUD_MODEL, provider="anthropic",
+        base_url=make_example.ANTHROPIC + "/v1",
+        started_at=NOW - 13.0, first_chunk_at=NOW - 0.31, ended_at=NOW - 0.29,
+        status="done", prompt_tokens=18000, cached_tokens=18000, completion_tokens=723,
+    )
+    derived = api.build_request("default|4242|opus1", conn=conn)["derived"]
+    assert derived["streamed"] is False
+    assert derived["ttft_ms"] is None
+    assert derived["decode_tps"] is None
+    assert derived["rate_kind"] is None
+    assert derived["latency_ms"] == 12710.0
+
+    cloud = model(snapshot(conn), f"anthropic|{make_example.CLOUD_MODEL}")
+    assert cloud["non_streamed"] == 1
+    assert cloud["streamed"] == 1  # c2 streams for 5.1 s of its 6 s
+    assert cloud["decode_tps"] == 176.5  # 900 / 5.1, from the streamed row only
+    assert cloud["ttft_ms_p50"] == 900.0
+    assert cloud["latency_ms_p50"] == 6000.0
+    assert cloud["latency_ms_p95"] == 12710.0
+
+
+def test_decode_span_rule_boundaries():
+    # 0.3 s of decode inside a 10 s request is 3% — non-streamed.
+    assert api._decode_span(0.0, 9.7, 10.0) is None
+    # 0.2 s is under the 0.25 s floor even when it is the whole request.
+    assert api._decode_span(0.0, 0.2, 0.22) is None
+    assert api._decode_span(0.0, 0.75, 1.0) == 0.25
+
+
+# --- §9.1 request buckets (cloud sparkline) ---------------------------------
+
+
+def test_requests_buckets_shape_and_sum(conn):
+    payload = snapshot(conn)
+    ds4_model = model(payload, f"ds4|{make_example.DS4_MODEL}")
+    buckets = ds4_model["requests_buckets"]
+    assert len(buckets) == 20  # 300 s / 15 s
+    assert sum(buckets) == ds4_model["requests_5m"] == 6
+    assert all(isinstance(count, int) and count >= 0 for count in buckets)
+    # A 1m window has 4 buckets and counts only that window's rows.
+    one_min = api.build_snapshot(60, servers=make_example.server_samples(), conn=conn, now=NOW)
+    ds4_one = model(one_min, f"ds4|{make_example.DS4_MODEL}")
+    assert len(ds4_one["requests_buckets"]) == 4
+    assert sum(ds4_one["requests_buckets"]) == ds4_one["requests_5m"] == 3
+
+
+# --- §9.1 /servers folds unreachable servers --------------------------------
+
+
+def test_build_servers_folds_dead_servers_and_returns_unreachable(conn):
+    dead = {"name": "studio-worker", "base_url": "http://127.0.0.1:18012",
+            "kind": "unknown", "healthy": None, "models": [], "running": None,
+            "waiting": None, "slots": None, "decode_tps": None, "prefill_tps": None,
+            "sampled_at": api._now_iso(NOW), "error": "/health: URLError"}
+    payload = api.build_servers(servers=[dead], conn=conn, now=NOW)
+    assert payload["servers"] == []
+    assert payload["unreachable"] == [{
+        "name": "studio-worker", "base_url": "http://127.0.0.1:18012",
+        "error": "/health: URLError", "since": NOW,
+    }]
+
+    # A dead server that served a request in the window is still a card.
+    make_example.insert_request(
+        conn, id="default|4242|w1", session_id="s1", api_request_id="w1",
+        model=make_example.DS4_MODEL, provider="main-llm",
+        base_url="http://127.0.0.1:18012/v1", started_at=NOW - 10,
+        status="in-flight",
+    )
+    payload = api.build_servers(servers=[dead], conn=conn, now=NOW)
+    assert [card["name"] for card in payload["servers"]] == ["studio-worker"]
+    assert payload["unreachable"] == []
 
 
 # --- §11 fleet_status -------------------------------------------------------
@@ -455,7 +537,8 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
     monkeypatch.setattr(module._api(), "_now", lambda: NOW)
 
     payload = asyncio.run(module.snapshot("5m"))
-    assert list(payload) == ["generated_at", "window", "totals", "servers", "unreachable", "models", "agents"]
+    assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
+                             "unreachable", "models", "agents"]
     assert payload["totals"]["in_flight"] == 6
 
     assert len(module.agents("1m")["agents"]) == 2
