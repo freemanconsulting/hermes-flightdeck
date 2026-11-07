@@ -121,6 +121,33 @@ function profileTone(name) {
   return profileColor(name) || 'var(--ui-accent)'
 }
 
+// Canvas fills need concrete colors: a CSS var() is not a valid fillStyle, so
+// profileTone() draws transparent bars. Agents get a fixed HSL palette, assigned
+// per draw in order of appearance so the legend and the bars always agree.
+const AGENT_PALETTE = [
+  'hsl(210 90% 62%)', 'hsl(285 80% 68%)', 'hsl(160 70% 48%)', 'hsl(38 95% 58%)',
+  'hsl(0 80% 62%)', 'hsl(188 85% 55%)', 'hsl(255 85% 70%)', 'hsl(24 90% 60%)'
+]
+
+function agentKey(row) {
+  return `${(row && row.profile) || ''}|${(row && row.session_id) || ''}`
+}
+
+function agentColorMap(servers) {
+  const colors = new Map()
+  let next = 0
+  for (const server of servers || []) {
+    for (const request of server.requests || []) {
+      const key = agentKey(request)
+      if (!colors.has(key)) {
+        colors.set(key, AGENT_PALETTE[next % AGENT_PALETTE.length])
+        next += 1
+      }
+    }
+  }
+  return colors
+}
+
 // A row's display label. Snapshot labels are always ""; sessions resolve from
 // session.list, subagents from role + goal, cron runs from the job name.
 function agentLabel(row, labels) {
@@ -351,32 +378,60 @@ function Sparkline({ samples }) {
       decode.push(`${x.toFixed(2)},${(25 - (rows[i][1] / maxDecode) * 22).toFixed(2)}`)
       prefill.push(`${x.toFixed(2)},${(25 - (rows[i][2] / maxPrefill) * 22).toFixed(2)}`)
     }
-    return { decode: decode.join(' '), prefill: prefill.join(' '), area: `0,26 ${decode.join(' ')} 100,26` }
+    return {
+      decode: decode.join(' '), prefill: prefill.join(' '),
+      area: `0,26 ${decode.join(' ')} 100,26`, maxDecode, maxPrefill
+    }
   }, [samples])
 
   if (!series) return null
-  return jsxs('svg', {
-    viewBox: '0 0 100 26',
-    preserveAspectRatio: 'none',
-    className: 'h-6 w-full',
-    'aria-hidden': 'true',
+  return jsxs('div', {
+    className: 'flex flex-col gap-0.5',
     children: [
-      jsx('polygon', { points: series.area, fill: 'var(--ui-accent)', opacity: 0.1 }),
-      jsx('polyline', {
-        points: series.decode,
-        fill: 'none',
-        stroke: 'var(--ui-accent)',
-        strokeWidth: 1.4,
-        vectorEffect: 'non-scaling-stroke',
-        strokeLinejoin: 'round'
+      jsxs('div', {
+        className: 'flex items-center gap-2 text-[0.55rem] tabular-nums text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { children: `max ${fmtRate(series.maxDecode)} tok/s` }),
+          jsxs('span', {
+            className: 'inline-flex items-center gap-1',
+            children: [
+              jsx('span', { className: 'size-1 rounded-full', style: { background: 'var(--ui-accent)' } }),
+              jsx('span', { children: 'decode' }),
+              jsx('span', { className: 'size-1 rounded-full', style: { background: 'var(--ui-text-quaternary)' } }),
+              jsx('span', { children: 'prefill' })
+            ]
+          })
+        ]
       }),
-      jsx('polyline', {
-        points: series.prefill,
-        fill: 'none',
-        stroke: 'var(--ui-text-quaternary)',
-        strokeWidth: 1,
-        vectorEffect: 'non-scaling-stroke',
-        strokeLinejoin: 'round'
+      jsxs('svg', {
+        viewBox: '0 0 100 26',
+        preserveAspectRatio: 'none',
+        className: 'h-6 w-full',
+        'aria-hidden': 'true',
+        children: [
+          jsx('line', {
+            x1: 0, y1: 25.5, x2: 100, y2: 25.5,
+            stroke: 'var(--ui-stroke-secondary)', strokeWidth: 0.5,
+            vectorEffect: 'non-scaling-stroke'
+          }),
+          jsx('polygon', { points: series.area, fill: 'var(--ui-accent)', opacity: 0.1 }),
+          jsx('polyline', {
+            points: series.decode,
+            fill: 'none',
+            stroke: 'var(--ui-accent)',
+            strokeWidth: 1.4,
+            vectorEffect: 'non-scaling-stroke',
+            strokeLinejoin: 'round'
+          }),
+          jsx('polyline', {
+            points: series.prefill,
+            fill: 'none',
+            stroke: 'var(--ui-text-quaternary)',
+            strokeWidth: 1,
+            vectorEffect: 'non-scaling-stroke',
+            strokeLinejoin: 'round'
+          })
+        ]
       })
     ]
   })
@@ -390,32 +445,44 @@ function RequestSparkline({ buckets }) {
     const max = Math.max(...buckets, 1)
     const step = 100 / buckets.length
     const width = Math.max(1, step * 0.62)
-    return buckets.map((count, i) => ({
-      x: i * step + (step - width) / 2,
-      width,
-      height: Math.max(count > 0 ? 1.5 : 0, (count / max) * 18),
-      count
-    }))
+    return {
+      max,
+      bars: buckets.map((count, i) => ({
+        x: i * step + (step - width) / 2,
+        width,
+        height: Math.max(count > 0 ? 1.5 : 0, (count / max) * 18),
+        count
+      }))
+    }
   }, [buckets])
 
   if (!series) return null
-  return jsxs('svg', {
-    viewBox: '0 0 100 20',
-    preserveAspectRatio: 'none',
-    className: 'h-5 w-full',
-    'aria-hidden': 'true',
+  return jsxs('div', {
+    className: 'flex flex-col gap-0.5',
     children: [
-      jsx('line', {
-        x1: 0, y1: 19.5, x2: 100, y2: 19.5,
-        stroke: 'var(--ui-stroke-secondary)', strokeWidth: 0.5,
-        vectorEffect: 'non-scaling-stroke'
+      jsx('span', {
+        className: 'text-[0.55rem] tabular-nums text-(--ui-text-quaternary)',
+        children: `max ${series.max} / 15s`
       }),
-      series.map(bar =>
-        jsx('rect', {
-          x: bar.x, y: 20 - bar.height, width: bar.width, height: bar.height,
-          fill: 'var(--ui-accent)', opacity: bar.count > 0 ? 0.7 : 0
-        }, `bucket-${bar.x}`)
-      )
+      jsxs('svg', {
+        viewBox: '0 0 100 20',
+        preserveAspectRatio: 'none',
+        className: 'h-5 w-full',
+        'aria-hidden': 'true',
+        children: [
+          jsx('line', {
+            x1: 0, y1: 19.5, x2: 100, y2: 19.5,
+            stroke: 'var(--ui-stroke-secondary)', strokeWidth: 0.5,
+            vectorEffect: 'non-scaling-stroke'
+          }),
+          series.bars.map(bar =>
+            jsx('rect', {
+              x: bar.x, y: 20 - bar.height, width: bar.width, height: bar.height,
+              fill: 'var(--ui-accent)', opacity: bar.count > 0 ? 0.7 : 0
+            }, `bucket-${bar.x}`)
+          )
+        ]
+      })
     ]
   })
 }
@@ -456,6 +523,9 @@ function ServerCard({ server, models, labels, now }) {
             children: server.name
           }),
           jsx(Badge, { variant: 'outline', size: 'xs', children: server.kind }),
+          server.aux
+            ? jsx(Badge, { variant: 'muted', size: 'xs', title: server.title || 'auxiliary helper model', children: 'aux' })
+            : null,
           jsx(Badge, { variant: verdict.variant, size: 'xs', children: verdict.label }),
           jsx('span', {
             className: 'ml-auto truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
@@ -821,6 +891,29 @@ function truncateText(ctx2, text, maxWidth) {
   return `${cut}…`
 }
 
+function requestTooltip(request, labels) {
+  const ttft = request.first_chunk_at != null && request.started_at != null
+    ? Math.max(0, request.first_chunk_at - request.started_at) * 1000
+    : null
+  const decodeEnd = request.ended_at != null ? request.ended_at : Date.now() / 1000
+  const decodeSpan = request.first_chunk_at != null ? Math.max(0, decodeEnd - request.first_chunk_at) : null
+  const decode = decodeSpan && decodeSpan > 0 && request.completion_tokens != null
+    ? request.completion_tokens / decodeSpan
+    : null
+  return [
+    agentLabel(request, labels || {}),
+    request.model || 'model unknown',
+    `TTFT ${fmtMs(ttft)}`,
+    `decode ${decode != null ? `${fmtRate(decode)} tok/s` : '—'}`,
+    `${tokenText(request.prompt_tokens)} in / ${tokenText(request.completion_tokens)} out`,
+    request.status || 'status unknown'
+  ].join(' · ')
+}
+
+// One lane per local server with traffic. Bars are stacked into sub-rows so
+// concurrency is visible: slot 1 at the top, queued requests beyond the server's
+// slots drawn dashed. Dim = prefill (start → first token), bright = decode.
+// The faint throughput trace keeps its own right-side scale (max tok/s).
 function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, labels) {
   const style = getComputedStyle(canvas)
   const accent = style.getPropertyValue('--ui-accent').trim() || 'currentColor'
@@ -829,25 +922,31 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
   const text = style.getPropertyValue('--ui-text-tertiary').trim() || 'currentColor'
 
   const gutter = 124
+  const right = 56
   const axisH = 16
   const top = 4
-  const plotW = Math.max(40, width - gutter - 10)
+  const plotW = Math.max(40, width - gutter - right)
   const nowSec = now / 1000
   const since = nowSec - windowSeconds
   const xOf = t => gutter + ((Math.max(since, Math.min(nowSec, t)) - since) / windowSeconds) * plotW
+  const hits = []
 
   ctx2.clearRect(0, 0, width, height)
   ctx2.textBaseline = 'middle'
+  ctx2.textAlign = 'left'
 
-  const lanes = (Array.isArray(servers) ? servers : []).filter(server => server && server.kind !== 'cloud')
+  const lanes = (Array.isArray(servers) ? servers : []).filter(server =>
+    server && server.kind !== 'cloud' &&
+    ((Array.isArray(server.requests) && server.requests.length > 0) || (server.in_flight || 0) > 0)
+  )
   if (!lanes.length) {
     ctx2.fillStyle = text
     ctx2.font = '11px sans-serif'
-    ctx2.fillText('no local servers declared', gutter, height / 2)
-    return
+    ctx2.fillText('no local server traffic in this window', gutter, height / 2)
+    return hits
   }
 
-  const laneH = Math.max(46, (height - top - axisH) / lanes.length)
+  const laneH = Math.max(56, (height - top - axisH) / lanes.length)
 
   for (let li = 0; li < lanes.length; li += 1) {
     const server = lanes[li]
@@ -859,12 +958,12 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
     ctx2.lineWidth = 1
     ctx2.strokeRect(gutter + 0.5, y + 0.5, plotW - 1, innerH - 1)
 
-    // Throughput history: decode bright area + line, prefill dim line.
+    // Throughput history: decode bright area + line, prefill dim line, faint.
     const samples = Array.isArray(server.samples)
       ? server.samples.filter(s => Array.isArray(s) && s.length >= 3 && s[0] >= since)
       : []
+    let maxDecode = 0
     if (samples.length >= 2) {
-      let maxDecode = 0
       let maxPrefill = 0
       for (const s of samples) {
         if (s[1] > maxDecode) maxDecode = s[1]
@@ -880,7 +979,7 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
         prefillPath.push([x, baseY - (maxPrefill > 0 ? (s[2] / maxPrefill) * plotH : 0)])
       }
       ctx2.save()
-      ctx2.globalAlpha = 0.12
+      ctx2.globalAlpha = 0.10
       ctx2.fillStyle = accent
       ctx2.beginPath()
       ctx2.moveTo(decodePath[0][0], baseY)
@@ -891,7 +990,7 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
       ctx2.restore()
 
       ctx2.save()
-      ctx2.globalAlpha = 0.4
+      ctx2.globalAlpha = 0.28
       ctx2.strokeStyle = dim
       ctx2.lineWidth = 1
       ctx2.beginPath()
@@ -900,70 +999,89 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
       ctx2.restore()
 
       ctx2.save()
+      ctx2.globalAlpha = 0.55
       ctx2.strokeStyle = accent
-      ctx2.lineWidth = 1.5
+      ctx2.lineWidth = 1
       ctx2.beginPath()
       decodePath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
       ctx2.stroke()
       ctx2.restore()
     }
 
-    // Per-request bars when the backend ships them; otherwise in-flight agent
-    // bars from oldest_started_at.
-    const requests = Array.isArray(server.requests) ? server.requests : null
-    if (requests && requests.length) {
-      const visible = requests
-        .filter(r => r && r.started_at != null && (r.ended_at == null || r.ended_at >= since))
-        .slice(0, 14)
-      visible.forEach((request, ri) => {
-        const start = Math.max(since, request.started_at)
-        const end = request.ended_at != null ? Math.min(nowSec, request.ended_at) : nowSec
-        const x1 = xOf(start)
-        const x2 = Math.max(x1 + 2, xOf(end))
-        const barY = y + 14 + ri * 9
-        const barH = 6
-        const color = profileTone(request.profile)
-        const split = request.first_chunk_at != null ? xOf(request.first_chunk_at) : x1
-        ctx2.save()
+    // Per-request bars, stacked into sub-rows by overlap.
+    const requests = Array.isArray(server.requests) ? server.requests : []
+    const visible = requests
+      .filter(r => r && r.started_at != null && (r.ended_at == null || r.ended_at >= since))
+      .sort((a, b) => a.started_at - b.started_at)
+      .slice(0, 40)
+    const rowEnds = []
+    const placed = visible.map(request => {
+      const start = Math.max(since, request.started_at)
+      const end = request.ended_at != null ? Math.min(nowSec, request.ended_at) : nowSec
+      let slot = rowEnds.findIndex(ends => ends <= start)
+      if (slot < 0) {
+        slot = rowEnds.length
+        rowEnds.push(end)
+      } else {
+        rowEnds[slot] = end
+      }
+      return { request, start, end, slot }
+    })
+    const concurrency = Math.max(1, rowEnds.length)
+    const slots = server.slots != null ? Math.max(1, server.slots) : concurrency
+    const barH = 6
+    const barGap = 2
+    const barTop = y + 14
+    const colors = agentColorMap(lanes)
+
+    placed.forEach(item => {
+      const { request, start, end, slot } = item
+      const x1 = xOf(start)
+      const x2 = Math.max(x1 + 2, xOf(end))
+      const barY = barTop + slot * (barH + barGap)
+      const color = colors.get(agentKey(request)) || accent
+      const split = request.first_chunk_at != null ? xOf(request.first_chunk_at) : x2
+      const queued = slot >= slots
+      ctx2.save()
+      if (queued) {
+        ctx2.globalAlpha = 0.55
+        ctx2.strokeStyle = color
+        ctx2.lineWidth = 1
+        ctx2.setLineDash([2, 2])
+        ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, barH - 1)
+      } else {
         ctx2.globalAlpha = 0.35
         ctx2.fillStyle = color
         ctx2.fillRect(x1, barY, Math.max(1, split - x1), barH)
         ctx2.globalAlpha = 0.9
         ctx2.fillRect(split, barY, Math.max(1, x2 - split), barH)
-        ctx2.restore()
-      })
-    } else {
-      const agents = Array.isArray(server.agents)
-        ? server.agents.filter(a => a && a.oldest_started_at != null && (a.requests || a.in_flight || 0) > 0).slice(0, 4)
-        : []
-      agents.forEach((agent, ai) => {
-        const start = Math.max(since, agent.oldest_started_at)
-        const x1 = xOf(start)
-        const x2 = gutter + plotW
-        const barY = y + 16 + ai * 15
-        const barH = 7
-        ctx2.save()
-        ctx2.globalAlpha = 0.85
-        ctx2.fillStyle = profileTone(agent.profile)
-        ctx2.fillRect(x1, barY, Math.max(2, x2 - x1), barH)
-        ctx2.restore()
-        ctx2.fillStyle = text
-        ctx2.font = '10px sans-serif'
-        const labelText = `${agentLabel(agent, labels || {})} · ${elapsedOf(agent.oldest_started_at, now) || '—'}`
-        const room = gutter + plotW - x1 - 6
-        if (room < 90) {
-          ctx2.textAlign = 'right'
-          ctx2.fillText(truncateText(ctx2, labelText, Math.max(40, x1 - gutter - 6)), x1 - 4, barY - 5)
-          ctx2.textAlign = 'left'
-        } else {
-          ctx2.fillText(truncateText(ctx2, labelText, Math.max(40, room)), x1 + 4, barY - 5)
+        if (request.ended_at == null) {
+          // In-flight growing edge: a brighter cap that pulses with the clock.
+          ctx2.globalAlpha = 0.55 + 0.35 * Math.abs(Math.sin(now / 420))
+          ctx2.fillStyle = color
+          ctx2.fillRect(x2 - 1.5, barY - 1, 2, barH + 2)
         }
-      })
-      if (!agents.length) {
-        ctx2.fillStyle = dim
-        ctx2.font = '10px sans-serif'
-        ctx2.fillText('no in-flight request', gutter + 6, y + 20)
       }
+      ctx2.restore()
+      hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: barH, request })
+    })
+
+    // Slot numbers down the left edge of the plot: the y-axis is the stacked rows.
+    ctx2.fillStyle = dim
+    ctx2.font = '8px sans-serif'
+    for (let slot = 0; slot < Math.min(concurrency, slots + 2); slot += 1) {
+      ctx2.fillText(String(slot + 1), gutter + 3, barTop + slot * (barH + barGap) + barH / 2)
+    }
+
+    // Right edge: concurrency and the throughput trace's own scale.
+    ctx2.fillStyle = text
+    ctx2.font = '600 10px sans-serif'
+    ctx2.fillText(`${concurrency} concurrent`, gutter + plotW + 6, y + 10)
+    ctx2.fillStyle = dim
+    ctx2.font = '9px sans-serif'
+    if (maxDecode > 0) {
+      ctx2.fillText(`max ${fmtRate(maxDecode)} tok/s`, gutter + plotW + 6, y + 22)
+      ctx2.fillText('0 tok/s', gutter + plotW + 6, y + innerH - 6)
     }
 
     // Lane label in the gutter.
@@ -975,7 +1093,7 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
     ctx2.fillText(
       truncateText(
         ctx2,
-        `${server.kind || 'server'} · ${server.running != null ? server.running : '—'}/${server.slots != null ? server.slots : '—'}`,
+        `${server.kind || 'server'} · ${server.running != null ? server.running : '—'}/${server.slots != null ? server.slots : '—'} slots`,
         gutter - 14
       ),
       8,
@@ -1006,12 +1124,16 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
     const label = i === 4 ? 'now' : `-${fmtElapsed(offset)}`
     ctx2.fillText(label, i === 4 ? x - 18 : x + 2, height - axisH + 2)
   }
+  ctx2.textBaseline = 'middle'
+  return hits
 }
 
 function SwimLane({ servers, labels, windowSeconds, now }) {
   const wrapRef = useRef(null)
   const canvasRef = useRef(null)
+  const hitsRef = useRef([])
   const [size, setSize] = useState({ width: 0, height: 0 })
+  const [hover, setHover] = useState(null)
 
   useEffect(() => {
     const element = wrapRef.current
@@ -1033,28 +1155,148 @@ function SwimLane({ servers, labels, windowSeconds, now }) {
     const ctx2 = canvas.getContext('2d')
     if (!ctx2) return
     ctx2.setTransform(dpr, 0, 0, dpr, 0, 0)
-    drawSwimLane(ctx2, size.width, size.height, servers, windowSeconds, now, canvas, labels)
+    hitsRef.current = drawSwimLane(ctx2, size.width, size.height, servers, windowSeconds, now, canvas, labels)
   }, [servers, windowSeconds, now, size, labels])
 
-  return jsx('div', {
-    ref: wrapRef,
-    className: 'h-[190px] w-full rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) p-1',
-    children: jsx('canvas', {
-      ref: canvasRef,
-      className: 'block h-full w-full',
-      role: 'img',
-      'aria-label': 'Swim-lane timeline: decode and prefill throughput per local server with in-flight agent bars over the selected window'
+  const legend = useMemo(() => {
+    const colors = agentColorMap(servers)
+    const entries = [...colors.entries()].slice(0, 8)
+    return entries.map(([key, color]) => {
+      const [profile, session] = key.split('|')
+      const label = labels[session] || (session ? `session ${session.slice(0, 8)}` : profile)
+      return { key, color, label: `${profile} · ${label}` }
     })
+  }, [servers, labels])
+
+  const onMove = event => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const x = event.clientX - rect.left
+    const y = event.clientY - rect.top
+    const hit = (hitsRef.current || []).find(item =>
+      x >= item.x - 1 && x <= item.x + item.w + 1 && y >= item.y - 1 && y <= item.y + item.h + 1
+    )
+    if (hit) setHover({ x, y, text: requestTooltip(hit.request, labels) })
+    else if (hover) setHover(null)
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsxs('div', {
+        ref: wrapRef,
+        className: 'relative h-[190px] w-full rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) p-1',
+        onMouseMove: onMove,
+        onMouseLeave: () => setHover(null),
+        children: [
+          jsx('canvas', {
+            ref: canvasRef,
+            className: 'block h-full w-full',
+            role: 'img',
+            'aria-label': 'Swim-lane timeline: one lane per local server with traffic, one stacked bar per request, dim prefill and bright decode, with concurrency and throughput scale labels'
+          }),
+          hover
+            ? jsx('div', {
+                className: 'pointer-events-none absolute z-10 max-w-[340px] rounded border border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) px-2 py-1 text-[0.6rem] leading-relaxed text-(--ui-text-secondary) shadow-lg',
+                style: {
+                  left: `${Math.min(hover.x + 10, Math.max(8, size.width - 350))}px`,
+                  top: `${Math.min(hover.y + 12, Math.max(8, size.height - 60))}px`
+                },
+                children: hover.text
+              })
+            : null
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5 text-[0.55rem] text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { className: 'font-medium', children: 'dim = prefill, bright = decode' }),
+          legend.map(entry =>
+            jsxs('span', {
+              className: 'inline-flex items-center gap-1',
+              children: [
+                jsx('span', { className: 'size-1 rounded-full', style: { background: entry.color } }),
+                jsx('span', { children: entry.label })
+              ]
+            }, entry.key)
+          ),
+          legend.length >= 8
+            ? jsx('span', { children: '+more agents' })
+            : null
+        ]
+      })
+    ]
   })
 }
 
 // ---------------------------------------------------------------------------
 // By agent — profile → session → subagents and cron runs.
 
+function modelTone(laneId) {
+  const text = String(laneId || '')
+  let hash = 0
+  for (let i = 0; i < text.length; i += 1) hash = (hash * 31 + text.charCodeAt(i)) % 997
+  return AGENT_PALETTE[hash % AGENT_PALETTE.length]
+}
+
+function aggregateModels(rows) {
+  const byLane = new Map()
+  for (const row of rows || []) {
+    for (const model of row.models || []) {
+      const existing = byLane.get(model.lane_id)
+      if (!existing) {
+        byLane.set(model.lane_id, { ...model })
+        continue
+      }
+      existing.requests += model.requests || 0
+      existing.in_flight += model.in_flight || 0
+      existing.tokens_in += model.tokens_in || 0
+      existing.tokens_out += model.tokens_out || 0
+      existing.cached_tokens += model.cached_tokens || 0
+    }
+  }
+  return [...byLane.values()].sort((a, b) => (b.requests || 0) - (a.requests || 0))
+}
+
+function ModelChip({ model }) {
+  const tone = modelTone(model.lane_id)
+  const inFlight = (model.in_flight || 0) > 0
+  return jsxs('span', {
+    className: cn(
+      'inline-flex items-center gap-1 rounded border px-1 py-px text-[0.55rem] tabular-nums',
+      inFlight && 'animate-pulse'
+    ),
+    style: { borderColor: tone, color: tone },
+    title: `${model.label} · ${model.requests} requests${inFlight ? ` · ${model.in_flight} in flight` : ''} · ${fmtTokens(model.tokens_in)} in / ${fmtTokens(model.tokens_out)} out`,
+    children: [
+      jsx('span', { className: 'size-1 rounded-full', style: { background: tone } }),
+      jsx('span', { className: 'max-w-[150px] truncate', children: model.label }),
+      jsx('span', { className: 'text-(--ui-text-quaternary)', children: fmtInt(model.requests) })
+    ]
+  })
+}
+
+function ModelMixBar({ models }) {
+  const total = (models || []).reduce((sum, model) => sum + (model.requests || 0), 0)
+  if (!total) return null
+  return jsx('div', {
+    className: 'flex h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-(--ui-bg-tertiary)',
+    title: models.map(model => `${model.label}: ${model.requests}`).join(' · '),
+    children: models.map(model =>
+      jsx('span', {
+        style: {
+          width: `${((model.requests || 0) / total) * 100}%`,
+          background: modelTone(model.lane_id)
+        }
+      }, model.lane_id)
+    )
+  })
+}
+
 function AgentRow({ row, labels, now, depth }) {
   const inFlight = row.in_flight || 0
-  const elapsed = elapsedOf(row.oldest_started_at, now)
+  const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
   const models = Array.isArray(row.models) ? row.models : []
+  const cachedPct = row.tokens_in ? Math.round(((row.cached_tokens || 0) / row.tokens_in) * 100) : null
   return jsxs('div', {
     className: cn(
       'flex items-center gap-2 rounded-[4px] py-1 pr-2 text-[0.75rem] transition-colors',
@@ -1067,30 +1309,55 @@ function AgentRow({ row, labels, now, depth }) {
         className: cn('size-2 shrink-0', inFlight > 0 && 'animate-pulse')
       }),
       jsx('span', {
-        className: cn('min-w-0 truncate', inFlight > 0 ? 'font-medium text-(--ui-text-primary)' : 'text-(--ui-text-secondary)'),
+        className: cn('min-w-0 flex-1 truncate', inFlight > 0 ? 'font-medium text-(--ui-text-primary)' : 'text-(--ui-text-secondary)'),
+        title: agentLabel(row, labels),
         children: agentLabel(row, labels)
       }),
       row.kind === 'subagent' || row.kind === 'cron'
         ? jsx(Badge, { variant: 'outline', size: 'xs', children: row.kind })
         : null,
       models.length
-        ? jsx('span', {
-            className: 'hidden min-w-0 truncate font-mono text-[0.6rem] text-(--ui-text-quaternary) sm:inline',
-            children: models.join(' · ')
+        ? jsxs('span', {
+            className: 'hidden min-w-0 items-center gap-1 lg:inline-flex',
+            children: models.slice(0, 3).map(model => jsx(ModelChip, { model }, model.lane_id))
           })
         : null,
+      models.length > 3
+        ? jsx('span', { className: 'hidden text-[0.55rem] text-(--ui-text-quaternary) lg:inline', children: `+${models.length - 3}` })
+        : null,
+      jsx(ModelMixBar, { models }),
       jsx('span', {
-        className: 'ml-auto shrink-0 tabular-nums text-(--ui-text-tertiary)',
-        children: elapsed || '—'
-      }),
-      jsx(Badge, {
-        variant: inFlight > 0 ? 'success' : 'muted',
-        size: 'xs',
-        children: `${inFlight} in flight`
+        className: 'w-16 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
+        title: 'in flight · elapsed of the oldest in-flight request',
+        children: inFlight ? `${inFlight} · ${elapsed || '—'}` : '—'
       }),
       jsx('span', {
-        className: 'w-16 shrink-0 text-right tabular-nums text-(--ui-text-quaternary)',
-        children: `${row.requests_5m || 0} req/5m`
+        className: 'w-14 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
+        title: 'requests in the window',
+        children: `${fmtInt(row.requests_5m)} req`
+      }),
+      jsx('span', {
+        className: 'w-24 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
+        title: 'tokens in / out (cached %)',
+        children: `${fmtTokens(row.tokens_in)}/${fmtTokens(row.tokens_out)}${cachedPct != null ? ` (${cachedPct}%)` : ''}`
+      }),
+      jsx('span', {
+        className: 'w-12 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
+        title: 'latency p50',
+        children: fmtMs(row.latency_ms_p50)
+      }),
+      jsx('span', {
+        className: 'w-12 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
+        title: 'TTFT p50',
+        children: fmtMs(row.ttft_ms_p50)
+      }),
+      jsx('span', {
+        className: cn(
+          'w-8 shrink-0 text-right text-[0.6rem] tabular-nums',
+          (row.errors_5m || 0) > 0 ? 'text-(--ui-destructive)' : 'text-(--ui-text-quaternary)'
+        ),
+        title: 'errors in the window',
+        children: fmtInt(row.errors_5m)
       })
     ]
   })
@@ -1120,58 +1387,81 @@ function AgentTree({ agents, labels, now }) {
 
   return jsxs('div', {
     className: 'flex flex-col gap-3',
-    children: groups.map(([profile, roots]) => {
-      const inFlight = roots.reduce((sum, row) => sum + (row.in_flight || 0), 0)
-      const requests = roots.reduce((sum, row) => sum + (row.requests_5m || 0), 0)
-      return jsxs(
-        'section',
-        {
-          className: 'flex flex-col gap-1',
-          children: [
-            jsxs('div', {
-              className: 'flex items-center gap-2 px-2',
-              children: [
-                jsx('span', {
-                  className: 'size-2 rounded-full',
-                  style: { background: profileTone(profile) }
-                }),
-                jsx('span', {
-                  className: 'text-[0.75rem] font-semibold text-(--ui-text-primary)',
-                  children: profile
-                }),
-                jsx('span', {
-                  className: 'text-[0.65rem] tabular-nums text-(--ui-text-quaternary)',
-                  children: `${plural(roots.length, 'session')} · ${inFlight} in flight · ${requests} req/5m`
-                })
-              ]
-            }),
-            roots.map(root =>
-              jsxs(
-                'div',
-                {
-                  className: 'flex flex-col gap-0.5',
-                  children: [
-                    jsx(AgentRow, { row: root, labels, now }),
-                    (root.children || []).map(child =>
-                      jsx(AgentRow, { row: child, labels, now, depth: true }, `${root.session_id}-${child.session_id}`)
-                    )
-                  ]
-                },
-                root.session_id
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-2 px-2 text-[0.55rem] uppercase tracking-[0.08em] text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { className: 'min-w-0 flex-1', children: 'agent' }),
+          jsx('span', { className: 'hidden lg:inline', children: 'models' }),
+          jsx('span', { className: 'w-24 shrink-0 text-right', children: 'mix' }),
+          jsx('span', { className: 'w-16 shrink-0 text-right', children: 'flight' }),
+          jsx('span', { className: 'w-14 shrink-0 text-right', children: 'req' }),
+          jsx('span', { className: 'w-24 shrink-0 text-right', children: 'tok in/out' }),
+          jsx('span', { className: 'w-12 shrink-0 text-right', children: 'lat' }),
+          jsx('span', { className: 'w-12 shrink-0 text-right', children: 'ttft' }),
+          jsx('span', { className: 'w-8 shrink-0 text-right', children: 'err' })
+        ]
+      }),
+      ...groups.map(([profile, roots]) => {
+        const inFlight = roots.reduce((sum, row) => sum + (row.in_flight || 0), 0)
+        const requests = roots.reduce((sum, row) => sum + (row.requests_5m || 0), 0)
+        const tokensIn = roots.reduce((sum, row) => sum + (row.tokens_in || 0), 0)
+        const tokensOut = roots.reduce((sum, row) => sum + (row.tokens_out || 0), 0)
+        const models = aggregateModels(roots)
+        return jsxs(
+          'section',
+          {
+            className: 'flex flex-col gap-1',
+            children: [
+              jsxs('div', {
+                className: 'flex flex-wrap items-center gap-2 px-2',
+                children: [
+                  jsx('span', {
+                    className: 'size-2 rounded-full',
+                    style: { background: profileTone(profile) }
+                  }),
+                  jsx('span', {
+                    className: 'text-[0.75rem] font-semibold text-(--ui-text-primary)',
+                    children: profile
+                  }),
+                  jsx('span', {
+                    className: 'text-[0.65rem] tabular-nums text-(--ui-text-quaternary)',
+                    children: `${plural(roots.length, 'session')} · ${inFlight} in flight · ${requests} req/5m · ${fmtTokens(tokensIn)}/${fmtTokens(tokensOut)} tok`
+                  }),
+                  models.slice(0, 4).map(model => jsx(ModelChip, { model }, `profile-${model.lane_id}`)),
+                  models.length > 4
+                    ? jsx('span', { className: 'text-[0.55rem] text-(--ui-text-quaternary)', children: `+${models.length - 4}` })
+                    : null
+                ]
+              }),
+              roots.map(root =>
+                jsxs(
+                  'div',
+                  {
+                    className: 'flex flex-col gap-0.5',
+                    children: [
+                      jsx(AgentRow, { row: root, labels, now }),
+                      (root.children || []).map(child =>
+                        jsx(AgentRow, { row: child, labels, now, depth: true }, `${root.session_id}-${child.session_id}`)
+                      )
+                    ]
+                  },
+                  root.session_id
+                )
               )
-            )
-          ]
-        },
-        profile
-      )
-    })
+            ]
+          },
+          profile
+        )
+      })
+    ]
   })
 }
 
 // ---------------------------------------------------------------------------
 // Page.
 
-function ModelView({ snapshot, labels, now, windowSeconds }) {
+function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
   // A declared cloud endpoint is a lane, not a local server: it has no gauge
   // and belongs in the cloud cards, never in the local capacity section.
   const servers = (Array.isArray(snapshot.servers) ? snapshot.servers : []).filter(
@@ -1179,6 +1469,7 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
   )
   const models = Array.isArray(snapshot.models) ? snapshot.models : []
   const unreachable = Array.isArray(snapshot.unreachable) ? snapshot.unreachable : []
+  const idle = Array.isArray(snapshot.idle) ? snapshot.idle : []
   const source = snapshot.servers_source || 'none'
   const cloud = models.filter(model => model.lane === 'cloud')
   const orphan = models.filter(model => model.lane !== 'cloud' &&
@@ -1263,6 +1554,44 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
                     })
                   ]
                 })
+              : null,
+            idle.length
+              ? jsxs('details', {
+                  className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  children: [
+                    jsx('summary', {
+                      className: 'cursor-pointer select-none',
+                      children: `Idle · not used by Hermes (${idle.length})`
+                    }),
+                    jsx('div', {
+                      className: 'flex flex-col gap-0.5 pt-1',
+                      children: idle.map(item =>
+                        jsxs('div', {
+                          className: 'flex items-baseline gap-2',
+                          children: [
+                            jsx('span', {
+                              className: 'min-w-0 truncate font-mono text-[0.6rem]',
+                              children: item.name || item.base_url
+                            }),
+                            jsx('span', {
+                              className: 'min-w-0 flex-1 truncate font-mono text-[0.55rem]',
+                              children: item.base_url
+                            }),
+                            onHide
+                              ? jsx(Button, {
+                                  variant: 'ghost',
+                                  size: 'xs',
+                                  title: `Hide ${item.name || item.base_url} from every Flightdeck view`,
+                                  onClick: () => onHide(item),
+                                  children: 'hide'
+                                })
+                              : null
+                          ]
+                        }, item.base_url || item.name)
+                      )
+                    })
+                  ]
+                })
               : null
           ]
         })
@@ -1270,7 +1599,7 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
       servers.length
         ? jsx(Section, {
             label: 'Swim lane',
-            meta: `last ${fmtDuration(windowSeconds)} · decode bright, prefill dim, bars = oldest in-flight request per agent`,
+            meta: `last ${fmtDuration(windowSeconds)} · one lane per server with traffic · dim = prefill, bright = decode · stacked bars = concurrency`,
             children: jsx(SwimLane, { servers, labels, windowSeconds, now })
           })
         : null,
@@ -1323,6 +1652,26 @@ function FlightdeckPage() {
   const reachableServers = snapshot && Array.isArray(snapshot.servers)
     ? snapshot.servers.filter(server => server && !server.error).length
     : 0
+  const [hideError, setHideError] = useState(null)
+
+  // Hide an idle server everywhere: append its base_url to the plugin setting
+  // through the gateway's plugins.manage settings write, then refetch.
+  const hideServer = async item => {
+    const current = snapshot && Array.isArray(snapshot.hidden_servers) ? snapshot.hidden_servers : []
+    const target = item.base_url || item.name
+    const next = current.includes(target) ? current : [...current, target]
+    try {
+      await host.request('plugins.manage', {
+        action: 'settings',
+        key: 'flightdeck',
+        values: { hidden_servers: next }
+      })
+      setHideError(null)
+      snapshotQ.refetch()
+    } catch (err) {
+      setHideError(`Could not hide ${item.name || target}: ${err && err.message ? err.message : 'settings write failed'}`)
+    }
+  }
 
   const header = jsxs('div', {
     className: 'flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-(--ui-stroke-secondary) px-3 py-2',
@@ -1392,7 +1741,10 @@ function FlightdeckPage() {
         : null,
       jsx('span', {
         children: `· window ${fmtDuration(windowSeconds)} · polls every ${POLL_MS / 1000}s`
-      })
+      }),
+      hideError
+        ? jsx('span', { className: 'text-(--ui-destructive)', children: hideError })
+        : null
     ]
   })
 
@@ -1426,7 +1778,7 @@ function FlightdeckPage() {
       children:
         view === 'agent'
           ? jsx(AgentView, { snapshot, labels, now, windowSeconds })
-          : jsx(ModelView, { snapshot, labels, now, windowSeconds })
+          : jsx(ModelView, { snapshot, labels, now, windowSeconds, onHide: hideServer })
     })
   }
 

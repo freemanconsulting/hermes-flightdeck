@@ -59,7 +59,7 @@ def model(snapshot_payload, key):
 def test_snapshot_shape_is_pinned(conn):
     payload = snapshot(conn)
     assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
-                             "unreachable", "models", "agents"]
+                             "unreachable", "idle", "hidden_servers", "models", "agents"]
     assert payload["servers_source"] == "declared"
     assert payload["window"] == {"seconds": 300, "since": NOW - 300}
     assert list(payload["totals"]) == ["in_flight", "requests_1m", "requests_5m", "errors_5m"]
@@ -94,11 +94,43 @@ def test_snapshot_shape_is_pinned(conn):
     agent = payload["agents"][0]
     assert list(agent) == [
         "profile", "session_id", "label", "kind", "parent_session_id", "cron_job",
-        "in_flight", "requests_5m", "errors_5m", "models", "oldest_started_at", "children",
+        "in_flight", "requests_5m", "errors_5m", "models", "oldest_started_at",
+        "tokens_in", "tokens_out", "cached_tokens", "latency_ms_p50", "ttft_ms_p50", "children",
     ]
     assert agent["label"] == ""
     assert agent["children"][0]["kind"] == "subagent"
     assert agent["children"][0]["role"] == "general"
+    # Per-node model breakdown: one entry per model lane, with counts and tokens.
+    # s1 also carries a cloud anthropic lane, so three chips, not two.
+    assert [chip["requests"] for chip in agent["models"]] == [5, 2, 2]
+    assert list(agent["models"][0]) == [
+        "lane_id", "label", "local", "requests", "in_flight",
+        "tokens_in", "tokens_out", "cached_tokens",
+    ]
+    assert agent["models"][0]["label"] == "ds4 · qwen38-27b-q4-q8kv-mtp3"
+    assert agent["models"][0]["local"] is True
+    assert agent["models"][0]["lane_id"] == DS4
+    assert agent["models"][0]["in_flight"] == 2
+    assert agent["models"][0]["tokens_in"] == 18000
+    assert agent["models"][0]["tokens_out"] == 1200
+    assert agent["models"][0]["cached_tokens"] == 14000
+    assert agent["models"][1]["label"] == "GN100 · qwen38-flash-next-tf-fp4"
+    assert agent["models"][1]["requests"] == 2
+    assert agent["models"][1]["local"] is True
+    # A server card existing does not make a lane local: the cloud anthropic
+    # lane is a chip with local False, grouped by provider not base_url.
+    assert agent["models"][2]["label"] == "anthropic/claude-opus-5-5"
+    assert agent["models"][2]["local"] is False
+    assert agent["models"][2]["lane_id"] == "cloud:anthropic"
+    assert agent["models"][2]["in_flight"] == 1
+    assert agent["models"][2]["tokens_in"] == 18000
+    assert agent["models"][2]["tokens_out"] == 900
+    assert agent["models"][2]["cached_tokens"] == 12000
+    assert agent["tokens_in"] == 66000 and agent["tokens_out"] == 3600
+    assert agent["cached_tokens"] == 50000
+    # Latency p50 over all five ended s1 rows (500, 1000, 2000, 4000, 6000 ms)
+    # is 2000; TTFT p50 over the four with a first chunk stays 200.
+    assert agent["latency_ms_p50"] == 2000.0 and agent["ttft_ms_p50"] == 200.0
 
 
 # --- §9.1 per-request rows (the swim-lane) -----------------------------------
@@ -539,7 +571,7 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
 
     payload = asyncio.run(module.snapshot("5m"))
     assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
-                             "unreachable", "models", "agents"]
+                             "unreachable", "idle", "hidden_servers", "models", "agents"]
     assert payload["totals"]["in_flight"] == 6
 
     assert len(module.agents("1m")["agents"]) == 2
@@ -584,3 +616,24 @@ def test_local_lanes_group_by_base_url_and_model_not_provider(conn):
     assert cards[0]["server_name"] == "studio-ds4"
     assert cards[0]["provider_aliases"] == ["custom", "studio-ds4"]
     assert cards[0]["in_flight"] == 2
+
+
+def test_idle_discovered_server_is_grouped_out_of_the_cards(conn):
+    spare = {"name": "spare", "title": None, "base_url": "http://127.0.0.1:18077",
+             "kind": "llamacpp", "healthy": True, "models": ["spare-model"],
+             "running": 0, "waiting": 0, "slots": 4,
+             "decode_tps": None, "prefill_tps": None,
+             "sampled_at": api._now_iso(NOW), "error": None}
+    payload = snapshot(conn, servers=make_example.server_samples() + [spare],
+                       servers_source="discovered")
+    assert [item["name"] for item in payload["idle"]] == ["spare"]
+    assert payload["idle"][0]["base_url"] == "http://127.0.0.1:18077"
+    assert [card["name"] for card in payload["servers"]] == ["ds4", "GN100", "anthropic"]
+    assert not any(model["server_name"] == "spare" for model in payload["models"])
+
+
+def test_hidden_servers_never_render(conn):
+    payload = snapshot(conn, servers=make_example.server_samples(), hidden_servers=["GN100"])
+    assert [card["name"] for card in payload["servers"]] == ["ds4", "anthropic"]
+    assert payload["hidden_servers"] == ["GN100"]
+    assert not any(model["server_name"] == "GN100" for model in payload["models"])

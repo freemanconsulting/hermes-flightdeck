@@ -531,6 +531,11 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
     {"name": "studio-worker", "base_url": "http://127.0.0.1:18012",
      "error": "/health: URLError ... (connection refused)", "since": 1762540700.0}
   ],
+  "idle": [
+    {"name": "studio-worker", "title": null, "base_url": "http://127.0.0.1:18012",
+     "kind": "tensorfold"}
+  ],
+  "hidden_servers": ["gb10-qwen"],
   "models": [
     {
       "key": "ds4|qwen38-27b-q4-q8kv-mtp3", "model": "qwen38-27b-q4-q8kv-mtp3",
@@ -554,7 +559,17 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
       "profile": "default", "session_id": "s1", "label": "", "kind": "session",
       "parent_session_id": null, "cron_job": null,
       "in_flight": 1, "requests_5m": 9, "errors_5m": 0,
-      "models": ["ds4"], "oldest_started_at": 1762540759.0,
+      "models": [
+        {"lane_id": "http://127.0.0.1:18010", "label": "ds4 · qwen38-27b-q4-q8kv-mtp3",
+         "local": true, "requests": 5, "in_flight": 2,
+         "tokens_in": 18000, "tokens_out": 1200, "cached_tokens": 14000},
+        {"lane_id": "cloud:anthropic", "label": "anthropic/claude-opus-5-5",
+         "local": false, "requests": 2, "in_flight": 1,
+         "tokens_in": 18000, "tokens_out": 900, "cached_tokens": 12000}
+      ],
+      "oldest_started_at": 1762540759.0,
+      "tokens_in": 66000, "tokens_out": 3600, "cached_tokens": 50000,
+      "latency_ms_p50": 2000.0, "ttft_ms_p50": 200.0,
       "children": [{"session_id": "s2", "label": "", "kind": "subagent",
                     "role": "general", "goal": "metrics adapters", "in_flight": 1, "requests_5m": 4}]
     }
@@ -571,6 +586,36 @@ unknown, never `0`-as-unknown. `name` is the short card label (declared name →
 `{name, base_url, error, since}`. Declared servers never move there. `servers_source` is
 `declared`|`discovered`|`none` — `discovered` even when discovery found nothing, so the UI can tell
 "discovery is on and empty" from "nothing declared".
+
+`idle` is always present (`[]` when none): discovered **non-cloud** servers with no Hermes request in the
+retention window (`retention_hours`, default 24 h) and no running/waiting slot, as
+`{name, title, base_url, kind}` — the collapsed "Idle · not used by Hermes" group. Declared servers never
+move there; a cloud card never does either. `hidden_servers` echoes the filter the snapshot ran with
+(settings `hidden_servers`, or the caller's list): entries match a sample by `name` or by normalized
+`base_url`, and a matched sample never becomes a server card, a model card's server metrics, or an
+`idle` row. It is always present (`[]` when nothing is hidden), so the UI can show "N hidden" without
+guessing.
+
+**Server card names** follow §7.2, including the aux-only rule: an endpoint that appears only in a
+profile's `auxiliary` block is named after **the model it serves** (`short_model_name`:
+`Qwen3.5-9B.Q6_K.gguf` → `qwen3.5-9b`) or, when it serves no model id, `host:port` — never after the
+role key, because `vision` or `compression` is a role, not a server. Such a config entry carries
+`aux: true` and `roles: [<role key>, …]`, and its `title` is `helper model for: <roles> · host:port`.
+A provider key on the same normalized `base_url` wins: it replaces the aux label and drops `aux`/`roles`
+from the merged entry, so `aux` only survives on an endpoint no provider declares. `aux` is a config /
+discovery field — a snapshot server card does not carry it (its `name`/`title` already encode the rule).
+
+**`node.models`** is the per-node model breakdown: one chip per model lane the node used in the window,
+`{lane_id, label, local, requests, in_flight, tokens_in, tokens_out, cached_tokens}`. `local` means the
+lane is **not cloud** — the same rule as a model card's `lane` and `_lane_for`: a server card decides by
+`kind`, else a private/loopback `base_url` is local and anything else is cloud. A cloud card existing
+does not make its lane local (`api.anthropic.com` is `local: false`). `lane_id` is the normalized
+`base_url` for a local lane and `cloud:<provider>` for a cloud lane, so chips merge across sessions and
+profile rows; `label` is `<server name> · <model>` (`ds4 · qwen38-27b-q4-q8kv-mtp3`) or
+`<provider>/<model>` (`anthropic/claude-opus-5-5`). Counts and tokens are summed over the node's rows
+(unknown tokens count as `0`); chips sort by `in_flight` desc, `requests` desc, `label`. The node's own
+`tokens_in`/`tokens_out`/`cached_tokens` are the same sums over every row, cloud lanes included, so they
+equal the chip sums. A child node carries the same fields as a root node plus `role` and `goal`.
 
 Each model card carries `streamed` / `non_streamed` (finished rows split by the §8 rule), `ttft_ms_p50/p95`
 (streamed rows only, `null` when none), `latency_ms_p50/p95` (all finished rows), and `requests_buckets`

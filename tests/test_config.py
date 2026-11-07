@@ -144,6 +144,7 @@ providers:
     name: ds4
 auxiliary:
   vision:
+    model: Qwen3.5-9B.Q6_K.gguf
     base_url: http://127.0.0.1:18436/v1
     fallback_chain:
       - base_url: http://192.168.1.60:18011/v1
@@ -155,5 +156,50 @@ auxiliary:
     assert [server["base_url"] for server in servers] == [
         "http://127.0.0.1:18010", "http://127.0.0.1:18436", "http://192.168.1.60:18011",
     ]
-    assert servers[1]["name"] == "vision"
-    assert servers[2]["name"] == "vision"
+    # Named after the model it serves, never after the auxiliary role key.
+    assert servers[1]["name"] == "qwen3.5-9b"
+    assert servers[1]["aux"] is True
+    assert servers[1]["title"] == "helper model for: vision · 127.0.0.1:18436"
+    assert servers[2]["name"] == "qwen3.5-9b"
+    assert servers[2]["title"] == "helper model for: vision · 192.168.1.60:18011"
+
+
+def test_hidden_servers_filter_cards_by_name_or_base_url(tmp_path, monkeypatch):
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", """
+providers:
+  ds4:
+    api: http://127.0.0.1:18010/v1
+  GN100:
+    api: http://127.0.0.1:18009/v1
+""")
+
+    class _HiddenCtx:
+        def get_config(self, key, default=None):
+            if key == "hidden_servers":
+                return ["GN100"]
+            return default
+
+    settings = config.load(ctx=_HiddenCtx())
+
+    assert [server["name"] for server in settings["servers"]] == ["ds4"]
+    assert settings["hidden_servers"] == ["GN100"]
+
+
+def test_auxiliary_label_loses_to_a_provider_key(tmp_path, monkeypatch):
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", """
+providers:
+  studio-ds4:
+    api: http://127.0.0.1:18010/v1
+    name: Studio DeepSeek
+auxiliary:
+  title_generation:
+    model: Qwen3.5-9B.Q6_K.gguf
+    base_url: http://127.0.0.1:18010/v1
+""")
+
+    servers = config.discover(config=None)
+
+    assert servers[0]["name"] == "studio-ds4"
+    assert "aux" not in servers[0]

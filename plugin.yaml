@@ -31,6 +31,11 @@ config_schema:
   auto_discover:
     type: boolean
     default: true
+  hidden_servers:
+    type: array
+    description: "Servers to hide everywhere (cards, chip, fleet_status), by name or base_url. Idle servers can be hidden from the page."
+    items:
+      type: string
   poll_interval_seconds:
     type: integer
     default: 5

@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ ROOT_PROFILE_LABEL = "default"
 
 DEFAULTS: dict[str, Any] = {
     "servers": [],
+    "hidden_servers": [],
     "auto_discover": True,
     "poll_interval_seconds": 5,
     "probe_timeout_seconds": 2.0,
@@ -175,6 +177,65 @@ def _normalize_servers(raw: Any) -> list[dict]:
     return servers
 
 
+_AUX_SUFFIX = re.compile(
+    r"\.(?:gguf|safetensors|bin|fp\d+|bf\d+|int\d+|iq\d+(?:_\w+)?|q\d+(?:_\w+)?)$",
+    re.IGNORECASE,
+)
+
+
+def short_model_name(model: Any) -> str:
+    """The model's short label: ``Qwen3.5-9B.Q6_K.gguf`` → ``qwen3.5-9b``.
+
+    Strips the path, the file format and a quantization suffix (repeatedly, so
+    ``.Q6_K.gguf`` goes too).  An auxiliary endpoint is named after the model it
+    serves, never after the role key that points at it (DESIGN §7.2).
+    """
+    text = str(model or "").strip()
+    if not text:
+        return ""
+    text = Path(text.replace("\\", "/")).name
+    for _ in range(4):
+        stripped = _AUX_SUFFIX.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    return text.lower()
+
+
+def _normalize_hidden(raw: Any) -> list[str]:
+    """Accept the settings list (or a JSON string) and return clean, unique names."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    hidden: list[str] = []
+    for entry in raw:
+        text = str(entry or "").strip()
+        if text and text not in hidden:
+            hidden.append(text)
+    return hidden
+
+
+def _is_hidden_server(server: dict, hidden: list[str]) -> bool:
+    """A server matches a ``hidden_servers`` entry by name or normalized base_url."""
+    if not hidden:
+        return False
+    name = str(server.get("name") or "").strip().lower()
+    url = normalize_base_url(server.get("base_url"))
+    for entry in hidden:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        if name and text.lower() == name:
+            return True
+        if url and normalize_base_url(text) == url:
+            return True
+    return False
+
+
 def _read_config() -> dict:
     try:
         from hermes_cli.config import load_config_readonly
@@ -291,10 +352,15 @@ def _union_servers(sources: list[tuple[str, dict]], *, declared: bool) -> list[d
                             continue
                         base_url = normalize_base_url(api)
                         if base_url:
+                            # Name an auxiliary-only endpoint after the model it
+                            # serves, never after the role key: "vision" is not a
+                            # server.  Provider keys still win (dedupe below).
                             entries.append({
-                                "name": str(key),
+                                "name": short_model_name(entry.get("model")) or host_port(base_url),
                                 "title": None,
                                 "key": str(key),
+                                "aux": True,
+                                "roles": [str(key)],
                                 "base_url": base_url,
                                 "kind": "auto",
                             })
@@ -308,11 +374,27 @@ def _union_servers(sources: list[tuple[str, dict]], *, declared: bool) -> list[d
                     existing["profiles"].append(profile)
                 if not existing.get("title") and entry.get("title"):
                     existing["title"] = entry["title"]
+                if existing.get("aux") and entry.get("aux"):
+                    for role in entry.get("roles") or []:
+                        if role not in existing.setdefault("roles", []):
+                            existing["roles"].append(role)
+                elif existing.get("aux") and not entry.get("aux"):
+                    # A provider key names the same endpoint: it wins over the
+                    # auxiliary role label.
+                    existing["name"] = entry["name"]
+                    existing["title"] = entry.get("title")
+                    existing["key"] = entry.get("key")
+                    existing.pop("aux", None)
+                    existing.pop("roles", None)
                 continue
             server = dict(entry)
             server["profiles"] = [profile]
             by_url[base_url] = server
             servers.append(server)
+    for server in servers:
+        if server.get("aux"):
+            roles = ", ".join(server.get("roles") or [])
+            server["title"] = f"helper model for: {roles} · {host_port(server.get('base_url'))}"
     return servers
 
 
@@ -383,6 +465,7 @@ def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> d
     raw = _settings_from_ctx(ctx) if ctx is not None else _settings_from_config(_read_config())
     settings = dict(DEFAULTS)
     settings.update({key: value for key, value in raw.items() if key in DEFAULTS})
+    hidden = _normalize_hidden(settings.get("hidden_servers"))
     servers = _declared_servers()
     source = "declared" if servers else "none"
     if not servers and _as_bool(settings.get("auto_discover"), True):
@@ -390,9 +473,12 @@ def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> d
         # "discovered" even when the search found nothing: the UI needs to tell
         # "discovery is on and found no servers" from "nothing declared".
         source = "discovered"
+    # Hidden servers never render: no card, no chip, no fleet_status lane.
+    servers = [server for server in servers if not _is_hidden_server(server, hidden)]
     return {
         "servers": servers,
         "servers_source": source,
+        "hidden_servers": hidden,
         "auto_discover": _as_bool(settings.get("auto_discover"), True),
         "poll_interval_seconds": _as_int(settings.get("poll_interval_seconds"), 5, minimum=2),
         "probe_timeout_seconds": _as_float(settings.get("probe_timeout_seconds"), 2.0),

@@ -610,6 +610,46 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
 # ---------------------------------------------------------------------------
 
 
+def _agent_models(items: list[dict], server_by_url: dict[str, dict]) -> list[dict]:
+    """Per-node model breakdown: one entry per model lane used in the window.
+
+    Local lanes are labelled by the server card's short name plus the model
+    (``studio-ds4 · ds4``); cloud lanes by ``provider/model``.  ``lane_id`` is
+    the normalized base_url for a local lane and ``cloud:<provider>`` for a
+    cloud lane, so the UI can merge chips across sessions and profile rows.
+    """
+    grouped: dict[str, dict] = {}
+    for row in items:
+        base_url = normalize_base_url(row.get("base_url"))
+        # Same rule as ``_lane_for``: a card decides by kind, else the address
+        # does.  A cloud card (anthropic) is not local just because it exists.
+        local = _lane_for(base_url, server_by_url) == "local"
+        model = str(row.get("model") or "")
+        provider = str(row.get("provider") or "")
+        if local:
+            lane_id = base_url or "local:unknown"
+            server_name = _server_name_for(base_url, server_by_url, provider)
+            label = f"{server_name} · {model}" if model else server_name
+        else:
+            lane_id = f"cloud:{provider}" if provider else "cloud:unknown"
+            label = f"{provider}/{model}" if provider and model else (model or provider or "cloud")
+        entry = grouped.get(lane_id)
+        if entry is None:
+            entry = grouped[lane_id] = {
+                "lane_id": lane_id, "label": label, "local": local,
+                "requests": 0, "in_flight": 0,
+                "tokens_in": 0, "tokens_out": 0, "cached_tokens": 0,
+            }
+        entry["requests"] += 1
+        if row.get("status") == "in-flight":
+            entry["in_flight"] += 1
+        entry["tokens_in"] += _int_or_none(row.get("prompt_tokens")) or 0
+        entry["tokens_out"] += _int_or_none(row.get("completion_tokens")) or 0
+        entry["cached_tokens"] += _int_or_none(row.get("cached_tokens")) or 0
+    return sorted(grouped.values(), key=lambda entry: (-entry["in_flight"], -entry["requests"],
+                                                       entry["label"]))
+
+
 def _agent_tree(rows: list[dict], links: dict[str, dict],
                 server_by_url: dict[str, dict] | None = None) -> list[dict]:
     server_by_url = server_by_url or {}
@@ -626,11 +666,17 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
         parent = next((row.get("parent_session_id") for row in items if row.get("parent_session_id")), None)
         cron_job = next((row.get("cron_job_name") or row.get("cron_job_id") for row in items
                          if row.get("cron_job_name") or row.get("cron_job_id")), None)
-        models: list[str] = []
+        ttfts: list[float] = []
+        latencies: list[float] = []
         for row in items:
-            name = _server_name_for(row.get("base_url"), server_by_url, row.get("provider"))
-            if name and name not in models:
-                models.append(name)
+            row_started = _num(row.get("started_at"))
+            first = _num(row.get("first_chunk_at"))
+            ended = _num(row.get("ended_at"))
+            latency = _latency(row_started, ended)
+            if latency is not None:
+                latencies.append(latency * 1000.0)
+            if row_started is not None and first is not None and first >= row_started:
+                ttfts.append((first - row_started) * 1000.0)
         nodes[key] = {
             "profile": profile,
             "session_id": session_id,
@@ -641,8 +687,13 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
             "in_flight": len(in_flight_rows),
             "requests_5m": len(items),
             "errors_5m": sum(1 for row in items if row.get("status") == "error"),
-            "models": models,
+            "models": _agent_models(items, server_by_url),
             "oldest_started_at": min(started) if started else None,
+            "tokens_in": sum(_int_or_none(row.get("prompt_tokens")) or 0 for row in items),
+            "tokens_out": sum(_int_or_none(row.get("completion_tokens")) or 0 for row in items),
+            "cached_tokens": sum(_int_or_none(row.get("cached_tokens")) or 0 for row in items),
+            "latency_ms_p50": _round(_percentile(latencies, 50), 1),
+            "ttft_ms_p50": _round(_percentile(ttfts, 50), 1),
             "children": [],
         }
 
@@ -651,15 +702,11 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
         parent_key = (node["profile"], node["parent_session_id"] or "")
         if node["parent_session_id"] and parent_key in nodes:
             link = links.get(node["session_id"] or "") or {}
-            nodes[parent_key]["children"].append({
-                "session_id": node["session_id"],
-                "label": "",
-                "kind": "subagent",
-                "role": link.get("role") or node.get("kind"),
-                "goal": link.get("goal") or "",
-                "in_flight": node["in_flight"],
-                "requests_5m": node["requests_5m"],
-            })
+            child = dict(node)
+            child.pop("children", None)
+            child["role"] = link.get("role") or node.get("kind")
+            child["goal"] = link.get("goal") or ""
+            nodes[parent_key]["children"].append(child)
         else:
             roots.append(node)
 
@@ -675,19 +722,50 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
 # ---------------------------------------------------------------------------
 
 
+def _requested_urls_since(conn: sqlite3.Connection, since: float) -> set[str]:
+    """Normalized base_urls that served at least one Hermes request since *since*."""
+    rows = _dict_rows(conn.execute(
+        "SELECT DISTINCT base_url FROM requests WHERE started_at >= ?", (float(since),)))
+    return {normalize_base_url(row.get("base_url")) for row in rows if row.get("base_url")}
+
+
+def _sample_hidden(sample: dict, hidden: list[str]) -> bool:
+    """A sample matches a ``hidden_servers`` entry by normalized base_url or name."""
+    if not hidden:
+        return False
+    url = normalize_base_url(sample.get("base_url"))
+    name = str(sample.get("name") or "").strip().lower()
+    for entry in hidden:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        if name and text.lower() == name:
+            return True
+        if url and normalize_base_url(text) == url:
+            return True
+    return False
+
+
 def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                    conn: sqlite3.Connection | None = None, now: float | None = None,
-                   servers_source: str | None = None) -> dict:
+                   servers_source: str | None = None,
+                   hidden_servers: list[str] | None = None,
+                   retention_hours: int | None = None) -> dict:
     """The §9.1 snapshot.  ``servers`` is already-polled samples (dict or list);
     None means poll the declared servers synchronously; [] means no server cards.
     ``servers_source`` overrides the derived source — /servers passes
-    ``discovered`` so dead servers fold out of the chip too (DESIGN §7.2)."""
+    ``discovered`` so dead servers fold out of the chip too (DESIGN §7.2).
+    ``hidden_servers`` filters passed samples by name or base_url; the live path
+    is already filtered by ``config.load``.  ``retention_hours`` bounds the
+    idle-server check (default 24)."""
     conn = conn if conn is not None else _open_conn()
     now = _now() if now is None else float(now)
     since = now - float(window_seconds)
 
+    settings_hidden: list[str] = []
     if servers is None:
         settings = _settings(conn)
+        settings_hidden = list(settings.get("hidden_servers") or [])
         declared = list(settings.get("servers") or [])
         derived_source = str(settings.get("servers_source") or "declared")
         poller = _poller_module()
@@ -698,6 +776,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
             ).values())
         else:
             samples = []
+        if retention_hours is None:
+            retention_hours = settings.get("retention_hours", 24)
     elif isinstance(servers, dict):
         samples = [_sample_dict(value) for value in servers.values()]
         derived_source = "declared"
@@ -705,6 +785,11 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
         samples = [_sample_dict(value) for value in servers]
         derived_source = "declared"
     servers_source = derived_source if servers_source is None else str(servers_source)
+    hidden_list = list(hidden_servers or [])
+    if servers is None and not hidden_list:
+        hidden_list = settings_hidden
+    if hidden_list:
+        samples = [sample for sample in samples if not _sample_hidden(sample, hidden_list)]
 
     rows = _window_rows(conn, since)
     in_flight = _in_flight_rows(conn)
@@ -730,6 +815,27 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
             else:
                 kept.append(card)
         server_cards = kept
+    # Idle servers (DESIGN §9.1): a discovered server with no Hermes request in
+    # the retention window and no running/waiting slot is not a card — it is one
+    # row in the collapsed "Idle · not used by Hermes" group. Declared servers
+    # always stay as cards.
+    idle: list[dict] = []
+    if servers_source != "declared":
+        retention = float(retention_hours if retention_hours is not None else 24)
+        requested_recently = _requested_urls_since(conn, now - retention * 3600.0)
+        kept = []
+        for card in server_cards:
+            busy = (card.get("running") or 0) > 0 or (card.get("waiting") or 0) > 0
+            if card.get("kind") != "cloud" and not busy and normalize_base_url(card["base_url"]) not in requested_recently:
+                idle.append({
+                    "name": card["name"],
+                    "title": card.get("title"),
+                    "base_url": card["base_url"],
+                    "kind": card.get("kind"),
+                })
+            else:
+                kept.append(card)
+        server_cards = kept
     model_cards = _model_cards(rows, server_cards, now, window_seconds)
     agent_nodes = _agent_tree(rows, _subagent_links(conn),
                               {normalize_base_url(card["base_url"]): card for card in server_cards})
@@ -749,6 +855,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
         "servers_source": servers_source,
         "servers": server_cards,
         "unreachable": unreachable,
+        "idle": idle,
+        "hidden_servers": hidden_list,
         "models": model_cards,
         "agents": agent_nodes,
     }
@@ -759,7 +867,14 @@ def build_agents(window_seconds: int = 300, *, conn: sqlite3.Connection | None =
     conn = conn if conn is not None else _open_conn()
     now = _now() if now is None else float(now)
     rows = _window_rows(conn, now - float(window_seconds))
-    return {"agents": _agent_tree(rows, _subagent_links(conn))}
+    # Labels need the server cards' short names; the settings list is enough
+    # (no probe) and matches the page's snapshot cards.
+    server_by_url = {
+        normalize_base_url(server.get("base_url")): server
+        for server in (_settings(conn).get("servers") or [])
+        if server.get("base_url")
+    }
+    return {"agents": _agent_tree(rows, _subagent_links(conn), server_by_url)}
 
 def build_models(window_seconds: int = 300, *, servers: Any = None,
                  conn: sqlite3.Connection | None = None, now: float | None = None,
