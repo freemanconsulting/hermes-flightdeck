@@ -348,7 +348,9 @@ Closure, in three layers:
 
 ### 7.1 Declaring servers
 
-`config_schema.servers` is a JSON list, edited in Settings → Plugins:
+`config_schema.servers` is a JSON list, edited in Settings → Plugins. The lists declared in
+every profile are unioned by normalized base_url (first name wins, referencing profiles
+recorded); when any profile declares servers they win over auto-discovery:
 
 ```json
 [
@@ -365,12 +367,19 @@ declared server (`http://127.0.0.1:18010`).
 
 ### 7.2 Zero-setup auto-discovery
 
-When `servers` is empty (or `auto_discover: true`), `config.py` reads the profile's config with
-`load_config_readonly()` (`plugins/index.md:1054`) and takes every `providers.<key>.api` as a base_url,
-with `providers.<key>.name` as the display name. Only **loopback and private addresses** are probed by
-default (`127.0.0.0/8`, `::1`, `localhost`, RFC1918, `100.64/10`, `.local`, `.tailscale.net`) — probing a
-cloud endpoint on every poll is waste and looks like abuse; a public URL must be declared explicitly.
-Discovery is cached in `meta` for 60 s so a config read does not run per poll.
+When `servers` is empty (or `auto_discover: true`), `config.py` reads **every profile's**
+`config.yaml` — the root profile's `<hermes root>/config.yaml` and each
+`<hermes root>/profiles/*/config.yaml` — with a read-only YAML safe load (never
+`load_config_readonly()`, which would touch the active profile's cache), and takes every
+`providers.<key>.api` as a base_url, with `providers.<key>.name` as the display name.
+Servers are deduped by normalized base_url: the first display name found wins (root first,
+then profiles in sorted order) and each server records the profiles that reference it under
+`profiles` for the UI tooltip. Unreadable files are skipped silently. Only **loopback and
+private addresses** are probed by default (`127.0.0.0/8`, `::1`, `localhost`, RFC1918,
+`100.64/10`, `.local`, `.tailscale.net`) — probing a cloud endpoint on every poll is waste
+and looks like abuse; a public URL must be declared explicitly. Discovery is cached in
+`meta` for 60 s so a config read does not run per poll; an empty result is retried after
+10 s so a fixed config shows up quickly.
 
 ### 7.3 Polling
 
@@ -696,7 +705,7 @@ the CLI without the Desktop. Worth it.
 | 10 | Dependency policy | Stdlib only; no `python_dependencies`, no `pyproject.toml` deps. |
 | 11 | Credentials through Hermes | No credentials needed: local servers need none, cloud traffic is observed, not called. Quota comes from a public RPC, never from `auth.json`/`.env`. |
 | 12 | Approvals and unattended runs | Hooks are observer-only and fail-open; no prompts, no blocking, no spawn. Probes are GET-only with 2 s timeouts and a 5 s floor. |
-| 13 | Risky behaviour disclosed | README + entry description: GET probes to declared/auto-discovered model server endpoints (loopback/private only by default), one shared SQLite under `plugin-data/flightdeck`, 24 h/7 d retention, no message text stored, no telemetry, no credential reads, no shell. The `/profiles` panel (cut line) would add per-profile `config.yaml` reads — disclosed if it ships. |
+| 13 | Risky behaviour disclosed | README + entry description: GET probes to declared/auto-discovered model server endpoints (loopback/private only by default), one shared SQLite under `plugin-data/flightdeck`, 24 h/7 d retention, no message text stored, no telemetry, no credential reads, no shell. Reads every profile's `config.yaml` read-only to find model servers and its own declared settings; disclosed here and in the README. |
 | 14 | Compatibility metadata truthful | `requires_hermes: ">=0.21.6"` in both `plugin.yaml` and the entry; current release v0.23.0. |
 | 15 | No skins or forks | Original. |
 | 16 | One listing per lineage | Original; no fork of a listed plugin. |
@@ -712,9 +721,11 @@ the CLI without the Desktop. Worth it.
 > and no credentials. It makes GET-only requests to the model server endpoints you declare in its
 > settings, or that it auto-discovers from your own provider config (loopback and private addresses only
 > by default), at most once per server per poll interval (5 s by default, 2 s floor, 2 s timeout). It
-> reads the active profile's `config.yaml` to find those providers. No telemetry, no network calls to
-> third-party services, no shell commands, no credential reads. Quota shown on cloud cards comes from the
-> public `session.stats` RPC for the focused session only, and is labelled as such.
+> reads every profile's `config.yaml` read-only — the root profile and every profile under
+> `profiles/*` — to find those providers and its own declared server settings; it never writes to
+> them. No telemetry, no network calls to third-party services, no shell commands, no credential reads.
+> Quota shown on cloud cards comes from the public `session.stats` RPC for the focused session only,
+> and is labelled as such.
 
 ### 12.2 Catalog entry draft (`plugin-catalog/flightdeck.yaml`)
 
@@ -724,7 +735,7 @@ title: Flightdeck
 repo: https://github.com/freemanconsulting/hermes-flightdeck
 sha: <40-hex at submission>
 version: "0.1.0"
-description: "Live air-traffic control for Hermes agents and model servers: every in-flight LLM request, which profile/session/subagent/cron job holds it, and each local model server's slots, queue, prefill and decode throughput, by agent or by model. Disclosure — observer hooks record request metadata (ids, model, provider, base_url, timings, token counts, finish reason, error status) into one local SQLite file shared by all profiles under plugin-data/flightdeck (24h raw, 7d per-minute rollups, no message text); the poller makes GET-only requests to the model server endpoints you declare or that auto-discovery finds in your own provider config (loopback/private only by default), at most once per server per poll interval; reads the active profile's config.yaml; no telemetry, no credential reads, no shell commands."
+description: "Live air-traffic control for Hermes agents and model servers: every in-flight LLM request, which profile/session/subagent/cron job holds it, and each local model server's slots, queue, prefill and decode throughput, by agent or by model. Disclosure — observer hooks record request metadata (ids, model, provider, base_url, timings, token counts, finish reason, error status) into one local SQLite file shared by all profiles under plugin-data/flightdeck (24h raw, 7d per-minute rollups, no message text); the poller makes GET-only requests to the model server endpoints you declare or that auto-discovery finds in your own provider config (loopback/private only by default), at most once per server per poll interval; reads every profile's config.yaml read-only to find model servers and its own settings; no telemetry, no credential reads, no shell commands."
 maintainer: freemanconsulting
 tier: community
 category: desktop

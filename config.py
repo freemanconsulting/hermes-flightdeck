@@ -1,8 +1,9 @@
 """Flightdeck settings: declared servers, zero-setup discovery, poll knobs.
 
 Per-profile settings live in ``plugins.entries.flightdeck.settings`` (DESIGN
-§7.1); discovery reads the profile's provider list read-only (DESIGN §7.2) and
-caches the result in the shared store's ``meta`` table for 60 s. Stdlib only.
+§7.1); discovery reads every profile's provider list read-only (DESIGN §7.2)
+and caches the result in the shared store's ``meta`` table for 60 s. Stdlib
+only apart from the YAML parser Hermes already ships.
 """
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -19,6 +22,8 @@ logger = logging.getLogger(__name__)
 PLUGIN_ID = "flightdeck"
 DISCOVERY_CACHE_KEY = "discovery_cache"
 DISCOVERY_TTL_SECONDS = 60.0
+DISCOVERY_EMPTY_TTL_SECONDS = 10.0
+ROOT_PROFILE_LABEL = "default"
 
 DEFAULTS: dict[str, Any] = {
     "servers": [],
@@ -155,6 +160,106 @@ def _read_config() -> dict:
         return {}
 
 
+def _hermes_root() -> Path:
+    """Machine-wide Hermes root; honours a ``HERMES_HOME`` override."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root())
+    except Exception:
+        env = os.environ.get("HERMES_HOME", "").strip()
+        return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
+def _read_yaml_config(path: Path) -> dict:
+    """Parse one config.yaml read-only; unreadable or non-mapping files are {}."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+    try:
+        import yaml
+
+        data = yaml.safe_load(text)
+    except Exception:
+        try:
+            import hermes_yaml as yaml
+
+            data = yaml.safe_load(text)
+        except Exception:
+            return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _config_sources(config: Optional[dict] = None) -> list[tuple[str, dict]]:
+    """(profile label, config) for the root and every profile, root first.
+
+    Reads the files directly with a YAML safe load — never ``load_config_readonly``,
+    which would touch the active profile's cache. A supplied *config* stands in for
+    the root config.yaml so callers and tests can pin it without touching disk.
+    """
+    root = _hermes_root()
+    sources: list[tuple[str, dict]] = []
+    root_data = config if isinstance(config, dict) else _read_yaml_config(root / "config.yaml")
+    if root_data:
+        sources.append((ROOT_PROFILE_LABEL, root_data))
+    try:
+        profile_dirs = sorted((path for path in (root / "profiles").iterdir() if path.is_dir()),
+                              key=lambda path: path.name)
+    except Exception:
+        profile_dirs = []
+    for directory in profile_dirs:
+        data = _read_yaml_config(directory / "config.yaml")
+        if data:
+            sources.append((directory.name, data))
+    return sources
+
+
+def _union_servers(sources: list[tuple[str, dict]], *, declared: bool) -> list[dict]:
+    """Dedupe servers by base_url across profiles; first name wins, profiles accumulate."""
+    servers: list[dict] = []
+    by_url: dict[str, dict] = {}
+    for profile, data in sources:
+        if declared:
+            entries = _normalize_servers(_settings_from_config(data).get("servers"))
+        else:
+            providers = data.get("providers")
+            entries = []
+            if isinstance(providers, dict):
+                for key, entry in providers.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    api = entry.get("api") or entry.get("base_url")
+                    if not api or not _private_url(api):
+                        continue
+                    base_url = normalize_base_url(api)
+                    if base_url:
+                        entries.append({
+                            "name": str(entry.get("name") or key),
+                            "base_url": base_url,
+                            "kind": "auto",
+                        })
+        for entry in entries:
+            base_url = entry.get("base_url") or ""
+            if not base_url:
+                continue
+            existing = by_url.get(base_url)
+            if existing is not None:
+                if profile not in existing["profiles"]:
+                    existing["profiles"].append(profile)
+                continue
+            server = dict(entry)
+            server["profiles"] = [profile]
+            by_url[base_url] = server
+            servers.append(server)
+    return servers
+
+
+def _declared_servers(config: Optional[dict] = None) -> list[dict]:
+    """Union of ``plugins.entries.flightdeck.settings.servers`` across every profile."""
+    return _union_servers(_config_sources(config), declared=True)
+
+
 def _settings_from_config(config: dict) -> dict:
     entries = ((config.get("plugins") or {}).get("entries") or {})
     entry = entries.get(PLUGIN_ID) if isinstance(entries, dict) else None
@@ -176,9 +281,13 @@ def _settings_from_ctx(ctx: Any) -> dict:
 
 def discover(conn: Any = None, *, config: Optional[dict] = None,
              now: Optional[float] = None) -> list[dict]:
-    """Provider base_urls from the profile config; private addresses only.
+    """Provider base_urls from every profile's config; private addresses only.
 
-    Cached in ``meta`` for 60 s when *conn* is given (no config read per poll).
+    The union covers the root config.yaml and every ``profiles/*/config.yaml``,
+    deduped by normalized base_url with the first display name winning and the
+    referencing profiles recorded under ``profiles``. Cached in ``meta`` for
+    60 s when *conn* is given; an empty result is retried after 10 s so a fixed
+    config shows up quickly.
     """
     moment = float(now if now is not None else time.time())
     if conn is not None:
@@ -190,29 +299,14 @@ def discover(conn: Any = None, *, config: Optional[dict] = None,
         if cached:
             try:
                 payload = json.loads(cached)
-                if moment - float(payload.get("at", 0)) < DISCOVERY_TTL_SECONDS:
-                    return list(payload.get("servers") or [])
+                cached_servers = list(payload.get("servers") or [])
+                age = moment - float(payload.get("at", 0))
+                ttl = DISCOVERY_TTL_SECONDS if cached_servers else DISCOVERY_EMPTY_TTL_SECONDS
+                if age < ttl:
+                    return cached_servers
             except (TypeError, ValueError, AttributeError):
                 pass
-    data = config if isinstance(config, dict) else _read_config()
-    providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
-    servers: list[dict] = []
-    seen: set[str] = set()
-    for key, entry in providers.items():
-        if not isinstance(entry, dict):
-            continue
-        api = entry.get("api") or entry.get("base_url")
-        if not api or not _private_url(api):
-            continue
-        base_url = normalize_base_url(api)
-        if not base_url or base_url in seen:
-            continue
-        seen.add(base_url)
-        servers.append({
-            "name": str(entry.get("name") or key),
-            "base_url": base_url,
-            "kind": "auto",
-        })
+    servers = _union_servers(_config_sources(config), declared=False)
     if conn is not None:
         try:
             _store.meta_set(conn, DISCOVERY_CACHE_KEY,
@@ -223,11 +317,15 @@ def discover(conn: Any = None, *, config: Optional[dict] = None,
 
 
 def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> dict:
-    """Settings with defaults applied; declared servers win, else discovery."""
+    """Settings with defaults applied; declared servers win, else discovery.
+
+    Declared servers are the union across every profile's config.yaml; the
+    remaining knobs come from *ctx* (or the active profile's config).
+    """
     raw = _settings_from_ctx(ctx) if ctx is not None else _settings_from_config(_read_config())
     settings = dict(DEFAULTS)
     settings.update({key: value for key, value in raw.items() if key in DEFAULTS})
-    servers = _normalize_servers(settings.get("servers"))
+    servers = _declared_servers()
     source = "declared" if servers else "none"
     if not servers and _as_bool(settings.get("auto_discover"), True):
         servers = discover(conn, now=now)

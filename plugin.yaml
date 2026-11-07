@@ -15,7 +15,7 @@ provides_hooks:
 config_schema:
   servers:
     type: array
-    description: "Model servers to poll, per profile. Empty means auto-discover from the profile's provider list (private addresses only)."
+    description: "Model servers to poll, machine-wide. Empty means auto-discover from every profile's provider list (private addresses only)."
     items:
       type: object
       properties:
