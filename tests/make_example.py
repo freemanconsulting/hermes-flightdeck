@@ -228,11 +228,13 @@ def seed(conn: sqlite3.Connection, now: float = NOW) -> None:
 def server_samples(now: float = NOW) -> list[dict]:
     """The polled samples the example snapshot is built from (declared servers)."""
     return [
-        {"name": "ds4", "base_url": DS4, "kind": "tensorfold", "healthy": True,
+        {"name": "ds4", "title": "Studio DeepSeek-V4.1-Flash (M5 Ultra, TensorFold fork)",
+         "base_url": DS4, "kind": "tensorfold", "healthy": True,
          "models": [DS4_MODEL], "running": 3, "waiting": 0, "slots": 4,
          "decode_tps": 42.1, "prefill_tps": 3100.0,
          "sampled_at": api._now_iso(now), "error": None},
-        {"name": "GN100", "base_url": GN100, "kind": "tensorfold", "healthy": True,
+        {"name": "GN100", "title": "GN100 Qwen3.8-Flash-Next FP4 TensorFold (trial)",
+         "base_url": GN100, "kind": "tensorfold", "healthy": True,
          "models": [GN100_MODEL], "running": 5, "waiting": 2, "slots": 5,
          "decode_tps": 18.4, "prefill_tps": 900.0,
          "sampled_at": api._now_iso(now), "error": None},

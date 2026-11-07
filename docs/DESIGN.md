@@ -371,15 +371,26 @@ When `servers` is empty (or `auto_discover: true`), `config.py` reads **every pr
 `config.yaml` — the root profile's `<hermes root>/config.yaml` and each
 `<hermes root>/profiles/*/config.yaml` — with a read-only YAML safe load (never
 `load_config_readonly()`, which would touch the active profile's cache), and takes every
-`providers.<key>.api` as a base_url, with `providers.<key>.name` as the display name.
-Servers are deduped by normalized base_url: the first display name found wins (root first,
-then profiles in sorted order) and each server records the profiles that reference it under
-`profiles` for the UI tooltip. Unreadable files are skipped silently. Only **loopback and
-private addresses** are probed by default (`127.0.0.0/8`, `::1`, `localhost`, RFC1918,
-`100.64/10`, `.local`, `.tailscale.net`) — probing a cloud endpoint on every poll is waste
-and looks like abuse; a public URL must be declared explicitly. Discovery is cached in
-`meta` for 60 s so a config read does not run per poll; an empty result is retried after
-10 s so a fixed config shows up quickly.
+`providers.<key>.api` as a base_url. Servers are deduped by normalized base_url: the first
+provider key found wins (root first, then profiles in sorted order) and each server records the
+profiles that reference it under `profiles` for the UI tooltip. Unreadable files are skipped
+silently. Only **loopback and private addresses** are probed by default (`127.0.0.0/8`, `::1`,
+`localhost`, RFC1918, `100.64/10`, `.local`, `.tailscale.net`) — probing a cloud endpoint on every
+poll is waste and looks like abuse; a public URL must be declared explicitly. Discovery is cached
+in `meta` for 60 s so a config read does not run per poll; an empty result is retried after 10 s so
+a fixed config shows up quickly.
+
+**Card names.** A card's `name` is a short, stable, human label, never a model id or a URL. Order:
+the declared server name; else the provider **key** from config (`studio-ds4`, `gb10-qwen` — short
+and unique); else `host:port`. The provider's `name:` field is often long prose, so it rides along
+as `title` for the card tooltip only. The served model id(s) live in `models`. A probe result never
+overwrites `name` or `title`: the server entry owns both.
+
+**Dead-server noise.** A discovered (not declared) server that is unreachable AND served no request
+in the window is not a card: it goes to `snapshot["unreachable"]` as
+`{name, base_url, error, since}` (`since` = the last good sample's epoch, else the failed probe's
+`sampled_at`). Declared servers always stay in `servers`, reachable or not. `fleet_status` lanes and
+`fleet_status_text` skip unreachable servers; the status chip shows healthy local servers only.
 
 ### 7.3 Polling
 
@@ -492,7 +503,8 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
   "totals": {"in_flight": 5, "requests_1m": 18, "requests_5m": 63, "errors_5m": 3},
   "servers": [
     {
-      "name": "ds4", "base_url": "http://127.0.0.1:18010", "kind": "tensorfold",
+      "name": "ds4", "title": "Studio DeepSeek-V4.1-Flash (M5 Ultra, TensorFold fork)",
+      "base_url": "http://127.0.0.1:18010", "kind": "tensorfold",
       "healthy": true, "models": ["qwen38-27b-q4-q8kv-mtp3"],
       "running": 3, "waiting": 0, "slots": 4,
       "decode_tps": 42.1, "prefill_tps": 3100.0,
@@ -507,6 +519,10 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
       "samples": [[1762540740.0, 40.2, 2900.0], [1762540745.0, 42.1, 3100.0]],
       "error": null, "sampled_at": "2026-11-07T16:00:00Z"
     }
+  ],
+  "unreachable": [
+    {"name": "studio-worker", "base_url": "http://127.0.0.1:18012",
+     "error": "/health: URLError ... (connection refused)", "since": 1762540700.0}
   ],
   "models": [
     {
@@ -539,7 +555,10 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
 Rules the backend guarantees: `label` is always `""` (the UI fills it from `session.list` /
 `child_goal`); `lane` ∈ `local`|`cloud`; `slots` is `null` for cloud and for kinds without a gauge;
 `quota` is always `null` from the backend (the UI fills it from `session.stats`); numbers are `null` when
-unknown, never `0`-as-unknown.
+unknown, never `0`-as-unknown. `name` is the short card label (declared name → provider key → host:port);
+`title` is `null` or the provider's prose name, for the card tooltip only. `unreachable` is always present
+(`[]` when none): discovered servers that are unreachable and served no request in the window, as
+`{name, base_url, error, since}`. Declared servers never move there.
 
 `requests` (per server card) is the swim-lane's per-request rows: **every in-flight row for that server
 plus every row that ended in the last 60 s**, newest first by `started_at`, capped at 50 per server. Each
@@ -683,7 +702,10 @@ capacity. The handler calls `api.build_snapshot()` directly — no HTTP hop, no 
 
 ### 11.2 Slash command — yes, it is worth it
 
-`/fleet` returns one line: `ds4 3/4 · GN100 5/5 (2 queued) · anthropic 1 in flight · pick: ds4`.
+`/fleet` returns one line: `ds4 3/4 · GN100 5/5 (q 2) · anthropic/claude-opus-5-5 1 in flight · pick: ds4`.
+Healthy local servers as `name used/total (q N)` (queue shown only when non-zero), then cloud lanes
+with in-flight > 0 or requests in the window as `provider/model N in flight`, then `pick: <name>`.
+Unreachable servers never appear. Capped near 160 chars by dropping trailing lanes before the pick.
 Ten lines of code reusing `fleet_status_text()`, and it makes the plugin usable from Telegram, Discord and
 the CLI without the Desktop. Worth it.
 

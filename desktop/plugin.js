@@ -422,6 +422,7 @@ function ServerCard({ server, models, labels, now }) {
 
   return jsxs('article', {
     className: 'flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2.5',
+    title: server.title || undefined,
     children: [
       jsxs('div', {
         className: 'flex items-center gap-2',
@@ -1063,6 +1064,7 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
     server => server && server.kind !== 'cloud'
   )
   const models = Array.isArray(snapshot.models) ? snapshot.models : []
+  const unreachable = Array.isArray(snapshot.unreachable) ? snapshot.unreachable : []
   const cloud = models.filter(model => model.lane === 'cloud')
   const orphan = models.filter(model => model.lane !== 'cloud' && !model.server_name)
   const queued = servers.reduce((sum, server) => sum + (server.waiting || 0), 0)
@@ -1085,15 +1087,55 @@ function ModelView({ snapshot, labels, now, windowSeconds }) {
         meta: servers.length
           ? `${servers.length} server(s) · ${used}/${total} slots · ${queued} queued`
           : 'none declared',
-        children: servers.length
-          ? jsx('div', {
-              className: 'grid gap-2 xl:grid-cols-2',
-              children: servers.map(server => jsx(ServerCard, { server, models, labels, now }, server.base_url || server.name))
-            })
-          : jsx('div', {
-              className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-quaternary)',
-              children: 'No local model server declared. Add one under Settings → Plugins → Flightdeck.'
-            })
+        children: jsxs('div', {
+          className: 'flex flex-col gap-2',
+          children: [
+            servers.length
+              ? jsx('div', {
+                  className: 'grid gap-2 xl:grid-cols-2',
+                  children: servers.map(server => jsx(ServerCard, { server, models, labels, now }, server.base_url || server.name))
+                })
+              : jsx('div', {
+                  className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-quaternary)',
+                  children: 'No local model server declared. Add one under Settings → Plugins → Flightdeck.'
+                }),
+            unreachable.length
+              ? jsxs('details', {
+                  className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  children: [
+                    jsx('summary', {
+                      className: 'cursor-pointer select-none',
+                      children: `${unreachable.length} server${unreachable.length === 1 ? '' : 's'} unreachable`
+                    }),
+                    jsx('div', {
+                      className: 'flex flex-col gap-0.5 pt-1',
+                      children: unreachable.map(item =>
+                        jsxs('div', {
+                          className: 'flex items-baseline gap-2',
+                          children: [
+                            jsx('span', {
+                              className: 'min-w-0 truncate font-mono text-[0.6rem]',
+                              children: item.base_url
+                            }),
+                            jsx('span', {
+                              className: 'min-w-0 flex-1 truncate',
+                              children: item.error || 'unreachable'
+                            }),
+                            item.since != null
+                              ? jsx('span', {
+                                  className: 'shrink-0 tabular-nums',
+                                  children: fmtAgo(item.since, now)
+                                })
+                              : null
+                          ]
+                        }, item.base_url || item.name)
+                      )
+                    })
+                  ]
+                })
+              : null
+          ]
+        })
       }),
       servers.length
         ? jsx(Section, {
@@ -1269,7 +1311,7 @@ function FleetChip() {
   const data = serversQ.data
   if (data && data.show_chip === false) return null
   const servers = Array.isArray(data) ? data : (data && Array.isArray(data.servers) ? data.servers : [])
-  const local = servers.filter(server => server && server.kind !== 'cloud')
+  const local = servers.filter(server => server && server.kind !== 'cloud' && server.healthy === true && !server.error)
   const navigate = () => host.navigate(ROUTE)
 
   if (!local.length) {

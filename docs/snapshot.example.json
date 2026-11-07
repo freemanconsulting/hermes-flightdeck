@@ -13,6 +13,7 @@
   "servers": [
     {
       "name": "ds4",
+      "title": "Studio DeepSeek-V4.1-Flash (M5 Ultra, TensorFold fork)",
       "base_url": "http://127.0.0.1:18010",
       "kind": "tensorfold",
       "healthy": true,
@@ -116,6 +117,7 @@
     },
     {
       "name": "GN100",
+      "title": "GN100 Qwen3.8-Flash-Next FP4 TensorFold (trial)",
       "base_url": "http://127.0.0.1:18009",
       "kind": "tensorfold",
       "healthy": true,
@@ -204,6 +206,7 @@
     },
     {
       "name": "anthropic",
+      "title": null,
       "base_url": "https://api.anthropic.com",
       "kind": "cloud",
       "healthy": null,
@@ -249,6 +252,7 @@
       "sampled_at": "2026-11-07T18:40:00Z"
     }
   ],
+  "unreachable": [],
   "models": [
     {
       "key": "ds4|qwen38-27b-q4-q8kv-mtp3",

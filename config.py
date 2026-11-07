@@ -124,6 +124,15 @@ def _as_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def host_port(url: Any) -> str:
+    """A URL's host:port — the last-resort card label when nothing names it."""
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return str(url or "")
+    return parts.netloc or str(url or "")
+
+
 def _normalize_servers(raw: Any) -> list[dict]:
     """Accept the settings list (or a JSON string) and return clean entries."""
     if isinstance(raw, str):
@@ -143,7 +152,7 @@ def _normalize_servers(raw: Any) -> list[dict]:
             continue
         seen.add(base_url)
         servers.append({
-            "name": str(entry.get("name") or base_url),
+            "name": str(entry.get("name") or host_port(base_url)),
             "base_url": base_url,
             "kind": str(entry.get("kind") or "auto").strip().lower() or "auto",
         })
@@ -234,8 +243,14 @@ def _union_servers(sources: list[tuple[str, dict]], *, declared: bool) -> list[d
                         continue
                     base_url = normalize_base_url(api)
                     if base_url:
+                        # The provider KEY is the short, stable label; the
+                        # provider `name:` is often long prose, so it rides
+                        # along as the tooltip title only (DESIGN §7.2).
+                        prose = str(entry.get("name") or "").strip()
                         entries.append({
-                            "name": str(entry.get("name") or key),
+                            "name": str(key),
+                            "title": prose if prose and prose != str(key) else None,
+                            "key": str(key),
                             "base_url": base_url,
                             "kind": "auto",
                         })
@@ -247,6 +262,8 @@ def _union_servers(sources: list[tuple[str, dict]], *, declared: bool) -> list[d
             if existing is not None:
                 if profile not in existing["profiles"]:
                     existing["profiles"].append(profile)
+                if not existing.get("title") and entry.get("title"):
+                    existing["title"] = entry["title"]
                 continue
             server = dict(entry)
             server["profiles"] = [profile]

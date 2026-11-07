@@ -112,11 +112,20 @@ def _sample_dict(sample: Any) -> dict[str, Any]:
     if isinstance(sample, dict):
         return dict(sample)
     fields = (
-        "name", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
+        "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "prompt_tokens_total", "cached_tokens_total",
         "generation_tokens_total", "sampled_at", "error",
     )
     return {field: getattr(sample, field, None) for field in fields}
+
+
+def _host_port(url: str | None) -> str:
+    """A URL's host:port — the last-resort card label (DESIGN §7.2)."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return str(url or "")
+    return parts.netloc or str(url or "")
 
 
 def _percentile(values: list[float], pct: float) -> float | None:
@@ -194,6 +203,28 @@ def _server_samples_since(conn: sqlite3.Connection, since: float) -> list[dict]:
             "SELECT * FROM server_samples WHERE ts >= ? ORDER BY ts", (since,)
         )
     )
+
+
+def _last_good_sample_ts(conn: sqlite3.Connection, base_url: str) -> float | None:
+    """Epoch of the newest healthy server_samples row for one server, or None."""
+    try:
+        rows = _dict_rows(conn.execute(
+            "SELECT MAX(ts) AS ts FROM server_samples WHERE base_url = ? AND error IS NULL",
+            (base_url,),
+        ))
+    except sqlite3.Error:
+        return None
+    return _num(rows[0].get("ts")) if rows else None
+
+
+def _iso_epoch(iso: Any) -> float | None:
+    """Epoch seconds from an ISO 8601 UTC string, or None."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _subagent_links(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -289,7 +320,8 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
         lane = sorted(lane_rows.get(base_url, []),
                       key=lambda item: _num(item.get("started_at")) or 0, reverse=True)[:50]
         cards.append({
-            "name": sample.get("name") or base_url,
+            "name": sample.get("name") or _host_port(base_url),
+            "title": sample.get("title"),
             "base_url": base_url,
             "kind": sample.get("kind") or "unknown",
             "healthy": None if healthy is None else bool(healthy),
@@ -568,6 +600,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     if servers is None:
         settings = _settings(conn)
         declared = list(settings.get("servers") or [])
+        servers_source = str(settings.get("servers_source") or "declared")
         poller = _poller_module()
         if poller is not None and declared:
             samples = list(poller.poll_sync(
@@ -578,14 +611,35 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
             samples = []
     elif isinstance(servers, dict):
         samples = [_sample_dict(value) for value in servers.values()]
+        servers_source = "declared"
     else:
         samples = [_sample_dict(value) for value in servers]
+        servers_source = "declared"
 
     rows = _window_rows(conn, since)
     in_flight = _in_flight_rows(conn)
     sample_rows = _server_samples_since(conn, since)
 
     server_cards = _server_cards(samples, _request_rows(conn, now), in_flight, sample_rows, now)
+    # Dead-server noise (DESIGN §7.2): a discovered server that is unreachable
+    # and served no request in the window is not a card — it is one line in
+    # `unreachable`. Declared servers always stay in `servers`.
+    unreachable: list[dict] = []
+    if servers_source != "declared":
+        requested = {normalize_base_url(row.get("base_url")) for row in rows}
+        kept = []
+        for card in server_cards:
+            if card.get("error") and normalize_base_url(card["base_url"]) not in requested:
+                unreachable.append({
+                    "name": card["name"],
+                    "base_url": card["base_url"],
+                    "error": card["error"],
+                    "since": (_last_good_sample_ts(conn, card["base_url"])
+                              or _iso_epoch(card.get("sampled_at"))),
+                })
+            else:
+                kept.append(card)
+        server_cards = kept
     model_cards = _model_cards(rows, server_cards, now)
     agent_nodes = _agent_tree(rows, _subagent_links(conn),
                               {normalize_base_url(card["base_url"]): card for card in server_cards})
@@ -603,6 +657,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
         "window": {"seconds": int(window_seconds), "since": since},
         "totals": totals,
         "servers": server_cards,
+        "unreachable": unreachable,
         "models": model_cards,
         "agents": agent_nodes,
     }
@@ -710,6 +765,8 @@ def fleet_status(snapshot: dict | None = None, *, window_seconds: int = 300,
     for card in snapshot.get("servers", []):
         if card.get("kind") == "cloud":
             continue  # cloud traffic is the `cloud` list, not a lane
+        if card.get("error"):
+            continue  # unreachable servers are noise, not lanes (§7.2)
         slots = None
         if card.get("slots") is not None:
             slots = {"used": card.get("running"), "total": card.get("slots")}
@@ -764,22 +821,33 @@ def fleet_status(snapshot: dict | None = None, *, window_seconds: int = 300,
 def fleet_status_text(snapshot: dict | None = None, *, window_seconds: int = 300,
                       servers: Any = None, conn: sqlite3.Connection | None = None,
                       now: float | None = None) -> str:
-    """§11.2 one-liner: `ds4 3/4 · GN100 5/5 (2 queued) · anthropic 1 in flight · pick: ds4`."""
+    """§11.2 one-liner: `ds4 3/4 · GN100 5/5 (q 2) · anthropic/claude-opus-5-5 1 in flight · pick: ds4`.
+
+    Healthy local servers only, then cloud lanes with traffic in the window,
+    then the pick.  Capped near 160 chars by dropping trailing lanes.
+    """
     status = fleet_status(snapshot, window_seconds=window_seconds, servers=servers,
                           conn=conn, now=now)
     parts = []
     for lane in status["lanes"]:
+        if lane.get("healthy") is not True:
+            continue
         slots = lane.get("slots")
-        if slots and slots.get("total") is not None:
+        if slots and slots.get("total") is not None and slots.get("used") is not None:
             text = f"{lane['name']} {slots.get('used')}/{slots['total']}"
             if lane.get("queue"):
-                text += f" ({lane['queue']} queued)"
+                text += f" (q {lane['queue']})"
         else:
-            text = f"{lane['name']} {lane.get('in_flight')} in flight"
+            text = f"{lane['name']} {lane.get('in_flight') or 0} in flight"
         parts.append(text)
     for card in status["cloud"]:
-        parts.append(f"{card['provider']} {card['in_flight']} in flight")
+        window_requests = card.get("requests_1m") if window_seconds <= 60 else card.get("requests_5m")
+        if (card.get("in_flight") or 0) > 0 or (window_requests or 0) > 0:
+            parts.append(f"{card['provider']}/{card['model']} {card['in_flight']} in flight")
     parts.append(f"pick: {status['pick']['lane']}" if status["pick"] else "pick: none")
+    # Under ~160 chars: drop the least important lane before the pick.
+    while len(" · ".join(parts)) > 160 and len(parts) > 2:
+        del parts[-2]
     return " · ".join(parts)
 
 

@@ -49,12 +49,31 @@ providers:
 
     servers = config.discover(config=None)
 
-    assert [server["name"] for server in servers] == ["ds4", "GN100"]
+    assert [server["name"] for server in servers] == ["root-loopback", "new-private"]
+    assert [server["title"] for server in servers] == ["ds4", "GN100"]
+    assert [server["key"] for server in servers] == ["root-loopback", "new-private"]
     assert [server["base_url"] for server in servers] == [
         "http://127.0.0.1:18010", "http://192.168.1.50:18009",
     ]
     assert servers[0]["profiles"] == ["default", "alpha"]
     assert servers[1]["profiles"] == ["beta"]
+
+
+def test_discovery_name_is_the_provider_key_and_title_is_the_prose(tmp_path, monkeypatch):
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", """
+providers:
+  studio-ds4:
+    api: http://127.0.0.1:18010/v1
+    name: Studio DeepSeek-V4.1-Flash (M5 Ultra, TensorFold fork 72a552ed, thinking on, greedy)
+""")
+
+    servers = config.discover(config=None)
+
+    assert servers[0]["name"] == "studio-ds4"  # short, stable, unique
+    assert servers[0]["key"] == "studio-ds4"
+    assert servers[0]["title"].startswith("Studio DeepSeek")  # tooltip only
+    assert servers[0]["profiles"] == ["default"]
 
 
 def test_declared_servers_union_across_profiles_wins_over_discovery(tmp_path, monkeypatch):
@@ -111,6 +130,6 @@ providers:
     name: ds4
 """)
         assert config.discover(conn, now=105.0) == []  # still inside the 10 s empty TTL
-        assert config.discover(conn, now=111.0)[0]["name"] == "ds4"
+        assert config.discover(conn, now=111.0)[0]["name"] == "late"
     finally:
         conn.close()

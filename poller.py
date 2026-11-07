@@ -81,7 +81,7 @@ def _sample_dict(snap: Any) -> dict[str, Any]:
     if isinstance(snap, dict):
         return dict(snap)
     fields = (
-        "name", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
+        "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "prompt_tokens_total", "cached_tokens_total",
         "generation_tokens_total", "sampled_at", "error",
     )
@@ -161,8 +161,12 @@ async def _one(server: dict[str, Any], ttl: float, timeout: float,
         snap = await asyncio.to_thread(_servers_module().probe, base_url, timeout)
         sample = _sample_dict(snap)
         sample["base_url"] = base_url
-        if server.get("name") and not sample.get("name"):
+        # The server entry owns the card label and tooltip; a probe's name is a
+        # model id or a URL and must never overwrite them (DESIGN §7.2).
+        if server.get("name"):
             sample["name"] = server["name"]
+        if server.get("title"):
+            sample["title"] = server["title"]
         _derive_rates(_LAST.get(base_url), sample)
         _LAST[base_url] = sample
         _CACHE[base_url] = {"at": time.monotonic(), "sample": sample}

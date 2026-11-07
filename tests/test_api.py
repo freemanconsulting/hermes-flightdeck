@@ -58,17 +58,18 @@ def model(snapshot_payload, key):
 
 def test_snapshot_shape_is_pinned(conn):
     payload = snapshot(conn)
-    assert list(payload) == ["generated_at", "window", "totals", "servers", "models", "agents"]
+    assert list(payload) == ["generated_at", "window", "totals", "servers", "unreachable", "models", "agents"]
     assert payload["window"] == {"seconds": 300, "since": NOW - 300}
     assert list(payload["totals"]) == ["in_flight", "requests_1m", "requests_5m", "errors_5m"]
     assert payload["totals"] == {"in_flight": 6, "requests_1m": 6, "requests_5m": 11, "errors_5m": 1}
 
     ds4 = card(payload, "ds4")
     assert list(ds4) == [
-        "name", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
+        "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "in_flight", "unattributed", "over_attributed",
         "agents", "requests", "samples", "error", "sampled_at",
     ]
+    assert ds4["title"].startswith("Studio DeepSeek")
     assert ds4["base_url"] == DS4
     assert ds4["in_flight"] == 3
     assert ds4["agents"][0]["label"] == ""
@@ -197,7 +198,51 @@ def test_unreachable_shows_last_good_sample(conn):
     assert gn100["error"] == "connect failed"
     assert gn100["running"] == 5  # last good sample in server_samples
     assert gn100["slots"] == 5
-    assert api.fleet_status(payload)["lanes"][0]["verdict"] == "unreachable"
+    # Declared servers stay in `servers`, but unreachable ones are not lanes.
+    assert api.fleet_status(payload)["lanes"] == []
+
+
+def test_discovered_dead_server_goes_to_unreachable(conn, monkeypatch):
+    """A discovered server that is unreachable and served no request is noise."""
+    dead = {"name": "studio-worker", "title": "Studio Nemotron worker pool",
+            "base_url": "http://127.0.0.1:18012", "kind": "unknown", "healthy": None,
+            "models": [], "running": None, "waiting": None, "slots": None,
+            "decode_tps": None, "prefill_tps": None,
+            "sampled_at": api._now_iso(NOW), "error": "/health: URLError"}
+    monkeypatch.setattr(api, "_settings", lambda conn: {
+        "servers": [{"name": "studio-worker", "base_url": "http://127.0.0.1:18012", "kind": "auto"}],
+        "servers_source": "discovered", "poll_interval_seconds": 5, "probe_timeout_seconds": 2.0,
+    })
+    monkeypatch.setattr(api, "_poller_module", lambda: type(
+        "Poller", (), {"poll_sync": staticmethod(lambda *a, **k: {dead["base_url"]: dead})})())
+
+    payload = api.build_snapshot(300, conn=conn, now=NOW)
+
+    assert payload["servers"] == []
+    assert payload["unreachable"] == [{
+        "name": "studio-worker", "base_url": "http://127.0.0.1:18012",
+        "error": "/health: URLError", "since": NOW,
+    }]
+    assert api.fleet_status(payload)["lanes"] == []
+
+
+def test_declared_dead_server_stays_in_servers(conn):
+    dead = {"name": "studio-worker", "base_url": "http://127.0.0.1:18012",
+            "kind": "unknown", "healthy": None, "models": [], "running": None,
+            "waiting": None, "slots": None, "decode_tps": None, "prefill_tps": None,
+            "sampled_at": api._now_iso(NOW), "error": "URLError"}
+    payload = snapshot(conn, servers=[dead])
+    assert payload["unreachable"] == []
+    assert [card["name"] for card in payload["servers"]] == ["studio-worker"]
+
+
+def test_card_name_falls_back_to_host_port(conn):
+    unnamed = {"base_url": "http://127.0.0.1:18012", "kind": "unknown", "healthy": None,
+               "models": [], "running": None, "waiting": None, "slots": None,
+               "decode_tps": None, "prefill_tps": None,
+               "sampled_at": api._now_iso(NOW), "error": None}
+    payload = snapshot(conn, servers=[unnamed])
+    assert payload["servers"][0]["name"] == "127.0.0.1:18012"
 
 
 def test_request_detail_derives_per_request_numbers(conn):
@@ -231,7 +276,7 @@ def test_fleet_status_json_and_pick(conn):
 
 def test_fleet_status_text_one_liner(conn):
     assert api.fleet_status_text(snapshot(conn)) == (
-        "ds4 3/4 · GN100 5/5 (2 queued) · anthropic 1 in flight · pick: ds4"
+        "ds4 3/4 · GN100 5/5 (q 2) · anthropic/claude-opus-5-5 1 in flight · pick: ds4"
     )
 
 
@@ -244,6 +289,34 @@ def test_build_health_shape(conn):
     assert health["servers_declared"] == 3
     assert health["servers_probed"] == 3
     assert health["server_errors"] == 0
+
+
+def test_fleet_status_text_skips_unreachable_and_quiet_cloud():
+    payload = {
+        "generated_at": NOW,
+        "servers": [],
+        "unreachable": [{"name": "studio-worker", "base_url": "http://127.0.0.1:18012",
+                         "error": "URLError", "since": NOW}],
+        "models": [{"lane": "cloud", "provider": "openai", "model": "gpt-6",
+                    "in_flight": 0, "requests_5m": 0, "errors_429_5m": 0,
+                    "ttft_ms_p50": None}],
+        "agents": [],
+    }
+    assert api.fleet_status_text(payload) == "pick: none"
+
+
+def test_fleet_status_text_stays_under_160_chars():
+    servers = [
+        {"name": f"server-{i}", "kind": "tensorfold", "healthy": True, "slots": 4,
+         "running": 1, "waiting": 0, "error": None, "decode_tps": None,
+         "prefill_tps": None, "in_flight": 0, "unattributed": 0, "ttft_ms_p50": None}
+        for i in range(12)
+    ]
+    payload = {"generated_at": NOW, "servers": servers, "unreachable": [],
+               "models": [], "agents": []}
+    text = api.fleet_status_text(payload)
+    assert len(text) <= 160
+    assert text.endswith("pick: server-0")
 
 
 # --- poller ----------------------------------------------------------------
@@ -280,6 +353,22 @@ def test_poller_ttl_cache_and_floor(monkeypatch):
     poller.clear_cache()
     poller.poll_sync(servers, ttl=5.0)
     assert len(calls) == 2
+
+
+def test_poller_name_and_title_come_from_the_server_entry(monkeypatch):
+    """A probe's name is a model id; it must never overwrite the card label."""
+    _fake_probe(monkeypatch, [
+        {"name": "qwen38-flash-next-tf-fp4", "base_url": "http://127.0.0.1:18009",
+         "kind": "tensorfold", "healthy": True, "models": ["qwen38-flash-next-tf-fp4"],
+         "sampled_at": api._now_iso(NOW)},
+    ])
+    poller.clear_cache()
+    servers = [{"name": "gb10-qwen", "title": "GN100 Qwen3.8-Flash-Next FP4 TensorFold (trial)",
+                "base_url": "http://127.0.0.1:18009", "kind": "tensorfold"}]
+    sample = poller.poll_sync(servers, ttl=5.0)["http://127.0.0.1:18009"]
+    assert sample["name"] == "gb10-qwen"
+    assert sample["title"] == "GN100 Qwen3.8-Flash-Next FP4 TensorFold (trial)"
+    assert sample["models"] == ["qwen38-flash-next-tf-fp4"]
 
 
 def test_poller_counter_delta_rates(monkeypatch):
@@ -366,7 +455,7 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
     monkeypatch.setattr(module._api(), "_now", lambda: NOW)
 
     payload = asyncio.run(module.snapshot("5m"))
-    assert list(payload) == ["generated_at", "window", "totals", "servers", "models", "agents"]
+    assert list(payload) == ["generated_at", "window", "totals", "servers", "unreachable", "models", "agents"]
     assert payload["totals"]["in_flight"] == 6
 
     assert len(module.agents("1m")["agents"]) == 2
