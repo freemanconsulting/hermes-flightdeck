@@ -69,3 +69,12 @@ def test_warn_survives_a_broken_logging_backend(plugin_api, monkeypatch):
     plugin_api._WARN_AT = 0.0
 
     plugin_api._warn("flightdeck: store sweep failed", ValueError("boom"))  # no raise
+
+
+@pytest.mark.parametrize("window, seconds", [
+    ("1m", 60), ("60", 60), ("60s", 60),
+    ("5m", 300), ("300", 300),
+    ("", 300), (None, 300), ("bogus", 300),
+])
+def test_window_seconds_maps_one_minute_and_five_minutes(plugin_api, window, seconds):
+    assert plugin_api._window_seconds(window) == seconds

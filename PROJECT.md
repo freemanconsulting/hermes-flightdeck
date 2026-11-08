@@ -31,6 +31,10 @@ cloud) and per-request attribution.
 - Cloud lanes (Anthropic, OpenAI/Codex, aux calls like Haiku compression) appear in the same views so the
   whole ecosystem is visible at once; their numbers come from hook rows only, labeled "Hermes traffic only".
 
+## Decisions (Aubrey, 2026-11-07 evening)
+- Capacity-aware delegation: YES (the "acts, not just watches" feature). Design in docs/CAPACITY.md, then one build worker.
+- Public repo + catalog PR: probably Sat 2026-11-08.
+
 ## Working rules
 - Subagents for this project run on **ds4** (`delegate_task option=general`), per Aubrey 2026-11-07. Not GN100.
 - Repo: local git here (Forgejo post-commit pushes the current branch; never commit on main; work on

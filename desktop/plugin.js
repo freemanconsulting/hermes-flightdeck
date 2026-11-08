@@ -31,6 +31,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'flightdeck'
 const ROUTE = '/flightdeck'
 const POLL_MS = 5000
+const SWIM_BUCKET_SECONDS = 15
 const CHIP_POLL_MS = 10000
 const QUOTA_POLL_MS = 15000
 
@@ -319,6 +320,124 @@ function Metric({ label, value, accent, title }) {
   })
 }
 
+// Engine health line. Server-side numbers cover all traffic, not just Hermes;
+// every tooltip says so in plain words. Missing fields are omitted, never zero.
+function fmtHealthSeconds(value) {
+  if (value == null) return null
+  return `${Number(value.toFixed(2))}s`
+}
+
+function fmtHealthPct(value) {
+  if (value == null) return null
+  return `${Math.round(value * 100)}%`
+}
+
+function fmtHealthMem(bytes) {
+  if (bytes == null) return null
+  return `${(bytes / 1e9).toFixed(1)} GB`
+}
+
+function HealthBar({ pct }) {
+  return jsx('span', {
+    style: {
+      display: 'inline-block',
+      width: '30px',
+      height: '4px',
+      borderRadius: '2px',
+      overflow: 'hidden',
+      background: 'var(--ui-bg-tertiary)',
+      verticalAlign: 'middle'
+    },
+    children: jsx('span', {
+      style: {
+        display: 'block',
+        width: `${Math.max(0, Math.min(100, pct))}%`,
+        height: '100%',
+        background: 'var(--ui-accent)'
+      }
+    })
+  })
+}
+
+function ServerHealth({ health }) {
+  if (!health) return null
+  const items = []
+  const kv = fmtHealthPct(health.kv_cache_usage)
+  if (kv != null) {
+    items.push(jsxs('span', {
+      title: 'KV cache fill on this server — how full its cache is right now; server-side, all traffic',
+      style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
+      children: [
+        jsx('span', { children: 'KV' }),
+        jsx(HealthBar, { pct: Math.round(health.kv_cache_usage * 100) }),
+        jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: kv })
+      ]
+    }))
+  }
+  const prefix = fmtHealthPct(health.prefix_cache_hit_rate)
+  if (prefix != null) {
+    items.push(jsx('span', {
+      title: 'prefix cache hit rate — share of prefix lookups that found a match; server-side, all traffic',
+      children: `prefix hit ${prefix}`
+    }))
+  }
+  const accept = fmtHealthPct(health.spec_accept_rate)
+  if (accept != null) {
+    items.push(jsxs('span', {
+      title: 'MTP acceptance rate — share of drafted tokens the model accepted; server-side, all traffic',
+      style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
+      children: [
+        jsx('span', { children: 'MTP accept' }),
+        jsx(HealthBar, { pct: Math.round(health.spec_accept_rate * 100) }),
+        jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: accept })
+      ]
+    }))
+  }
+  const ttftP50 = fmtHealthSeconds(health.server_ttft_p50)
+  const ttftP95 = fmtHealthSeconds(health.server_ttft_p95)
+  if (ttftP50 != null || ttftP95 != null) {
+    const parts = []
+    if (ttftP50 != null) parts.push(`p50 ${ttftP50}`)
+    if (ttftP95 != null) parts.push(`p95 ${ttftP95}`)
+    items.push(jsx('span', {
+      title: 'time to first token from the server\'s own histogram — p50 median and p95; server-side numbers cover ALL traffic, not just Hermes',
+      children: `TTFT ${parts.join(' / ')}`
+    }))
+  }
+  const tpot = health.server_tpot_p50 != null ? `${Math.round(health.server_tpot_p50 * 1000)} ms` : null
+  if (tpot != null) {
+    items.push(jsx('span', {
+      title: 'time per output token from the server\'s own histogram — median; server-side numbers cover ALL traffic, not just Hermes',
+      children: `TPOT ${tpot}`
+    }))
+  }
+  const mem = fmtHealthMem(health.memory_bytes)
+  if (mem != null) {
+    items.push(jsx('span', {
+      title: 'device memory the engine holds; server-side, all traffic',
+      children: `mem ${mem}`
+    }))
+  }
+  if (!items.length) return null
+  const children = []
+  items.forEach((item, i) => {
+    if (i > 0) children.push(jsx('span', { style: { color: 'var(--ui-stroke-tertiary)' }, children: '·' }, `sep-${i}`))
+    children.push(item)
+  })
+  return jsx('div', {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      columnGap: '8px',
+      rowGap: '2px',
+      fontSize: '0.6rem',
+      color: 'var(--ui-text-quaternary)'
+    },
+    children
+  })
+}
+
 function SlotBar({ total, running, waiting }) {
   if (total == null) {
     return jsx('span', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'no slot gauge' })
@@ -557,6 +676,7 @@ function ServerCard({ server, models, labels, now }) {
           })
         ]
       }),
+      jsx(ServerHealth, { health: server.health }),
       jsxs('div', {
         className: 'flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[0.6875rem]',
         children: [
@@ -910,11 +1030,117 @@ function requestTooltip(request, labels) {
   ].join(' · ')
 }
 
-// One lane per local server with traffic. Bars are stacked into sub-rows so
-// concurrency is visible: slot 1 at the top, queued requests beyond the server's
-// slots drawn dashed. Dim = prefill (start → first token), bright = decode.
-// The faint throughput trace keeps its own right-side scale (max tok/s).
-function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, labels) {
+// The swim lane's window comes from the snapshot itself, never the page clock:
+// a snapshot polled 5 s ago still shows the rows the backend put in it, and a
+// stale page clock can never hide a lane's bars or draw the empty message.
+function swimWindow(snapshot, windowSeconds, now) {
+  const win = snapshot && snapshot.window
+  const seconds = Number(win && win.seconds) || Number(windowSeconds) || 300
+  const end = Number(win && win.since != null ? win.since + seconds : null) ||
+    Number(snapshot && snapshot.generated_at) ||
+    Number(now) / 1000
+  const start = Number(win && win.since != null ? win.since : null) || end - seconds
+  return { seconds, start, end }
+}
+
+// One stacked sub-row per overlapping request: slot 1 at the top, queued
+// requests beyond the server's slots drawn dashed. A request with no first
+// chunk is a whole response and draws as one uniform hatched bar.
+function stackBars(requests, win) {
+  const rowEnds = []
+  return requests.map(request => {
+    const start = Math.max(win.start, request.started_at)
+    const end = request.ended_at != null ? Math.min(win.end, request.ended_at) : win.end
+    let slot = rowEnds.findIndex(ends => ends <= start)
+    if (slot < 0) {
+      slot = rowEnds.length
+      rowEnds.push(end)
+    } else {
+      rowEnds[slot] = end
+    }
+    return { request, start, end, slot, whole: request.first_chunk_at == null }
+  })
+}
+
+// Cloud model entries carry no per-request rows: their traffic is the 15 s
+// request buckets. One tick per non-empty bucket, height by count.
+function bucketTicks(buckets, win) {
+  const perBucket = Math.max(1, Math.ceil(win.seconds / SWIM_BUCKET_SECONDS))
+  const ticks = []
+  for (let i = 0; i < buckets.length && i < perBucket; i += 1) {
+    const count = Number(buckets[i]) || 0
+    if (!count) continue
+    ticks.push({
+      start: win.start + i * SWIM_BUCKET_SECONDS,
+      end: win.start + (i + 1) * SWIM_BUCKET_SECONDS,
+      count,
+      slot: 0
+    })
+  }
+  return ticks
+}
+
+// Every lane in the window: local servers with rows or in-flight work, then one
+// cloud lane per cloud model with traffic. The whole ecosystem, local first.
+function swimLanes(snapshot, windowSeconds, now) {
+  const win = swimWindow(snapshot, windowSeconds, now)
+  const servers = Array.isArray(snapshot && snapshot.servers) ? snapshot.servers : []
+  const models = Array.isArray(snapshot && snapshot.models) ? snapshot.models : []
+  const lanes = []
+  for (const server of servers) {
+    if (!server || server.kind === 'cloud') continue
+    const requests = (Array.isArray(server.requests) ? server.requests : [])
+      .filter(row => row && row.started_at != null && (row.ended_at == null || row.ended_at >= win.start))
+      .sort((a, b) => a.started_at - b.started_at)
+      .slice(0, 40)
+    if (!requests.length && !((server.in_flight || 0) > 0)) continue
+    const bars = stackBars(requests, win)
+    lanes.push({
+      kind: 'local',
+      id: `local:${server.base_url || server.name}`,
+      label: server.name || 'server',
+      detail: `${server.kind || 'server'} · ${server.running != null ? server.running : '—'}/${server.slots != null ? server.slots : '—'} slots`,
+      server,
+      requests,
+      bars,
+      samples: Array.isArray(server.samples)
+        ? server.samples.filter(s => Array.isArray(s) && s.length >= 3 && s[0] >= win.start)
+        : [],
+      concurrency: Math.max(1, ...bars.map(bar => bar.slot + 1)),
+      slots: server.slots != null ? Math.max(1, server.slots) : Math.max(1, ...bars.map(bar => bar.slot + 1))
+    })
+  }
+  for (const model of models) {
+    if (!model || model.lane !== 'cloud') continue
+    const buckets = Array.isArray(model.requests_buckets) ? model.requests_buckets : []
+    const total = buckets.reduce((sum, n) => sum + (Number(n) || 0), 0) ||
+      (model.requests_1m || 0) || (model.requests_5m || 0)
+    if (!total) continue
+    lanes.push({
+      kind: 'cloud',
+      id: `cloud:${model.key || model.provider}`,
+      label: `${model.provider || 'cloud'} / ${model.model || 'model'}`,
+      detail: `cloud · ${fmtInt(model.streamed)} streamed · ${fmtInt(model.non_streamed)} whole response`,
+      model,
+      requests: [],
+      bars: bucketTicks(buckets, win),
+      ticks: true,
+      samples: [],
+      concurrency: 1,
+      slots: 1,
+      total
+    })
+  }
+  return { win, lanes }
+}
+
+// One lane per server or cloud model with traffic. Local bars are stacked into
+// sub-rows so concurrency is visible: slot 1 at the top, queued requests beyond
+// the server's slots drawn dashed. Dim = prefill (start → first token), bright =
+// decode; a whole response (no first chunk) is one uniform hatched bar. Cloud
+// lanes draw the 15 s request buckets as ticks. The faint throughput trace keeps
+// its own right-side scale (max tok/s).
+function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
   const style = getComputedStyle(canvas)
   const accent = style.getPropertyValue('--ui-accent').trim() || 'currentColor'
   const dim = style.getPropertyValue('--ui-text-quaternary').trim() || 'currentColor'
@@ -926,30 +1152,25 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
   const axisH = 16
   const top = 4
   const plotW = Math.max(40, width - gutter - right)
-  const nowSec = now / 1000
-  const since = nowSec - windowSeconds
-  const xOf = t => gutter + ((Math.max(since, Math.min(nowSec, t)) - since) / windowSeconds) * plotW
+  const xOf = t => gutter + ((Math.max(win.start, Math.min(win.end, t)) - win.start) / win.seconds) * plotW
   const hits = []
 
   ctx2.clearRect(0, 0, width, height)
   ctx2.textBaseline = 'middle'
   ctx2.textAlign = 'left'
 
-  const lanes = (Array.isArray(servers) ? servers : []).filter(server =>
-    server && server.kind !== 'cloud' &&
-    ((Array.isArray(server.requests) && server.requests.length > 0) || (server.in_flight || 0) > 0)
-  )
   if (!lanes.length) {
     ctx2.fillStyle = text
     ctx2.font = '11px sans-serif'
-    ctx2.fillText('no local server traffic in this window', gutter, height / 2)
+    ctx2.fillText('no local or cloud traffic in this window', gutter, height / 2)
     return hits
   }
 
   const laneH = Math.max(56, (height - top - axisH) / lanes.length)
+  const colors = agentColorMap(lanes.filter(lane => lane.kind === 'local').map(lane => lane.server))
 
   for (let li = 0; li < lanes.length; li += 1) {
-    const server = lanes[li]
+    const lane = lanes[li]
     const y = top + li * laneH
     const innerH = laneH - 6
 
@@ -958,147 +1179,161 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
     ctx2.lineWidth = 1
     ctx2.strokeRect(gutter + 0.5, y + 0.5, plotW - 1, innerH - 1)
 
-    // Throughput history: decode bright area + line, prefill dim line, faint.
-    const samples = Array.isArray(server.samples)
-      ? server.samples.filter(s => Array.isArray(s) && s.length >= 3 && s[0] >= since)
-      : []
-    let maxDecode = 0
-    if (samples.length >= 2) {
-      let maxPrefill = 0
-      for (const s of samples) {
-        if (s[1] > maxDecode) maxDecode = s[1]
-        if (s[2] > maxPrefill) maxPrefill = s[2]
-      }
-      const baseY = y + innerH - 4
-      const plotH = innerH - 12
-      const decodePath = []
-      const prefillPath = []
-      for (const s of samples) {
-        const x = xOf(s[0])
-        decodePath.push([x, baseY - (maxDecode > 0 ? (s[1] / maxDecode) * plotH : 0)])
-        prefillPath.push([x, baseY - (maxPrefill > 0 ? (s[2] / maxPrefill) * plotH : 0)])
-      }
-      ctx2.save()
-      ctx2.globalAlpha = 0.10
-      ctx2.fillStyle = accent
-      ctx2.beginPath()
-      ctx2.moveTo(decodePath[0][0], baseY)
-      for (const point of decodePath) ctx2.lineTo(point[0], point[1])
-      ctx2.lineTo(decodePath[decodePath.length - 1][0], baseY)
-      ctx2.closePath()
-      ctx2.fill()
-      ctx2.restore()
-
-      ctx2.save()
-      ctx2.globalAlpha = 0.28
-      ctx2.strokeStyle = dim
-      ctx2.lineWidth = 1
-      ctx2.beginPath()
-      prefillPath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
-      ctx2.stroke()
-      ctx2.restore()
-
-      ctx2.save()
-      ctx2.globalAlpha = 0.55
-      ctx2.strokeStyle = accent
-      ctx2.lineWidth = 1
-      ctx2.beginPath()
-      decodePath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
-      ctx2.stroke()
-      ctx2.restore()
-    }
-
-    // Per-request bars, stacked into sub-rows by overlap.
-    const requests = Array.isArray(server.requests) ? server.requests : []
-    const visible = requests
-      .filter(r => r && r.started_at != null && (r.ended_at == null || r.ended_at >= since))
-      .sort((a, b) => a.started_at - b.started_at)
-      .slice(0, 40)
-    const rowEnds = []
-    const placed = visible.map(request => {
-      const start = Math.max(since, request.started_at)
-      const end = request.ended_at != null ? Math.min(nowSec, request.ended_at) : nowSec
-      let slot = rowEnds.findIndex(ends => ends <= start)
-      if (slot < 0) {
-        slot = rowEnds.length
-        rowEnds.push(end)
-      } else {
-        rowEnds[slot] = end
-      }
-      return { request, start, end, slot }
-    })
-    const concurrency = Math.max(1, rowEnds.length)
-    const slots = server.slots != null ? Math.max(1, server.slots) : concurrency
-    const barH = 6
-    const barGap = 2
-    const barTop = y + 14
-    const colors = agentColorMap(lanes)
-
-    placed.forEach(item => {
-      const { request, start, end, slot } = item
-      const x1 = xOf(start)
-      const x2 = Math.max(x1 + 2, xOf(end))
-      const barY = barTop + slot * (barH + barGap)
-      const color = colors.get(agentKey(request)) || accent
-      const split = request.first_chunk_at != null ? xOf(request.first_chunk_at) : x2
-      const queued = slot >= slots
-      ctx2.save()
-      if (queued) {
-        ctx2.globalAlpha = 0.55
-        ctx2.strokeStyle = color
-        ctx2.lineWidth = 1
-        ctx2.setLineDash([2, 2])
-        ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, barH - 1)
-      } else {
-        ctx2.globalAlpha = 0.35
-        ctx2.fillStyle = color
-        ctx2.fillRect(x1, barY, Math.max(1, split - x1), barH)
-        ctx2.globalAlpha = 0.9
-        ctx2.fillRect(split, barY, Math.max(1, x2 - split), barH)
-        if (request.ended_at == null) {
-          // In-flight growing edge: a brighter cap that pulses with the clock.
-          ctx2.globalAlpha = 0.55 + 0.35 * Math.abs(Math.sin(now / 420))
-          ctx2.fillStyle = color
-          ctx2.fillRect(x2 - 1.5, barY - 1, 2, barH + 2)
+    if (lane.kind === 'local') {
+      // Throughput history: decode bright area + line, prefill dim line, faint.
+      const samples = lane.samples
+      let maxDecode = 0
+      if (samples.length >= 2) {
+        let maxPrefill = 0
+        for (const s of samples) {
+          if (s[1] > maxDecode) maxDecode = s[1]
+          if (s[2] > maxPrefill) maxPrefill = s[2]
         }
+        const baseY = y + innerH - 4
+        const plotH = innerH - 12
+        const decodePath = []
+        const prefillPath = []
+        for (const s of samples) {
+          const x = xOf(s[0])
+          decodePath.push([x, baseY - (maxDecode > 0 ? (s[1] / maxDecode) * plotH : 0)])
+          prefillPath.push([x, baseY - (maxPrefill > 0 ? (s[2] / maxPrefill) * plotH : 0)])
+        }
+        ctx2.save()
+        ctx2.globalAlpha = 0.10
+        ctx2.fillStyle = accent
+        ctx2.beginPath()
+        ctx2.moveTo(decodePath[0][0], baseY)
+        for (const point of decodePath) ctx2.lineTo(point[0], point[1])
+        ctx2.lineTo(decodePath[decodePath.length - 1][0], baseY)
+        ctx2.closePath()
+        ctx2.fill()
+        ctx2.restore()
+
+        ctx2.save()
+        ctx2.globalAlpha = 0.28
+        ctx2.strokeStyle = dim
+        ctx2.lineWidth = 1
+        ctx2.beginPath()
+        prefillPath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
+        ctx2.stroke()
+        ctx2.restore()
+
+        ctx2.save()
+        ctx2.globalAlpha = 0.55
+        ctx2.strokeStyle = accent
+        ctx2.lineWidth = 1
+        ctx2.beginPath()
+        decodePath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
+        ctx2.stroke()
+        ctx2.restore()
+      }
+
+      // Per-request bars, stacked into sub-rows by overlap.
+      const barH = 6
+      const barGap = 2
+      const barTop = y + 14
+      lane.bars.forEach(item => {
+        const { request, start, end, slot, whole } = item
+        const x1 = xOf(start)
+        const x2 = Math.max(x1 + 2, xOf(end))
+        const barY = barTop + slot * (barH + barGap)
+        const color = colors.get(agentKey(request)) || accent
+        const queued = slot >= lane.slots
+        ctx2.save()
+        if (queued) {
+          ctx2.globalAlpha = 0.55
+          ctx2.strokeStyle = color
+          ctx2.lineWidth = 1
+          ctx2.setLineDash([2, 2])
+          ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, barH - 1)
+        } else if (whole) {
+          // Whole response: no first chunk, so no prefill/decode split. One
+          // uniform medium bar with a hatch, so it never reads as decode.
+          ctx2.globalAlpha = 0.5
+          ctx2.fillStyle = color
+          ctx2.fillRect(x1, barY, Math.max(1, x2 - x1), barH)
+          ctx2.globalAlpha = 0.85
+          ctx2.strokeStyle = color
+          ctx2.lineWidth = 1
+          for (let x = x1; x < x2; x += 4) {
+            ctx2.beginPath()
+            ctx2.moveTo(x, barY + barH)
+            ctx2.lineTo(Math.min(x + 3, x2), barY)
+            ctx2.stroke()
+          }
+        } else {
+          const split = request.first_chunk_at != null ? xOf(request.first_chunk_at) : x2
+          ctx2.globalAlpha = 0.35
+          ctx2.fillStyle = color
+          ctx2.fillRect(x1, barY, Math.max(1, split - x1), barH)
+          ctx2.globalAlpha = 0.9
+          ctx2.fillRect(split, barY, Math.max(1, x2 - split), barH)
+          if (request.ended_at == null) {
+            // In-flight growing edge: a brighter cap that pulses with the clock.
+            ctx2.globalAlpha = 0.55 + 0.35 * Math.abs(Math.sin(win.end / 420))
+            ctx2.fillStyle = color
+            ctx2.fillRect(x2 - 1.5, barY - 1, 2, barH + 2)
+          }
+        }
+        ctx2.restore()
+        hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: barH, request, lane })
+      })
+
+      // Slot numbers down the left edge of the plot: the y-axis is the stacked rows.
+      ctx2.fillStyle = dim
+      ctx2.font = '8px sans-serif'
+      for (let slot = 0; slot < Math.min(lane.concurrency, lane.slots + 2); slot += 1) {
+        ctx2.fillText(String(slot + 1), gutter + 3, barTop + slot * (barH + barGap) + barH / 2)
+      }
+
+      // Right edge: concurrency and the throughput trace's own scale.
+      ctx2.fillStyle = text
+      ctx2.font = '600 10px sans-serif'
+      ctx2.fillText(`${lane.concurrency} concurrent`, gutter + plotW + 6, y + 10)
+      ctx2.fillStyle = dim
+      ctx2.font = '9px sans-serif'
+      if (maxDecode > 0) {
+        ctx2.fillText(`max ${fmtRate(maxDecode)} tok/s`, gutter + plotW + 6, y + 22)
+        ctx2.fillText('0 tok/s', gutter + plotW + 6, y + innerH - 6)
+      }
+    } else {
+      // Cloud lane: one tick per 15 s bucket with traffic, height by count.
+      const baseY = y + innerH - 6
+      const plotH = innerH - 22
+      const maxCount = Math.max(1, ...lane.bars.map(tick => tick.count))
+      ctx2.save()
+      ctx2.fillStyle = accent
+      ctx2.globalAlpha = 0.55
+      for (const tick of lane.bars) {
+        const x1 = xOf(tick.start) + 2
+        const x2 = Math.max(x1 + 2, xOf(tick.end) - 2)
+        const tickH = Math.max(2, (tick.count / maxCount) * plotH)
+        ctx2.fillRect(x1, baseY - tickH, Math.max(2, x2 - x1), tickH)
+        ctx2.fillStyle = text
+        ctx2.font = '8px sans-serif'
+        ctx2.fillText(String(tick.count), x1, baseY - tickH - 6)
+        ctx2.fillStyle = accent
       }
       ctx2.restore()
-      hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: barH, request })
-    })
-
-    // Slot numbers down the left edge of the plot: the y-axis is the stacked rows.
-    ctx2.fillStyle = dim
-    ctx2.font = '8px sans-serif'
-    for (let slot = 0; slot < Math.min(concurrency, slots + 2); slot += 1) {
-      ctx2.fillText(String(slot + 1), gutter + 3, barTop + slot * (barH + barGap) + barH / 2)
+      ctx2.fillStyle = text
+      ctx2.font = '600 10px sans-serif'
+      ctx2.fillText(`${fmtInt(lane.total)} req`, gutter + plotW + 6, y + 10)
+      ctx2.fillStyle = dim
+      ctx2.font = '9px sans-serif'
+      ctx2.fillText('15s buckets', gutter + plotW + 6, y + 22)
+      ctx2.fillText('0 req', gutter + plotW + 6, y + innerH - 6)
     }
 
-    // Right edge: concurrency and the throughput trace's own scale.
-    ctx2.fillStyle = text
+    // Lane label in the gutter: local/cloud first, then the lane's own name.
+    ctx2.fillStyle = lane.kind === 'local' ? text : accent
     ctx2.font = '600 10px sans-serif'
-    ctx2.fillText(`${concurrency} concurrent`, gutter + plotW + 6, y + 10)
-    ctx2.fillStyle = dim
-    ctx2.font = '9px sans-serif'
-    if (maxDecode > 0) {
-      ctx2.fillText(`max ${fmtRate(maxDecode)} tok/s`, gutter + plotW + 6, y + 22)
-      ctx2.fillText('0 tok/s', gutter + plotW + 6, y + innerH - 6)
-    }
-
-    // Lane label in the gutter.
+    ctx2.fillText(truncateText(ctx2, lane.kind, gutter - 14), 8, y + 10)
     ctx2.fillStyle = text
     ctx2.font = '600 11px sans-serif'
-    ctx2.fillText(truncateText(ctx2, server.name || 'server', gutter - 14), 8, y + 14)
+    ctx2.fillText(truncateText(ctx2, lane.label, gutter - 14), 8, y + 24)
     ctx2.fillStyle = dim
     ctx2.font = '10px sans-serif'
-    ctx2.fillText(
-      truncateText(
-        ctx2,
-        `${server.kind || 'server'} · ${server.running != null ? server.running : '—'}/${server.slots != null ? server.slots : '—'} slots`,
-        gutter - 14
-      ),
-      8,
-      y + 28
-    )
+    ctx2.fillText(truncateText(ctx2, lane.detail, gutter - 14), 8, y + 36)
   }
 
   // Time grid and axis labels.
@@ -1120,7 +1355,7 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
   const marks = [0, 1, 2, 3, 4]
   for (const i of marks) {
     const x = gutter + (plotW * i) / 4
-    const offset = windowSeconds * (1 - i / 4)
+    const offset = win.seconds * (1 - i / 4)
     const label = i === 4 ? 'now' : `-${fmtElapsed(offset)}`
     ctx2.fillText(label, i === 4 ? x - 18 : x + 2, height - axisH + 2)
   }
@@ -1128,12 +1363,16 @@ function drawSwimLane(ctx2, width, height, servers, windowSeconds, now, canvas, 
   return hits
 }
 
-function SwimLane({ servers, labels, windowSeconds, now }) {
+function SwimLane({ snapshot, labels, windowSeconds, now }) {
   const wrapRef = useRef(null)
   const canvasRef = useRef(null)
   const hitsRef = useRef([])
   const [size, setSize] = useState({ width: 0, height: 0 })
   const [hover, setHover] = useState(null)
+  const { win, lanes } = useMemo(
+    () => swimLanes(snapshot, windowSeconds, now),
+    [snapshot, windowSeconds, now]
+  )
 
   useEffect(() => {
     const element = wrapRef.current
@@ -1155,18 +1394,18 @@ function SwimLane({ servers, labels, windowSeconds, now }) {
     const ctx2 = canvas.getContext('2d')
     if (!ctx2) return
     ctx2.setTransform(dpr, 0, 0, dpr, 0, 0)
-    hitsRef.current = drawSwimLane(ctx2, size.width, size.height, servers, windowSeconds, now, canvas, labels)
-  }, [servers, windowSeconds, now, size, labels])
+    hitsRef.current = drawSwimLane(ctx2, size.width, size.height, lanes, win, canvas, labels)
+  }, [lanes, win, size, labels])
 
   const legend = useMemo(() => {
-    const colors = agentColorMap(servers)
+    const colors = agentColorMap(lanes.filter(lane => lane.kind === 'local').map(lane => lane.server))
     const entries = [...colors.entries()].slice(0, 8)
     return entries.map(([key, color]) => {
       const [profile, session] = key.split('|')
       const label = labels[session] || (session ? `session ${session.slice(0, 8)}` : profile)
       return { key, color, label: `${profile} · ${label}` }
     })
-  }, [servers, labels])
+  }, [lanes, labels])
 
   const onMove = event => {
     const rect = event.currentTarget.getBoundingClientRect()
@@ -1184,22 +1423,36 @@ function SwimLane({ servers, labels, windowSeconds, now }) {
     children: [
       jsxs('div', {
         ref: wrapRef,
-        className: 'relative h-[190px] w-full rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) p-1',
+        className: 'relative w-full',
+        style: {
+          height: '190px',
+          padding: '4px',
+          borderRadius: '8px',
+          border: '1px solid var(--ui-stroke-secondary)',
+          background: 'var(--ui-bg-quinary)'
+        },
         onMouseMove: onMove,
         onMouseLeave: () => setHover(null),
         children: [
           jsx('canvas', {
             ref: canvasRef,
-            className: 'block h-full w-full',
+            className: 'block',
+            style: { width: '100%', height: '100%' },
             role: 'img',
-            'aria-label': 'Swim-lane timeline: one lane per local server with traffic, one stacked bar per request, dim prefill and bright decode, with concurrency and throughput scale labels'
+            'aria-label': 'Swim-lane timeline: one local lane per server with traffic, then one cloud lane per cloud model with traffic; one stacked bar per request, dim prefill and bright decode, hatched whole response, cloud 15 s request ticks, with concurrency and throughput scale labels'
           }),
           hover
             ? jsx('div', {
-                className: 'pointer-events-none absolute z-10 max-w-[340px] rounded border border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) px-2 py-1 text-[0.6rem] leading-relaxed text-(--ui-text-secondary) shadow-lg',
+                className: 'pointer-events-none absolute z-10 rounded px-2 py-1 shadow-lg',
                 style: {
                   left: `${Math.min(hover.x + 10, Math.max(8, size.width - 350))}px`,
-                  top: `${Math.min(hover.y + 12, Math.max(8, size.height - 60))}px`
+                  top: `${Math.min(hover.y + 12, Math.max(8, size.height - 60))}px`,
+                  maxWidth: '340px',
+                  border: '1px solid var(--ui-stroke-secondary)',
+                  background: 'var(--ui-bg-tertiary)',
+                  fontSize: '0.6rem',
+                  lineHeight: 1.6,
+                  color: 'var(--ui-text-secondary)'
                 },
                 children: hover.text
               })
@@ -1207,14 +1460,31 @@ function SwimLane({ servers, labels, windowSeconds, now }) {
         ]
       }),
       jsxs('div', {
-        className: 'flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5 text-[0.55rem] text-(--ui-text-quaternary)',
+        className: 'flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5',
+        style: { fontSize: '0.55rem', color: 'var(--ui-text-quaternary)' },
         children: [
-          jsx('span', { className: 'font-medium', children: 'dim = prefill, bright = decode' }),
+          jsx('span', {
+            className: 'font-medium',
+            children: 'dim = prefill, bright = decode, hatched = whole response (no first chunk)'
+          }),
+          jsx('span', {
+            className: 'inline-flex items-center gap-1',
+            children: [
+              jsx('span', {
+                className: 'rounded-full',
+                style: { width: '6px', height: '6px', background: 'var(--ui-accent)' }
+              }),
+              jsx('span', { children: 'cloud lane = 15 s request buckets, no per-request rows' })
+            ]
+          }),
           legend.map(entry =>
             jsxs('span', {
               className: 'inline-flex items-center gap-1',
               children: [
-                jsx('span', { className: 'size-1 rounded-full', style: { background: entry.color } }),
+                jsx('span', {
+                  className: 'rounded-full',
+                  style: { width: '6px', height: '6px', background: entry.color }
+                }),
                 jsx('span', { children: entry.label })
               ]
             }, entry.key)
@@ -1257,20 +1527,122 @@ function aggregateModels(rows) {
   return [...byLane.values()].sort((a, b) => (b.requests || 0) - (a.requests || 0))
 }
 
-function ModelChip({ model }) {
-  const tone = modelTone(model.lane_id)
-  const inFlight = (model.in_flight || 0) > 0
-  return jsxs('span', {
-    className: cn(
-      'inline-flex items-center gap-1 rounded border px-1 py-px text-[0.55rem] tabular-nums',
-      inFlight && 'animate-pulse'
-    ),
-    style: { borderColor: tone, color: tone },
-    title: `${model.label} · ${model.requests} requests${inFlight ? ` · ${model.in_flight} in flight` : ''} · ${fmtTokens(model.tokens_in)} in / ${fmtTokens(model.tokens_out)} out`,
+const AGENT_COLUMNS = [
+  { key: 'flight', label: 'flight', width: 64 },
+  { key: 'req', label: 'req', width: 56 },
+  { key: 'tokens', label: 'tok in/out', width: 112 },
+  { key: 'lat', label: 'lat', width: 48 },
+  { key: 'ttft', label: 'ttft', width: 48 },
+  { key: 'err', label: 'err', width: 32 }
+]
+const MIX_WIDTH = 96
+
+// Fixed widths live in inline styles, not Tailwind classes: the desktop CSS
+// bundle does not compile plugin.js, so w-16 / w-12 / h-1.5 / lg:inline-flex
+// silently render nothing — which is why the chips and columns were invisible.
+function colStyle(width, extra) {
+  return {
+    width: `${width}px`,
+    flex: '0 0 auto',
+    textAlign: 'right',
+    fontSize: '0.6rem',
+    fontVariantNumeric: 'tabular-nums',
+    color: 'var(--ui-text-secondary)',
+    ...extra
+  }
+}
+
+function modelDotStyle(model) {
+  return {
+    width: '6px',
+    height: '6px',
+    borderRadius: '999px',
+    flex: '0 0 auto',
+    background: model.local ? 'var(--ui-accent)' : 'var(--ui-text-tertiary)'
+  }
+}
+
+function cachedPctOf(node) {
+  return node.tokens_in ? Math.round(((node.cached_tokens || 0) / node.tokens_in) * 100) : null
+}
+
+function tokenColText(node) {
+  const pct = cachedPctOf(node)
+  return `${fmtTokens(node.tokens_in)}/${fmtTokens(node.tokens_out)}${pct != null ? ` (${pct}%)` : ''}`
+}
+
+// One indented sub-row per model an agent used in the window: a local/cloud
+// dot, the lane label, and the model's own columns. Per-model latency, TTFT and
+// errors are not in the snapshot yet, so they render as "—".
+function ModelSubRow({ model, now, depth }) {
+  const inFlight = model.in_flight || 0
+  return jsxs('div', {
+    'data-model-row': model.lane_id || model.label || 'model',
+    className: 'flex items-center gap-2',
+    style: {
+      marginLeft: `${depth ? 20 : 12}px`,
+      paddingLeft: '8px',
+      paddingRight: '8px',
+      paddingTop: '1px',
+      paddingBottom: '1px',
+      borderLeft: '1px solid var(--ui-stroke-secondary)',
+      fontSize: '0.6rem'
+    },
     children: [
-      jsx('span', { className: 'size-1 rounded-full', style: { background: tone } }),
-      jsx('span', { className: 'max-w-[150px] truncate', children: model.label }),
-      jsx('span', { className: 'text-(--ui-text-quaternary)', children: fmtInt(model.requests) })
+      jsx('span', {
+        style: modelDotStyle(model),
+        title: model.local ? 'local model server' : 'cloud provider'
+      }),
+      jsx('span', {
+        className: 'min-w-0 flex-1 truncate',
+        style: {
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          color: 'var(--ui-text-secondary)'
+        },
+        title: `${model.label} · ${model.local ? 'local' : 'cloud'}`,
+        children: model.label
+      }),
+      jsx('span', {
+        'data-col': 'flight',
+        className: cn(inFlight > 0 && 'animate-pulse'),
+        style: colStyle(64, inFlight > 0 ? { color: 'var(--ui-accent)', fontWeight: 600 } : null),
+        title: 'in flight',
+        children: inFlight ? String(inFlight) : '—'
+      }),
+      jsx('span', {
+        'data-col': 'req',
+        style: colStyle(56),
+        title: 'requests in the window',
+        children: `${fmtInt(model.requests)} req`
+      }),
+      jsx('span', {
+        'data-col': 'tokens',
+        style: colStyle(112),
+        title: 'tokens in / out (cached %)',
+        children: tokenColText(model)
+      }),
+      jsx('span', {
+        'data-col': 'lat',
+        style: colStyle(48),
+        title: 'latency p50',
+        children: fmtMs(model.latency_ms_p50)
+      }),
+      jsx('span', {
+        'data-col': 'ttft',
+        style: colStyle(48),
+        title: 'TTFT p50',
+        children: fmtMs(model.ttft_ms_p50)
+      }),
+      jsx('span', {
+        'data-col': 'err',
+        style: colStyle(32, {
+          color: (model.errors_5m || 0) > 0 ? 'var(--ui-destructive)' : 'var(--ui-text-quaternary)'
+        }),
+        title: 'errors in the window',
+        children: fmtInt(model.errors_5m)
+      })
     ]
   })
 }
@@ -1279,7 +1651,8 @@ function ModelMixBar({ models }) {
   const total = (models || []).reduce((sum, model) => sum + (model.requests || 0), 0)
   if (!total) return null
   return jsx('div', {
-    className: 'flex h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-(--ui-bg-tertiary)',
+    className: 'flex shrink-0 overflow-hidden rounded-full',
+    style: { width: `${MIX_WIDTH}px`, height: '6px', background: 'var(--ui-bg-tertiary)' },
     title: models.map(model => `${model.label}: ${model.requests}`).join(' · '),
     children: models.map(model =>
       jsx('span', {
@@ -1292,73 +1665,90 @@ function ModelMixBar({ models }) {
   })
 }
 
+// An agent row keeps only its totals across models; one model sub-row per model
+// sits under it, so two models never read as two chips for one agent.
 function AgentRow({ row, labels, now, depth }) {
   const inFlight = row.in_flight || 0
   const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
   const models = Array.isArray(row.models) ? row.models : []
-  const cachedPct = row.tokens_in ? Math.round(((row.cached_tokens || 0) / row.tokens_in) * 100) : null
+  const label = agentLabel(row, labels)
   return jsxs('div', {
-    className: cn(
-      'flex items-center gap-2 rounded-[4px] py-1 pr-2 text-[0.75rem] transition-colors',
-      depth ? 'ml-5 border-l border-(--ui-stroke-secondary) pl-2' : 'px-2',
-      inFlight > 0 ? 'bg-(--ui-row-hover-background)' : 'hover:bg-(--ui-row-hover-background)'
-    ),
+    'data-agent-row': row.session_id || row.profile || 'agent',
+    className: 'flex flex-col',
     children: [
-      jsx(StatusDot, {
-        tone: inFlight > 0 ? 'good' : 'muted',
-        className: cn('size-2 shrink-0', inFlight > 0 && 'animate-pulse')
-      }),
-      jsx('span', {
-        className: cn('min-w-0 flex-1 truncate', inFlight > 0 ? 'font-medium text-(--ui-text-primary)' : 'text-(--ui-text-secondary)'),
-        title: agentLabel(row, labels),
-        children: agentLabel(row, labels)
-      }),
-      row.kind === 'subagent' || row.kind === 'cron'
-        ? jsx(Badge, { variant: 'outline', size: 'xs', children: row.kind })
-        : null,
-      models.length
-        ? jsxs('span', {
-            className: 'hidden min-w-0 items-center gap-1 lg:inline-flex',
-            children: models.slice(0, 3).map(model => jsx(ModelChip, { model }, model.lane_id))
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        style: {
+          paddingLeft: `${depth ? 24 : 8}px`,
+          paddingRight: '8px',
+          paddingTop: '2px',
+          paddingBottom: '2px',
+          borderRadius: '4px',
+          fontSize: '0.75rem',
+          background: inFlight > 0 ? 'var(--ui-row-hover-background)' : 'transparent'
+        },
+        children: [
+          jsx(StatusDot, {
+            tone: inFlight > 0 ? 'good' : 'muted',
+            className: cn('size-2 shrink-0', inFlight > 0 && 'animate-pulse')
+          }),
+          jsx('span', {
+            className: 'min-w-0 flex-1 truncate',
+            style: {
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontWeight: inFlight > 0 ? 600 : 400,
+              color: inFlight > 0 ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
+            },
+            title: label,
+            children: label
+          }),
+          row.kind === 'subagent' || row.kind === 'cron'
+            ? jsx(Badge, { variant: 'outline', size: 'xs', children: row.kind })
+            : null,
+          jsx(ModelMixBar, { models }),
+          jsx('span', {
+            'data-col': 'flight',
+            style: colStyle(64),
+            title: 'in flight · elapsed of the oldest in-flight request',
+            children: inFlight ? `${inFlight} · ${elapsed || '—'}` : '—'
+          }),
+          jsx('span', {
+            'data-col': 'req',
+            style: colStyle(56),
+            title: 'requests in the window',
+            children: `${fmtInt(row.requests_5m)} req`
+          }),
+          jsx('span', {
+            'data-col': 'tokens',
+            style: colStyle(112),
+            title: 'tokens in / out (cached %)',
+            children: tokenColText(row)
+          }),
+          jsx('span', {
+            'data-col': 'lat',
+            style: colStyle(48),
+            title: 'latency p50',
+            children: fmtMs(row.latency_ms_p50)
+          }),
+          jsx('span', {
+            'data-col': 'ttft',
+            style: colStyle(48),
+            title: 'TTFT p50',
+            children: fmtMs(row.ttft_ms_p50)
+          }),
+          jsx('span', {
+            'data-col': 'err',
+            style: colStyle(32, {
+              color: (row.errors_5m || 0) > 0 ? 'var(--ui-destructive)' : 'var(--ui-text-quaternary)'
+            }),
+            title: 'errors in the window',
+            children: fmtInt(row.errors_5m)
           })
-        : null,
-      models.length > 3
-        ? jsx('span', { className: 'hidden text-[0.55rem] text-(--ui-text-quaternary) lg:inline', children: `+${models.length - 3}` })
-        : null,
-      jsx(ModelMixBar, { models }),
-      jsx('span', {
-        className: 'w-16 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
-        title: 'in flight · elapsed of the oldest in-flight request',
-        children: inFlight ? `${inFlight} · ${elapsed || '—'}` : '—'
+        ]
       }),
-      jsx('span', {
-        className: 'w-14 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
-        title: 'requests in the window',
-        children: `${fmtInt(row.requests_5m)} req`
-      }),
-      jsx('span', {
-        className: 'w-24 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
-        title: 'tokens in / out (cached %)',
-        children: `${fmtTokens(row.tokens_in)}/${fmtTokens(row.tokens_out)}${cachedPct != null ? ` (${cachedPct}%)` : ''}`
-      }),
-      jsx('span', {
-        className: 'w-12 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
-        title: 'latency p50',
-        children: fmtMs(row.latency_ms_p50)
-      }),
-      jsx('span', {
-        className: 'w-12 shrink-0 text-right text-[0.6rem] tabular-nums text-(--ui-text-secondary)',
-        title: 'TTFT p50',
-        children: fmtMs(row.ttft_ms_p50)
-      }),
-      jsx('span', {
-        className: cn(
-          'w-8 shrink-0 text-right text-[0.6rem] tabular-nums',
-          (row.errors_5m || 0) > 0 ? 'text-(--ui-destructive)' : 'text-(--ui-text-quaternary)'
-        ),
-        title: 'errors in the window',
-        children: fmtInt(row.errors_5m)
-      })
+      models.map(model => jsx(ModelSubRow, { model, now, depth: true }, model.lane_id))
     ]
   })
 }
@@ -1389,17 +1779,27 @@ function AgentTree({ agents, labels, now }) {
     className: 'flex flex-col gap-3',
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2 px-2 text-[0.55rem] uppercase tracking-[0.08em] text-(--ui-text-quaternary)',
+        className: 'flex items-center gap-2',
+        style: {
+          paddingLeft: '8px',
+          paddingRight: '8px',
+          fontSize: '0.55rem',
+          textTransform: 'uppercase',
+          letterSpacing: '0.08em',
+          color: 'var(--ui-text-quaternary)'
+        },
         children: [
           jsx('span', { className: 'min-w-0 flex-1', children: 'agent' }),
-          jsx('span', { className: 'hidden lg:inline', children: 'models' }),
-          jsx('span', { className: 'w-24 shrink-0 text-right', children: 'mix' }),
-          jsx('span', { className: 'w-16 shrink-0 text-right', children: 'flight' }),
-          jsx('span', { className: 'w-14 shrink-0 text-right', children: 'req' }),
-          jsx('span', { className: 'w-24 shrink-0 text-right', children: 'tok in/out' }),
-          jsx('span', { className: 'w-12 shrink-0 text-right', children: 'lat' }),
-          jsx('span', { className: 'w-12 shrink-0 text-right', children: 'ttft' }),
-          jsx('span', { className: 'w-8 shrink-0 text-right', children: 'err' })
+          jsx('span', {
+            style: { width: `${MIX_WIDTH}px`, flex: '0 0 auto', textAlign: 'right' },
+            children: 'mix'
+          }),
+          ...AGENT_COLUMNS.map(col =>
+            jsx('span', {
+              style: { width: `${col.width}px`, flex: '0 0 auto', textAlign: 'right' },
+              children: col.label
+            }, col.key)
+          )
         ]
       }),
       ...groups.map(([profile, roots]) => {
@@ -1407,38 +1807,91 @@ function AgentTree({ agents, labels, now }) {
         const requests = roots.reduce((sum, row) => sum + (row.requests_5m || 0), 0)
         const tokensIn = roots.reduce((sum, row) => sum + (row.tokens_in || 0), 0)
         const tokensOut = roots.reduce((sum, row) => sum + (row.tokens_out || 0), 0)
+        const cachedTokens = roots.reduce((sum, row) => sum + (row.cached_tokens || 0), 0)
         const models = aggregateModels(roots)
+        const totals = { in_flight: inFlight, requests_5m: requests, tokens_in: tokensIn, tokens_out: tokensOut, cached_tokens: cachedTokens }
         return jsxs(
           'section',
           {
             className: 'flex flex-col gap-1',
             children: [
               jsxs('div', {
-                className: 'flex flex-wrap items-center gap-2 px-2',
+                'data-agent-row': `profile:${profile}`,
+                className: 'flex flex-col',
                 children: [
-                  jsx('span', {
-                    className: 'size-2 rounded-full',
-                    style: { background: profileTone(profile) }
+                  jsxs('div', {
+                    className: 'flex items-center gap-2',
+                    style: {
+                      paddingLeft: '8px',
+                      paddingRight: '8px',
+                      paddingTop: '2px',
+                      paddingBottom: '2px',
+                      fontSize: '0.75rem'
+                    },
+                    children: [
+                      jsx('span', {
+                        className: 'rounded-full',
+                        style: { width: '8px', height: '8px', flex: '0 0 auto', background: profileTone(profile) }
+                      }),
+                      jsx('span', {
+                        className: 'min-w-0 flex-1 truncate',
+                        style: {
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          fontWeight: 600,
+                          color: 'var(--ui-text-primary)'
+                        },
+                        title: `${profile} · ${plural(roots.length, 'session')}`,
+                        children: `${profile} · ${plural(roots.length, 'session')}`
+                      }),
+                      jsx(ModelMixBar, { models }),
+                      jsx('span', {
+                        'data-col': 'flight',
+                        style: colStyle(64),
+                        title: 'in flight across every session',
+                        children: inFlight ? String(inFlight) : '—'
+                      }),
+                      jsx('span', {
+                        'data-col': 'req',
+                        style: colStyle(56),
+                        title: 'requests in the window',
+                        children: `${fmtInt(requests)} req`
+                      }),
+                      jsx('span', {
+                        'data-col': 'tokens',
+                        style: colStyle(112),
+                        title: 'tokens in / out (cached %)',
+                        children: tokenColText(totals)
+                      }),
+                      jsx('span', {
+                        'data-col': 'lat',
+                        style: colStyle(48),
+                        title: 'latency p50',
+                        children: '—'
+                      }),
+                      jsx('span', {
+                        'data-col': 'ttft',
+                        style: colStyle(48),
+                        title: 'TTFT p50',
+                        children: '—'
+                      }),
+                      jsx('span', {
+                        'data-col': 'err',
+                        style: colStyle(32),
+                        title: 'errors in the window',
+                        children: fmtInt(roots.reduce((sum, row) => sum + (row.errors_5m || 0), 0))
+                      })
+                    ]
                   }),
-                  jsx('span', {
-                    className: 'text-[0.75rem] font-semibold text-(--ui-text-primary)',
-                    children: profile
-                  }),
-                  jsx('span', {
-                    className: 'text-[0.65rem] tabular-nums text-(--ui-text-quaternary)',
-                    children: `${plural(roots.length, 'session')} · ${inFlight} in flight · ${requests} req/5m · ${fmtTokens(tokensIn)}/${fmtTokens(tokensOut)} tok`
-                  }),
-                  models.slice(0, 4).map(model => jsx(ModelChip, { model }, `profile-${model.lane_id}`)),
-                  models.length > 4
-                    ? jsx('span', { className: 'text-[0.55rem] text-(--ui-text-quaternary)', children: `+${models.length - 4}` })
-                    : null
+                  models.map(model => jsx(ModelSubRow, { model, now, depth: true }, `profile-${model.lane_id}`))
                 ]
               }),
               roots.map(root =>
                 jsxs(
                   'div',
                   {
-                    className: 'flex flex-col gap-0.5',
+                    className: 'flex flex-col gap-1',
                     children: [
                       jsx(AgentRow, { row: root, labels, now }),
                       (root.children || []).map(child =>
@@ -1596,11 +2049,11 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
           ]
         })
       }),
-      servers.length
+      servers.length || cloud.length
         ? jsx(Section, {
             label: 'Swim lane',
-            meta: `last ${fmtDuration(windowSeconds)} · one lane per server with traffic · dim = prefill, bright = decode · stacked bars = concurrency`,
-            children: jsx(SwimLane, { servers, labels, windowSeconds, now })
+            meta: `last ${fmtDuration(windowSeconds)} · local lanes then cloud lanes · dim = prefill, bright = decode, hatched = whole response · stacked bars = concurrency`,
+            children: jsx(SwimLane, { snapshot, labels, windowSeconds, now })
           })
         : null,
       cloud.length

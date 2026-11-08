@@ -97,7 +97,11 @@ def _conn() -> Iterator[Any]:
 
 
 def _window_seconds(window: str | None) -> int:
-    return 60 if (window or "").strip() == "1m" else 300
+    """Window label or seconds to seconds. "60" is 1m, not a 5m fallback."""
+    label = (window or "").strip().lower()
+    if label in ("1m", "60", "60s"):
+        return 60
+    return 300
 
 
 def _settings(conn: Any) -> dict:
