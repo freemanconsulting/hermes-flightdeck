@@ -260,7 +260,10 @@ def server_samples(now: float = NOW) -> list[dict]:
 
 
 def build_example(conn: sqlite3.Connection, now: float = NOW) -> dict:
-    return api.build_snapshot(300, servers=server_samples(now), conn=conn, now=now)
+    # session_info={} keeps the fixture deterministic: agent title/source/
+    # started_at stay null instead of reading this machine's real state.db.
+    return api.build_snapshot(300, servers=server_samples(now), conn=conn, now=now,
+                              session_info={})
 
 
 def main() -> int:

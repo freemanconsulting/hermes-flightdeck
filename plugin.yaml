@@ -62,6 +62,10 @@ config_schema:
   show_quota:
     type: boolean
     default: true
+  demo_mode:
+    type: boolean
+    default: false
+    description: "Opt-in: serve a seeded, live-looking demo fleet instead of the real store, so a fresh install with no servers and no traffic still shows the page. Never writes demo rows to requests.db. FLIGHTDECK_DEMO=1 also turns it on."
   route_delegation:
     type: boolean
     default: false

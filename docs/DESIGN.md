@@ -613,6 +613,16 @@ unknown, never `0`-as-unknown. `name` is the short card label (declared name →
 `declared`|`discovered`|`none` — `discovered` even when discovery found nothing, so the UI can tell
 "discovery is on and empty" from "nothing declared".
 
+`demo` is always present: `true` only when demo mode served a seeded snapshot, so the UI can badge
+it and never mistake it for live traffic. `empty_reason` is always present and `null` whenever the
+page has content; otherwise it says why a fresh install is empty — `no_servers_configured` (nothing
+declared and discovery found nothing), `servers_unreachable` (servers were probed but none answered
+and no request is in the window), or `no_traffic` (reachable server cards, but no Hermes request in
+the window and nothing in flight). Agent rows also carry `title`, `source` and `started_at` from the
+owning profile's `state.db` `sessions` table (`label` is the title, `""` when there is none), so the
+tree labels itself without a `session.list` round-trip; a missing db, table or column leaves those
+fields null rather than raising.
+
 `decisions` is always present (`[]` when none): the newest 20 routing decisions inside the
 retention window, newest first, each `{id, at, action, task_index, requested_lane, chosen_lane,
 requested_model, chosen_model, reason, stale, goal, lanes}` with `lanes` the sampled slots at

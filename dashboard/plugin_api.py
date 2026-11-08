@@ -83,6 +83,13 @@ def _api() -> Any:
     return module
 
 
+def _demo() -> Any:
+    module = _load_sibling("demo")
+    if module is None:
+        raise HTTPException(status_code=503, detail="flightdeck demo.py is unavailable")
+    return module
+
+
 @contextmanager
 def _conn() -> Iterator[Any]:
     """One store connection per request, closed when the handler returns."""
@@ -112,6 +119,18 @@ def _settings(conn: Any) -> dict:
         except Exception as exc:
             _warn("flightdeck: settings load failed; serving an empty server list", exc)
     return {"servers": [], "poll_interval_seconds": 5, "probe_timeout_seconds": 2.0}
+
+
+def _demo_mode() -> bool:
+    """Demo mode from settings/env, read without opening the store.
+
+    Checked before ``_conn()`` so demo mode never opens — let alone writes —
+    the real requests.db, and still works when the store is unavailable.
+    """
+    try:
+        return bool(_settings(None).get("demo_mode"))
+    except Exception:
+        return False
 
 
 async def _poll(conn: Any, *, force: bool = False) -> dict:
@@ -153,6 +172,8 @@ def _maybe_sweep(conn: Any) -> None:
 async def snapshot(window: str = Query("5m", description="1m or 5m")):
     """The page's one call: full §9.1 payload."""
     seconds = _window_seconds(window)
+    if _demo_mode():
+        return _demo().build_demo_snapshot(seconds)
     with _conn() as conn:
         _maybe_sweep(conn)
         settings = _settings(conn)
@@ -163,22 +184,34 @@ async def snapshot(window: str = Query("5m", description="1m or 5m")):
 
 @router.get("/agents")
 def agents(window: str = Query("5m", description="1m or 5m")):
+    seconds = _window_seconds(window)
+    if _demo_mode():
+        payload = _demo().build_demo_snapshot(seconds)
+        return {"agents": payload["agents"], "demo": True}
     with _conn() as conn:
-        return _api().build_agents(_window_seconds(window), conn=conn)
+        return _api().build_agents(seconds, conn=conn)
 
 
 @router.get("/models")
 async def models(window: str = Query("5m", description="1m or 5m")):
+    seconds = _window_seconds(window)
+    if _demo_mode():
+        payload = _demo().build_demo_snapshot(seconds)
+        return {"models": payload["models"], "servers": payload["servers"], "demo": True}
     with _conn() as conn:
         settings = _settings(conn)
         samples = await _poll(conn)
-        return _api().build_models(_window_seconds(window), servers=samples, conn=conn,
+        return _api().build_models(seconds, servers=samples, conn=conn,
                                    servers_source=settings.get("servers_source"))
 
 
 @router.get("/servers")
 async def servers():
     """Chip call: server cards only, no hook join."""
+    if _demo_mode():
+        payload = _demo().build_demo_snapshot(300)
+        return {"servers": payload["servers"], "unreachable": payload["unreachable"],
+                "demo": True}
     with _conn() as conn:
         settings = _settings(conn)
         samples = await _poll(conn)

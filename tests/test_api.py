@@ -61,9 +61,10 @@ def model(snapshot_payload, key):
 
 def test_snapshot_shape_is_pinned(conn):
     payload = snapshot(conn)
-    assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
-                             "unreachable", "idle", "hidden_servers", "models", "agents",
-                             "decisions", "routing"]
+    assert list(payload) == ["generated_at", "demo", "empty_reason", "window", "totals",
+                             "servers_source", "servers", "unreachable", "idle", "hidden_servers",
+                             "models", "agents", "decisions", "routing"]
+    assert payload["demo"] is False and payload["empty_reason"] is None
     assert payload["servers_source"] == "declared"
     assert payload["window"] == {"seconds": 300, "since": NOW - 300}
     assert list(payload["totals"]) == ["in_flight", "requests_1m", "requests_5m", "errors_5m"]
@@ -99,12 +100,14 @@ def test_snapshot_shape_is_pinned(conn):
 
     agent = payload["agents"][0]
     assert list(agent) == [
-        "profile", "session_id", "label", "kind", "parent_session_id", "cron_job",
+        "profile", "session_id", "label", "title", "source", "started_at", "kind",
+        "parent_session_id", "cron_job",
         "in_flight", "requests_5m", "errors_5m", "models", "oldest_started_at",
         "last_active_at",
         "tokens_in", "tokens_out", "cached_tokens", "latency_ms_p50", "ttft_ms_p50", "children",
     ]
-    assert agent["label"] == ""
+    assert agent["label"] == "" and agent["title"] is None
+    assert agent["source"] is None and agent["started_at"] is None
     assert agent["children"][0]["kind"] == "subagent"
     assert agent["children"][0]["role"] == "general"
     # Per-node model breakdown: one entry per model lane, with counts and tokens.
@@ -139,6 +142,51 @@ def test_snapshot_shape_is_pinned(conn):
     # Latency p50 over all five ended s1 rows (500, 1000, 2000, 4000, 6000 ms)
     # is 2000; TTFT p50 over the four with a first chunk stays 200.
     assert agent["latency_ms_p50"] == 2000.0 and agent["ttft_ms_p50"] == 200.0
+
+
+# --- §9.1 agent session metadata (state.db) ---------------------------------
+
+
+def test_agent_rows_resolve_session_title_from_state_db(conn, monkeypatch, tmp_path):
+    """s1's title/source/started_at come from the owning profile's state.db."""
+    state = sqlite3.connect(str(tmp_path / "state.db"))
+    state.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, "
+                  "source TEXT, started_at REAL)")
+    state.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                  ("s1", "Flightdeck hackathon", "desktop", NOW - 3600))
+    state.commit()
+    state.close()
+    monkeypatch.setattr(api, "_profile_state_dbs", lambda: {"default": tmp_path / "state.db"})
+
+    payload = snapshot(conn)
+    agent = payload["agents"][0]
+    assert agent["session_id"] == "s1"
+    assert agent["title"] == "Flightdeck hackathon"
+    assert agent["label"] == "Flightdeck hackathon"
+    assert agent["source"] == "desktop"
+    assert agent["started_at"] == NOW - 3600
+    # s2 has no state.db row: null fields, never an invented label.
+    child = agent["children"][0]
+    assert child["title"] is None and child["label"] == ""
+    assert child["source"] is None and child["started_at"] is None
+
+
+def test_agent_rows_tolerate_missing_state_db_and_columns(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "_profile_state_dbs", lambda: {"default": tmp_path / "absent.db"})
+    agent = snapshot(conn)["agents"][0]
+    assert agent["title"] is None and agent["label"] == ""
+    assert agent["source"] is None and agent["started_at"] is None
+
+    # A sessions table without title/source/started_at is a missing-column case.
+    state = sqlite3.connect(str(tmp_path / "partial.db"))
+    state.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    state.execute("INSERT INTO sessions VALUES ('s1')")
+    state.commit()
+    state.close()
+    monkeypatch.setattr(api, "_profile_state_dbs", lambda: {"default": tmp_path / "partial.db"})
+    agent = snapshot(conn)["agents"][0]
+    assert agent["title"] is None and agent["label"] == ""
+    assert agent["source"] is None and agent["started_at"] is None
 
 
 # --- §9.1 per-request rows (the swim-lane) -----------------------------------
@@ -605,9 +653,10 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
     monkeypatch.setattr(module._api(), "_now", lambda: NOW)
 
     payload = asyncio.run(module.snapshot("5m"))
-    assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
-                             "unreachable", "idle", "hidden_servers", "models", "agents",
-                             "decisions", "routing"]
+    assert list(payload) == ["generated_at", "demo", "empty_reason", "window", "totals",
+                             "servers_source", "servers", "unreachable", "idle", "hidden_servers",
+                             "models", "agents", "decisions", "routing"]
+    assert payload["demo"] is False and payload["empty_reason"] is None
     assert payload["totals"]["in_flight"] == 6
 
     assert len(module.agents("1m")["agents"]) == 2

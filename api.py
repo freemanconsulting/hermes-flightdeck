@@ -756,11 +756,87 @@ def _agent_models(items: list[dict], server_by_url: dict[str, dict]) -> list[dic
                                                        entry["label"]))
 
 
+def _profile_state_dbs() -> dict[str, Path]:
+    """``profile label → state.db path`` for the root profile and every profile.
+
+    The root profile is labelled ``default`` (config.ROOT_PROFILE_LABEL) and
+    lives at ``<hermes root>/state.db``; every directory under ``profiles/*``
+    is a profile with its own ``state.db``.  The Hermes root comes from
+    config.py's own resolver, so a ``HERMES_HOME`` override is honoured.
+    Missing directories are simply absent; this never raises.
+    """
+    config = _config_module()
+    try:
+        root = Path(config._hermes_root()) if config is not None and hasattr(config, "_hermes_root") \
+            else Path.home() / ".hermes"
+    except Exception:
+        return {}
+    dbs: dict[str, Path] = {"default": root / "state.db"}
+    try:
+        for directory in sorted((root / "profiles").iterdir()):
+            if directory.is_dir():
+                dbs[directory.name] = directory / "state.db"
+    except Exception:
+        pass
+    return dbs
+
+
+def _session_info(rows: list[dict]) -> dict[tuple[str, str], dict]:
+    """``(profile, session_id) → {title, source, started_at}`` from state.db.
+
+    One read-only query per profile per snapshot, with an ``IN (...)`` list of
+    the session ids that snapshot actually mentions.  A missing db, missing
+    table or missing column is tolerated: those sessions simply have no entry,
+    and the agent row keeps ``title``/``source``/``started_at`` null and
+    ``label`` ``""``.  Never raises and never writes.
+    """
+    wanted: dict[str, set[str]] = {}
+    for row in rows:
+        profile = str(row.get("profile") or "")
+        session_id = row.get("session_id")
+        if profile and session_id:
+            wanted.setdefault(profile, set()).add(str(session_id))
+    if not wanted:
+        return {}
+    dbs = _profile_state_dbs()
+    info: dict[tuple[str, str], dict] = {}
+    for profile, session_ids in wanted.items():
+        path = dbs.get(profile)
+        if path is None or not path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{urllib.parse.quote(str(path))}?mode=ro",
+                                   uri=True, timeout=0.5)
+        except Exception:
+            continue
+        try:
+            placeholders = ", ".join("?" for _ in session_ids)
+            found = conn.execute(
+                f"SELECT id, title, source, started_at FROM sessions "
+                f"WHERE id IN ({placeholders})",
+                tuple(session_ids),
+            ).fetchall()
+            for item in found:
+                info[(profile, str(item[0]))] = {
+                    "title": item[1], "source": item[2], "started_at": item[3],
+                }
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return info
+
+
 def _agent_tree(rows: list[dict], links: dict[str, dict],
                 server_by_url: dict[str, dict] | None = None,
-                routed: dict[str, dict] | None = None) -> list[dict]:
+                routed: dict[str, dict] | None = None,
+                session_info: dict[tuple[str, str], dict] | None = None) -> list[dict]:
     server_by_url = server_by_url or {}
     routed = routed or {}
+    session_info = session_info or {}
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
         groups.setdefault((row.get("profile") or "", row.get("session_id") or ""), []).append(row)
@@ -780,6 +856,13 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
         parent = next((row.get("parent_session_id") for row in items if row.get("parent_session_id")), None)
         cron_job = next((row.get("cron_job_name") or row.get("cron_job_id") for row in items
                          if row.get("cron_job_name") or row.get("cron_job_id")), None)
+        # Session metadata from the owning profile's state.db.  A session with
+        # no row there (subagents, cron runs, a missing db) keeps label "" and
+        # null title/source/started_at rather than inventing a name.
+        meta = session_info.get((profile, session_id)) or {}
+        title = str(meta["title"]) if meta.get("title") else None
+        source = str(meta["source"]) if meta.get("source") else None
+        session_started = _num(meta.get("started_at"))
         ttfts: list[float] = []
         latencies: list[float] = []
         for row in items:
@@ -794,7 +877,10 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
         nodes[key] = {
             "profile": profile,
             "session_id": session_id,
-            "label": "",
+            "label": title or "",
+            "title": title,
+            "source": source,
+            "started_at": session_started,
             "kind": _row_kind(items[0]),
             "parent_session_id": parent,
             "cron_job": cron_job,
@@ -872,12 +958,32 @@ def _sample_hidden(sample: dict, hidden: list[str]) -> bool:
     return False
 
 
+def _empty_reason(rows: list[dict], in_flight: list[dict], samples: list[dict],
+                  server_cards: list[dict]) -> str | None:
+    """Why a fresh install's page is empty, or None when there is anything to show.
+
+    ``no_servers_configured``: nothing declared and discovery found nothing.
+    ``servers_unreachable``: servers were probed but none answered and no
+    request is in the window.  ``no_traffic``: reachable server cards but no
+    Hermes request in the window and nothing in flight.  Traffic (even
+    cloud-only) means the page has content, so the reason is None.
+    """
+    if rows or in_flight:
+        return None
+    if server_cards:
+        return "no_traffic"
+    if samples:
+        return "servers_unreachable"
+    return "no_servers_configured"
+
+
 def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                    conn: sqlite3.Connection | None = None, now: float | None = None,
                    servers_source: str | None = None,
                    hidden_servers: list[str] | None = None,
                    retention_hours: int | None = None,
-                   routing: dict | None = None) -> dict:
+                   routing: dict | None = None,
+                   session_info: dict | None = None) -> dict:
     """The §9.1 snapshot.  ``servers`` is already-polled samples (dict or list);
     None means poll the declared servers synchronously; [] means no server cards.
     ``servers_source`` overrides the derived source — /servers passes
@@ -885,7 +991,9 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     ``hidden_servers`` filters passed samples by name or base_url; the live path
     is already filtered by ``config.load``.  ``retention_hours`` bounds the
     idle-server check (default 24).  ``routing`` pins the routing block (tests,
-    dashboard) instead of reading config.yaml; None computes it."""
+    dashboard) instead of reading config.yaml; None computes it.
+    ``session_info`` pins the per-session title/source/started_at map (demo,
+    tests); None reads each profile's state.db once for the rows in the window."""
     conn = conn if conn is not None else _open_conn()
     now = _now() if now is None else float(now)
     since = now - float(window_seconds)
@@ -922,6 +1030,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     rows = _window_rows(conn, since)
     in_flight = _in_flight_rows(conn)
     sample_rows = _server_samples_since(conn, since)
+    if session_info is None:
+        session_info = _session_info(rows)
 
     server_cards = _server_cards(samples, _request_rows(conn, now), in_flight, sample_rows, now)
     # Dead-server noise (DESIGN §7.2): a discovered server that is unreachable
@@ -969,9 +1079,10 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     routed = _routed_for_links(conn, links)
     agent_nodes = _agent_tree(rows, links,
                               {normalize_base_url(card["base_url"]): card for card in server_cards},
-                              routed=routed)
+                              routed=routed, session_info=session_info)
     decisions = _decisions(conn, now, float(retention_hours if retention_hours is not None else 24))
     routing_value = _routing(_settings(conn)) if routing is None else dict(routing)
+    empty_reason = _empty_reason(rows, in_flight, samples, server_cards)
 
     totals = {
         "in_flight": len(in_flight),
@@ -983,6 +1094,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
 
     return {
         "generated_at": now,
+        "demo": False,
+        "empty_reason": empty_reason,
         "window": {"seconds": int(window_seconds), "since": since},
         "totals": totals,
         "servers_source": servers_source,
@@ -1010,7 +1123,8 @@ def build_agents(window_seconds: int = 300, *, conn: sqlite3.Connection | None =
         if server.get("base_url")
     }
     return {"agents": _agent_tree(rows, _subagent_links(conn), server_by_url,
-                                  routed=_routed_for_links(conn, _subagent_links(conn)))}
+                                  routed=_routed_for_links(conn, _subagent_links(conn)),
+                                  session_info=_session_info(rows))}
 
 def build_models(window_seconds: int = 300, *, servers: Any = None,
                  conn: sqlite3.Connection | None = None, now: float | None = None,

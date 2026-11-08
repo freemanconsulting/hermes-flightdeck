@@ -36,6 +36,18 @@ def _api():
     return _load_sibling("api", __package__)
 
 
+def _demo():
+    return _load_sibling("demo", __package__)
+
+
+def _demo_mode() -> bool:
+    """config.load()'s demo_mode, or False when config.py is unavailable."""
+    try:
+        return bool(_load_sibling("config", __package__).load().get("demo_mode"))
+    except Exception:
+        return False
+
+
 def _window_seconds(window: Any) -> int:
     return _WINDOWS.get(str(window or "5m").strip().lower(), 300)
 
@@ -142,7 +154,10 @@ def _iso(epoch: Any) -> Optional[str]:
 def fleet_status(window: str = "5m", include_cloud: bool = True, **_: Any) -> str:
     """Agent tool: JSON lanes with free capacity and a recommended pick."""
     try:
-        snapshot = _api().build_snapshot(window_seconds=_window_seconds(window))
+        if _demo_mode():
+            snapshot = _demo().build_demo_snapshot(_window_seconds(window))
+        else:
+            snapshot = _api().build_snapshot(window_seconds=_window_seconds(window))
     except Exception as exc:
         return json.dumps({"ok": False, "error": f"fleet snapshot unavailable: {exc}"})
     servers = snapshot.get("servers") or []
@@ -156,6 +171,8 @@ def fleet_status(window: str = "5m", include_cloud: bool = True, **_: Any) -> st
         "pick": _pick(lanes),
         "routing": _api().routing_block(snapshot),
     }
+    if snapshot.get("demo"):
+        payload["demo"] = True
     return json.dumps(payload, default=str)
 
 
@@ -163,7 +180,10 @@ def fleet_command(raw_args: str = "", **_: Any) -> str:
     """``/fleet``: one line, e.g. ``ds4 3/4 · GN100 5/5 (2 queued) · pick: ds4``."""
     window = "1m" if "1m" in str(raw_args or "").split() else "5m"
     try:
-        snapshot = _api().build_snapshot(window_seconds=_window_seconds(window))
+        if _demo_mode():
+            snapshot = _demo().build_demo_snapshot(_window_seconds(window))
+        else:
+            snapshot = _api().build_snapshot(window_seconds=_window_seconds(window))
         return _api().fleet_status_text(snapshot)
     except Exception as exc:
         return f"flightdeck: fleet status unavailable ({exc})"

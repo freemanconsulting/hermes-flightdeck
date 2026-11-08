@@ -100,6 +100,14 @@ their private provider URLs, deduped by base_url, with the profiles that referen
 shown on the card. Only loopback and private addresses are probed by default; declare a public
 URL explicitly if you want it polled.
 
+**Try it without local servers.** A fresh install with no model servers and no traffic shows an
+honest empty page: the snapshot carries `empty_reason` (`no_servers_configured`, `servers_unreachable`
+or `no_traffic`) so the UI can say why. To see the full page immediately, turn on demo mode with
+`demo_mode: true` in Settings → Plugins (Flightdeck) or by launching Hermes with
+`FLIGHTDECK_DEMO=1`: the backend then serves a seeded, live-looking fleet (local server cards,
+agents, subagents, a cron run and a cloud lane) with `demo: true` on every payload. Demo mode never
+writes demo rows into `requests.db`; turn it off to see your real fleet.
+
 ## Capacity routing (opt-in)
 
 Off by default. When enabled (`route_delegation: true`) and `delegation.backend: flightdeck`

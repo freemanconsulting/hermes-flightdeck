@@ -55,6 +55,9 @@ DEFAULTS: dict[str, Any] = {
     "show_cloud": True,
     "show_chip": True,
     "show_quota": True,
+    # Opt-in demo: serve a seeded, live-looking snapshot instead of the real
+    # store.  Off by default; FLIGHTDECK_DEMO=1 also turns it on.
+    "demo_mode": False,
     # Capacity routing (CAPACITY.md §8.2).  Off by default; opt-in only.
     "route_delegation": False,
     "inner_backend": "default",
@@ -149,6 +152,11 @@ def _as_bool(value: Any, default: bool) -> bool:
         if lowered in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def _demo_env() -> bool:
+    """``FLIGHTDECK_DEMO=1`` (or true/yes/on) turns demo mode on without settings."""
+    return _as_bool(os.environ.get("FLIGHTDECK_DEMO"), False)
 
 
 def host_port(url: Any) -> str:
@@ -528,6 +536,7 @@ def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> d
         "show_cloud": _as_bool(settings.get("show_cloud"), True),
         "show_chip": _as_bool(settings.get("show_chip"), True),
         "show_quota": _as_bool(settings.get("show_quota"), True),
+        "demo_mode": _as_bool(settings.get("demo_mode"), False) or _demo_env(),
         "route_delegation": _as_bool(settings.get("route_delegation"), False),
         "inner_backend": str(settings.get("inner_backend") or "default").strip().lower() or "default",
         "reserve_slots": _as_int(settings.get("reserve_slots"), 0, minimum=0),
