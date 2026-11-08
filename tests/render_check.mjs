@@ -196,6 +196,65 @@ const cloudRowCtx = { ...fakeCtx, fillRect() { cloudRowDraw.fillRect += 1 }, str
 mod.drawSwimLane(cloudRowCtx, 900, 190, cloudRows.lanes, cloudRows.win, cloudRowCtx, labels)
 check('cloud lane right label reads peak 3', cloudRowDraw.fillText.includes('peak 3'),
   cloudRowDraw.fillText.filter(t => String(t).startsWith('peak')).join(', '))
+// 2b-2. The agent loop from the live screenshot: 3 back-to-back requests whose
+//       first token lands at (or within 0.25 s of) the end — nothing streamed.
+//       Each must be its OWN hatched bar (whole = true) with a 1 px start gap
+//       (abutStart), and the left detail must say '3 req' with NO 'n req'
+//       number repeated on the right axis (only 'peak N').
+const cloudLoopSnapshot = JSON.parse(JSON.stringify(fixture))
+const cloudLoopModel = cloudLoopSnapshot.models.find(m => m.lane === 'cloud')
+const loopBase = win.end - 30
+cloudLoopModel.requests = [0, 16, 32].map(offset => ({
+  started_at: loopBase + offset,
+  first_chunk_at: loopBase + offset + 16,   // first token == end: never streamed
+  ended_at: loopBase + offset + 16,
+  profile: 'default',
+  session_id: `cloudloop_${offset}`,
+  status: 'done',
+  model: cloudLoopModel.model,
+  prompt_tokens: 900,
+  completion_tokens: 60
+}))
+const cloudLoop = mod.swimLanes(cloudLoopSnapshot, 60, fixture.generated_at * 1000)
+const cloudLoopLane = cloudLoop.lanes.find(lane => lane.kind === 'cloud' && (lane.requests || []).length === 3)
+check('3 back-to-back non-streamed cloud rows render as 3 separate hatched bars',
+  cloudLoopLane && cloudLoopLane.bars.length === 3
+    && cloudLoopLane.bars.every(bar => bar.whole === true)
+    && cloudLoopLane.bars.every(bar => bar.slot === 0)
+    && cloudLoopLane.bars.filter(bar => bar.abutStart).length === 1
+    && cloudLoopLane.bars[1].abutStart === true && cloudLoopLane.bars[2].abutStart === false,
+  cloudLoopLane ? `${cloudLoopLane.bars.length} bars, ${cloudLoopLane.bars.filter(b => b.whole).length} whole, `
+    + `${cloudLoopLane.bars.filter(b => b.abutStart).length} abutting` : 'lane missing')
+const cloudLoopDraw = { fillRect: 0, strokeRect: 0, fillText: [] }
+const cloudLoopCtx = { ...fakeCtx, fillRect() { cloudLoopDraw.fillRect += 1 }, strokeRect() { cloudLoopDraw.strokeRect += 1 }, fillText(t) { cloudLoopDraw.fillText.push(t) } }
+mod.drawSwimLane(cloudLoopCtx, 900, 190, cloudLoop.lanes, cloudLoop.win, cloudLoopCtx, labels)
+const loopRightLabels = cloudLoopDraw.fillText.filter(t => String(t).startsWith('peak') || /req$/.test(String(t)))
+check('cloud loop lane: left detail and right axis agree on the count (3 req left, no number right)',
+  cloudLoopLane && /^3 req · 0 streamed$/.test(cloudLoopLane.detail || '')
+    && !cloudLoopDraw.fillText.some(t => /^\d+ req$/.test(String(t)))
+    && loopRightLabels.length === cloudLoop.lanes.length,
+  `${cloudLoopLane ? cloudLoopLane.detail : 'lane missing'} | right: ${loopRightLabels.join(', ')}`)
+
+// 2b-3. The per-agent legend entries take their label from snapshot.agents, so
+//       a lane whose session has a titled agent row shows the title, never the
+//       date id. Seed a title on the agent row that owns a local lane's rows.
+const legendTitleSnapshot = JSON.parse(JSON.stringify(fixture))
+const localRowServer = fixture.servers.find(s => (s.requests || []).length > 0)
+const legendTitleSession = localRowServer.requests.find(r => r.session_id).session_id
+const legendTitleProfile = localRowServer.requests.find(r => r.session_id).profile || 'default'
+legendTitleSnapshot.agents = (legendTitleSnapshot.agents || []).filter(a => a.session_id !== legendTitleSession)
+legendTitleSnapshot.agents.push({
+  profile: legendTitleProfile, session_id: legendTitleSession, kind: 'session',
+  title: 'Flightdeck hackathon', label: '', source: 'cli'
+})
+const legendTitleLane = mod.SwimLane({
+  snapshot: legendTitleSnapshot, labels, now: fixture.generated_at * 1000, windowSeconds: 60
+})
+const legendTitleText = textOf(legendTitleLane)
+check('legend agent entry shows the snapshot agent title, not the date id',
+  legendTitleText.includes(`${legendTitleProfile} · Flightdeck hackathon`)
+    && !legendTitleText.includes(`session ${legendTitleSession.slice(0, 8)}`),
+  legendTitleText.slice(-140))
 
 // 2c. A 150-request fan-out must draw the NEWEST request, not the oldest:
 //     requestRows used to .slice(0, 40), keeping the 40 OLDEST rows.
@@ -368,7 +427,7 @@ const pageElements = elements(page)
 const canvas = pageElements.find(item => item.type === 'canvas')
 check('page renders the swim lane canvas', canvas && String(canvas.props['aria-label'] || '').includes('cloud model'), canvas ? canvas.props['aria-label'].slice(0, 60) : 'canvas missing')
 // Legend appears exactly once: the header meta carries no encoding text, the
-// footer carries the only 'dim = prefill'-style line, once on the page.
+// footer carries the only 'colour = agent'-style line, once on the page.
 const swimSection = pageElements.find(item =>
   textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
 check('swim lane section header drops the duplicated legend copy',
@@ -376,9 +435,18 @@ check('swim lane section header drops the duplicated legend copy',
   swimSection ? textOf(swimSection).slice(0, 80) : 'section missing')
 let legendLineCount = 0
 walk(page, item => {
-  if (item.kind === 'text' && item.text.includes('stacked rows = concurrent requests')) legendLineCount += 1
+  if (item.kind === 'text' && item.text.includes('colour = agent')) legendLineCount += 1
 })
 check('the legend line appears exactly once on the page (footer only)', legendLineCount === 1, `${legendLineCount} copies`)
+check('legend names the honest phases and the agent-colour rule',
+  !!swimSection && textOf(swimSection).includes('waiting for first token')
+    && textOf(swimSection).includes('generating')
+    && textOf(swimSection).includes('not streamed (whole response)')
+    && textOf(swimSection).includes('queued (beyond slots)')
+    && textOf(swimSection).includes('colour = agent')
+    && textOf(swimSection).includes('rows = requests running at the same time')
+    && !textOf(swimSection).includes('prefill') && !textOf(swimSection).includes('decode'),
+  swimSection ? textOf(swimSection).slice(0, 120) : 'section missing')
 check('swim lane section header keeps the window + ordering meta',
   swimSection && textOf(swimSection).includes('local lanes first, then cloud'),
   swimSection ? textOf(swimSection).slice(0, 90) : 'section missing')

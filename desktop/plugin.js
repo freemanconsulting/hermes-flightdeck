@@ -1233,16 +1233,17 @@ function requestTooltip(request, labels) {
   const ttft = request.first_chunk_at != null && request.started_at != null
     ? Math.max(0, request.first_chunk_at - request.started_at) * 1000
     : null
-  const decodeEnd = request.ended_at != null ? request.ended_at : Date.now() / 1000
-  const decodeSpan = request.first_chunk_at != null ? Math.max(0, decodeEnd - request.first_chunk_at) : null
-  const decode = decodeSpan && decodeSpan > 0 && request.completion_tokens != null
-    ? request.completion_tokens / decodeSpan
+  const genEnd = request.ended_at != null ? request.ended_at : Date.now() / 1000
+  const genSpan = request.first_chunk_at != null ? Math.max(0, genEnd - request.first_chunk_at) : null
+  const generating = genSpan && genSpan > 0 && request.completion_tokens != null
+    ? request.completion_tokens / genSpan
     : null
   return [
     agentLabel(request, labels || {}),
     request.model || 'model unknown',
     `TTFT ${fmtMs(ttft)}`,
-    `decode ${decode != null ? `${fmtRate(decode)} tok/s` : '—'}`,
+    `generating ${generating != null ? `${fmtRate(generating)} tok/s` : '—'}`,
+    isWholeResponse(request) ? 'not streamed (whole response)' : 'streamed',
     `${tokenText(request.prompt_tokens)} in / ${tokenText(request.completion_tokens)} out`,
     request.status || 'status unknown'
   ].join(' · ')
@@ -1261,12 +1262,34 @@ function swimWindow(snapshot, windowSeconds, now) {
   return { seconds, start, end }
 }
 
+// No streamed output: no first chunk at all, or a first token at/after the end
+// (minus a quarter-second of slack). A non-streamed response has nothing honest
+// to show as 'generating', so it draws as the hatched whole-response bar.
+function isWholeResponse(request) {
+  if (!request) return true
+  const first = request.first_chunk_at
+  if (first == null) return true
+  const end = request.ended_at != null ? request.ended_at : null
+  if (end == null) return false
+  return first >= end - 0.25
+}
+
+// An agent actually streamed output: a first token at least a quarter second
+// before the end (or a first token on a still-running request).
+function isStreamedRow(request) {
+  return !!request && request.first_chunk_at != null && !isWholeResponse(request)
+}
+
 // One stacked sub-row per overlapping request: slot 1 at the top, queued
-// requests beyond the server's slots drawn dashed. A request with no first
-// chunk is a whole response and draws as one uniform hatched bar.
+// requests beyond the server's slots drawn dashed. A request that never
+// streamed is a whole response and draws as one uniform hatched bar.
+// `abutStart` marks a request that starts the instant the previous bar on its
+// row ends (an agent loop firing back-to-back) — the draw insets those by 1 px
+// so 15 requests never read as one continuous block.
 function stackBars(requests, win) {
+  const rows = []
   const rowEnds = []
-  return requests.map(request => {
+  for (const request of requests || []) {
     const start = Math.max(win.start, request.started_at)
     const end = request.ended_at != null ? Math.min(win.end, request.ended_at) : win.end
     let slot = rowEnds.findIndex(ends => ends <= start)
@@ -1276,8 +1299,12 @@ function stackBars(requests, win) {
     } else {
       rowEnds[slot] = end
     }
-    return { request, start, end, slot, whole: request.first_chunk_at == null }
-  })
+    // Back-to-back on this exact sub-row (an agent loop: the next call starts
+    // the instant the previous ends) — drawn with a 1 px gap at its start.
+    const abutStart = rows.some(other => other.slot === slot && Math.abs(other.end - start) < 0.001)
+    rows.push({ request, start, end, slot, whole: isWholeResponse(request), abutStart })
+  }
+  return rows
 }
 
 // Fallback for a cloud lane whose backend carries no per-request rows: its
@@ -1299,6 +1326,19 @@ function bucketTicks(buckets, win) {
     })
   }
   return ticks
+}
+
+// Requests the lane actually drew in the selected window — the ONLY count the
+// lane shows. A bucket-fallback lane has no rows, so its bucket total is the
+// number of requests in the window. Left detail and right axis must never
+// disagree, so both read this, never the backend's requests_1m.
+function laneWindowCounts(lane) {
+  const rows = (lane && lane.requests) || []
+  if (rows.length) {
+    return { count: rows.length, streamed: rows.filter(isStreamedRow).length }
+  }
+  const total = Number(lane && lane.total) || 0
+  return { count: total, streamed: Number(lane && lane.model && lane.model.streamed) || 0 }
 }
 
 // Every lane in the window: local servers with rows or in-flight work, then one
@@ -1323,6 +1363,7 @@ function swimLanes(snapshot, windowSeconds, now) {
     const requests = requestRows(server.requests)
     if (!requests.length && !((server.in_flight || 0) > 0)) continue
     const bars = stackBars(requests, win)
+    const counts = laneWindowCounts({ requests, total: requests.length })
     lanes.push({
       kind: 'local',
       id: `local:${server.base_url || server.name}`,
@@ -1331,6 +1372,8 @@ function swimLanes(snapshot, windowSeconds, now) {
       server,
       requests,
       bars,
+      reqCount: counts.count,
+      streamedCount: counts.streamed,
       concurrency: Math.max(0, ...bars.map(bar => bar.slot + 1)),
       slots: server.slots != null ? Math.max(1, server.slots) : Math.max(1, ...bars.map(bar => bar.slot + 1))
     })
@@ -1345,15 +1388,20 @@ function swimLanes(snapshot, windowSeconds, now) {
     if (requests.length) {
       // Same encoding as local lanes: per-request bars, stacked rows = concurrency.
       const bars = stackBars(requests, win)
+      // The count BOTH sides of the lane show: the rows drawn in this window.
+      // Never model.requests_1m — that disagreed with the rows on the canvas.
+      const counts = laneWindowCounts({ requests, total })
       lanes.push({
         kind: 'cloud',
         id: `cloud:${model.key || model.provider}`,
         label: `${model.provider || 'cloud'} / ${model.model || 'model'}`,
         // Short enough for the 124 px left gutter: the long form truncated.
-        detail: `${fmtInt(model.requests_1m || model.total || total)} req · ${fmtInt(model.streamed)} streamed`,
+        detail: `${fmtInt(counts.count)} req · ${fmtInt(counts.streamed)} streamed`,
         model,
         requests,
         bars,
+        reqCount: counts.count,
+        streamedCount: counts.streamed,
         concurrency: Math.max(0, ...bars.map(bar => bar.slot + 1)),
         slots: null,
         total
@@ -1362,15 +1410,18 @@ function swimLanes(snapshot, windowSeconds, now) {
     }
     if (!bucketTotal) continue
     // Fallback: no per-request rows from the backend, only buckets.
+    const counts = laneWindowCounts({ requests: [], total })
     lanes.push({
       kind: 'cloud',
       id: `cloud:${model.key || model.provider}`,
       label: `${model.provider || 'cloud'} / ${model.model || 'model'}`,
-      detail: `${fmtInt(model.requests_1m || model.total || total)} req · ${fmtInt(model.streamed)} streamed`,
+      detail: `${fmtInt(counts.count)} req · ${fmtInt(counts.streamed)} streamed`,
       model,
       requests: [],
       bars: bucketTicks(buckets, win),
       ticks: true,
+      reqCount: counts.count,
+      streamedCount: counts.streamed,
       concurrency: Math.max(0, ...buckets.map(n => Number(n) || 0)),
       slots: null,
       total
@@ -1380,32 +1431,50 @@ function swimLanes(snapshot, windowSeconds, now) {
 }
 
 // One lane per server or cloud model with traffic — ONE encoding everywhere:
-// each request is a horizontal bar from start to end, dim = prefill (start →
-// first token), bright = decode, hatched = whole response (no first chunk),
-// dashed outline = queued beyond the server's slot count. Bars are stacked into
-// sub-rows by overlap, so the y-axis IS concurrency: stacked rows at any x =
-// concurrent requests at that moment, and the row height grows to fill the lane
-// (peak 1 draws one thick bar, not a stripe). The right edge labels the axis:
-// bold 'peak N', muted 'of S slots' for local lanes, muted 'n req'. A cloud
-// lane whose backend carries no per-request rows falls back to 15 s bucket
-// columns scaled to the max bucket.
+// each request is a horizontal bar from start to end, low alpha = waiting for
+// the first token (queue + prefill + thinking), full colour = generating,
+// hatched = whole response (the reply never streamed), dashed outline = queued
+// beyond the server's slot count. Back-to-back requests on a row get a 1 px gap
+// at their start and a 1 px darker outline in the bar's own colour, so an agent
+// loop of 15 abutting calls reads as 15 blocks, not one blob. Bars are stacked
+// into sub-rows by overlap, so the y-axis IS concurrency: stacked rows at any x
+// = concurrent requests at that moment, and the row height grows to fill the
+// lane (peak 1 draws one thick bar, not a stripe). The right edge labels the
+// axis: bold 'peak N', muted 'of S slots' for local lanes — and nothing else,
+// since the request count is already in the lane's left detail, from the same
+// number. A cloud lane whose backend carries no per-request rows falls back to
+// 15 s bucket columns scaled to the max bucket.
 // A lane's right-side concurrency-axis labels: bold 'peak N' (the max stacked
 // rows in the window = most concurrent requests), muted 'of S slots' for local
-// lanes, muted 'n req' for the request count in the window. A bucket-fallback
-// cloud lane labels the axis 'peak N / 15 s' instead, since its columns are
-// scaled to the max bucket. Measured with the drawing context (the gutter is
-// computed inside the draw, where the ctx exists), so the widest label never
-// clips.
+// lanes only. The request count is deliberately NOT repeated here — the left
+// detail ('<n> req · <m> streamed') and this axis both come from
+// laneWindowCounts, so one number, shown once. A bucket-fallback cloud lane
+// labels the axis 'peak N / 15 s' instead, since its columns are scaled to the
+// max bucket. Measured with the drawing context (the gutter is computed inside
+// the draw, where the ctx exists), so the widest label never clips.
 function laneRightLabels(lane) {
   if (lane.ticks) return [`peak ${lane.concurrency} / ${SWIM_BUCKET_SECONDS} s`]
   const labels = [`peak ${lane.concurrency}`]
   if (lane.kind === 'local' && lane.slots != null) labels.push(`of ${lane.slots} slots`)
-  labels.push(`${lane.requests.length || lane.total || 0} req`)
   return labels
 }
 
 const RIGHT_GUTTER_MIN = 60
 const RIGHT_GUTTER_PAD = 18
+
+function shadeColor(color, amount) {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(color || '').trim())
+  if (!hex) return color
+  let digits = hex[1]
+  if (digits.length === 3) digits = digits.split('').map(ch => ch + ch).join('')
+  const n = parseInt(digits, 16)
+  const part = shift => {
+    const v = (n >> shift) & 0xff
+    return Math.round(shift ? v * (1 - amount) : v * (1 - amount * 0.6))
+  }
+  const to2 = v => v.toString(16).padStart(2, '0')
+  return `#${to2(part(16))}${to2(part(8))}${to2(part(0))}`
+}
 
 function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
   const style = getComputedStyle(canvas)
@@ -1495,7 +1564,10 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
       // x = concurrent requests at that moment.
       lane.bars.forEach(item => {
         const { request, start, end, slot, whole } = item
-        const x1 = xOf(start)
+        // Request boundaries: a bar that starts the instant the previous one on
+        // its row ends is inset 1 px, so back-to-back calls read as separate
+        // blocks instead of one continuous blob.
+        const x1 = xOf(start) + (item.abutStart ? 1 : 0)
         const x2 = Math.max(x1 + 2, xOf(end))
         const barY = barTop + slot * (rowH + rowGap)
         const color = colors.get(agentKey(request)) || accent
@@ -1508,11 +1580,12 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
           ctx2.setLineDash([2, 2])
           ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, rowH - 1)
         } else if (whole) {
-          // Whole response: no first chunk, so no prefill/decode split. One
-          // uniform medium bar with a hatch, so it never reads as decode.
+          // Nothing was ever streamed, so there is no honest 'generating' half:
+          // draw the WHOLE bar hatched in the agent's colour rather than a dim
+          // bar with an invisible sliver of the bright phase.
           ctx2.globalAlpha = 0.5
           ctx2.fillStyle = color
-          ctx2.fillRect(x1, barY, Math.max(1, x2 - x1), rowH)
+          ctx2.fillRect(x1, barY, Math.max(2, x2 - x1), rowH)
           ctx2.globalAlpha = 0.85
           ctx2.strokeStyle = color
           ctx2.lineWidth = 1
@@ -1523,6 +1596,8 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
             ctx2.stroke()
           }
         } else {
+          // Low alpha = waiting for the first token (queue + prefill + thinking),
+          // full colour = generating.
           const split = request.first_chunk_at != null ? xOf(request.first_chunk_at) : x2
           ctx2.globalAlpha = 0.35
           ctx2.fillStyle = color
@@ -1536,6 +1611,12 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
             ctx2.fillRect(x2 - 1.5, barY - 1, 2, rowH + 2)
           }
         }
+        // 1 px darker outline in the bar's own colour: the edge of every request,
+        // visible even when two bars touch.
+        ctx2.globalAlpha = 0.95
+        ctx2.strokeStyle = shadeColor(color, 0.45)
+        ctx2.lineWidth = 1
+        ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, rowH - 1)
         ctx2.restore()
         hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: rowH, request, lane })
       })
@@ -1563,7 +1644,8 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     }
 
     // Right edge: the concurrency axis for this lane — bold 'peak N', then
-    // muted 'of S slots' (local only) / bucket-axis / 'n req'.
+    // muted 'of S slots' (local only) / bucket-axis. The request count lives in
+    // the left detail and is never repeated here.
     ctx2.fillStyle = text
     ctx2.font = '600 10px sans-serif'
     ctx2.fillText(rightLabels[0], gutter + plotW + 6, y + 10)
@@ -1654,14 +1736,32 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
     // agent bars get legend colours just like a local lane's.
     const colors = agentColorMap(lanes.filter(lane => (lane.requests || []).length))
     const entries = [...colors.entries()].slice(0, 8)
+    // snapshot.agents rows indexed by session id: the real title lives there,
+    // so the legend never shows a bare date id when a title exists.
+    const agentRows = Array.isArray(snapshot && snapshot.agents) ? snapshot.agents : []
+    const rowBySession = new Map()
+    for (const row of agentRows) {
+      if (row && row.session_id && !rowBySession.has(row.session_id)) {
+        rowBySession.set(row.session_id, row)
+      }
+    }
     // Same label builder as the By agent rows, so the legend and the tree never
     // read differently. Two sessions can still share a title (e.g. two
     // untitled 'default' sessions) — disambiguate with the id tail.
     const seen = new Map()
     return entries.map(([key, color]) => {
       const [profile, session] = key.split('|')
-      const row = { kind: 'session', profile, session_id: session }
-      const base = agentLabel(row, labels) || (session ? `session ${session.slice(0, 8)}` : profile)
+      const agentRow = (session && rowBySession.get(session)) || null
+      const row = {
+        kind: (agentRow && agentRow.kind) || 'session',
+        profile: (agentRow && agentRow.profile) || profile,
+        session_id: session,
+        title: agentRow && agentRow.title,
+        label: agentRow && agentRow.label,
+        source: agentRow && agentRow.source
+      }
+      // agentLabel prefers the row's own title; the date id is the last resort.
+      const base = agentLabel(row, labels || {}) || (session ? `session ${session.slice(0, 8)}` : profile)
       const label = `${profile} · ${base}`
       const n = (seen.get(label) || 0) + 1
       seen.set(label, n)
@@ -1671,7 +1771,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         label: n > 1 && session ? `${label} · ${session.slice(-6)}` : label
       }
     })
-  }, [lanes, labels])
+  }, [lanes, labels, snapshot])
 
   const onMove = event => {
     const rect = event.currentTarget.getBoundingClientRect()
@@ -1705,7 +1805,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
             className: 'block',
             style: { width: '100%', height: '100%' },
             role: 'img',
-            'aria-label': 'Swim-lane timeline: one lane per server or cloud model with traffic, local lanes first; every lane uses the same encoding — one horizontal bar per request (dim prefill, bright decode, hatched whole response, dashed queued), stacked into rows so rows at any moment equal concurrent requests, with the peak concurrency labelled on the right'
+            'aria-label': 'Swim-lane timeline: one lane per server or cloud model with traffic, local lanes first; every lane uses the same encoding — one horizontal bar per request (low-alpha waiting for first token, full-colour generating, hatched when the response was not streamed, dashed queued beyond slots), separated by a 1 px gap and outlined so back-to-back requests stay distinct, stacked into rows so rows at any moment equal concurrent requests, with the peak concurrency labelled on the right'
           }),
           hover
             ? jsx('div', {
@@ -1730,52 +1830,62 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         style: { fontSize: '0.55rem', color: 'var(--ui-text-quaternary)' },
         children: [
           // ONE legend line for the whole chart — the section header carries no
-          // encoding text. Small inline swatches, no second chart type below.
-          jsx('span', {
-            className: 'inline-flex items-center gap-1',
-            children: [
+          // encoding text. Swatches are drawn in ONE neutral colour (the UI
+          // accent, the same for every entry — agent identity is carried by the
+          // per-agent list below) with exactly the
+          // alpha / hatch / dash styles the canvas paints, so each swatch is a
+          // true preview of its bar; which agent is which is said by the
+          // 'colour = agent' sentence, not by recolouring the swatches.
+          ...(() => {
+            const swatch = 'var(--ui-accent)'
+            return [
               jsx('span', {
-                style: { width: '10px', height: '6px', background: 'currentColor', opacity: 0.35 }
+                className: 'inline-flex items-center gap-1',
+                children: [
+                  jsx('span', {
+                    style: { width: '10px', height: '6px', background: swatch, opacity: 0.35 }
+                  }),
+                  jsx('span', { children: 'waiting for first token' })
+                ]
               }),
-              jsx('span', { children: 'prefill' })
-            ]
-          }),
-          jsx('span', {
-            className: 'inline-flex items-center gap-1',
-            children: [
               jsx('span', {
-                style: { width: '10px', height: '6px', background: 'currentColor', opacity: 0.9 }
+                className: 'inline-flex items-center gap-1',
+                children: [
+                  jsx('span', {
+                    style: { width: '10px', height: '6px', background: swatch, opacity: 0.9 }
+                  }),
+                  jsx('span', { children: 'generating' })
+                ]
               }),
-              jsx('span', { children: 'decode' })
-            ]
-          }),
-          jsx('span', {
-            className: 'inline-flex items-center gap-1',
-            children: [
               jsx('span', {
-                style: {
-                  width: '10px', height: '6px', opacity: 0.6,
-                  background: 'repeating-linear-gradient(135deg, currentColor 0 1px, transparent 1px 3px)'
-                }
+                className: 'inline-flex items-center gap-1',
+                children: [
+                  jsx('span', {
+                    style: {
+                      width: '10px', height: '6px', opacity: 0.6,
+                      background: `repeating-linear-gradient(135deg, ${swatch} 0 1px, transparent 1px 3px)`
+                    }
+                  }),
+                  jsx('span', { children: 'not streamed (whole response)' })
+                ]
               }),
-              jsx('span', { children: 'whole response' })
-            ]
-          }),
-          jsx('span', {
-            className: 'inline-flex items-center gap-1',
-            children: [
               jsx('span', {
-                style: {
-                  width: '10px', height: '6px',
-                  border: '1px dashed currentColor', boxSizing: 'border-box'
-                }
-              }),
-              jsx('span', { children: 'queued' })
+                className: 'inline-flex items-center gap-1',
+                children: [
+                  jsx('span', {
+                    style: {
+                      width: '10px', height: '6px',
+                      border: `1px dashed ${swatch}`, boxSizing: 'border-box'
+                    }
+                  }),
+                  jsx('span', { children: 'queued (beyond slots)' })
+                ]
+              })
             ]
-          }),
+          })(),
           jsx('span', {
             className: 'font-medium',
-            children: 'stacked rows = concurrent requests; peak = most at once'
+            children: 'colour = agent · rows = requests running at the same time'
           }),
           // The buckets line appears only when a lane actually fell back to it.
           lanes.some(lane => lane.ticks)
