@@ -609,7 +609,12 @@ Rules the backend guarantees: `label` is always `""` (the UI fills it from `sess
 unknown, never `0`-as-unknown. `name` is the short card label (declared name → provider key → host:port);
 `title` is `null` or the provider's prose name, for the card tooltip only. `unreachable` is always present
 (`[]` when none): discovered servers that are unreachable and served no request in the window, as
-`{name, base_url, error, since}`. Declared servers never move there. `servers_source` is
+`{name, base_url, error, since}` — the UI renders one per row: dot · name · `host:port` · the collapsed
+reason (`error` split on `"; "`, one class per endpoint → plain words: "connection reset", "timed out",
+"connection refused", "HTTP 404", "host not found"; mixed → first + " (+n more)") · `down <age>` from
+`since`, omitted when null — with `min-width:0` + ellipsis so a row never overflows. The raw per-endpoint
+`error` lives only in the row `title`, one endpoint per line. Each row has a hide button that appends the
+`base_url` to settings `hidden_servers` (same mechanism as the idle group). Declared servers never move there. `servers_source` is
 `declared`|`discovered`|`none` — `discovered` even when discovery found nothing, so the UI can tell
 "discovery is on and empty" from "nothing declared".
 
@@ -639,7 +644,8 @@ move there; a cloud card never does either. `hidden_servers` echoes the filter t
 (settings `hidden_servers`, or the caller's list): entries match a sample by `name` or by normalized
 `base_url`, and a matched sample never becomes a server card, a model card's server metrics, or an
 `idle` row. It is always present (`[]` when nothing is hidden), so the UI can show "N hidden" without
-guessing.
+guessing. `unreachable` rows honour the same filter client-side (name or normalized `base_url`): a
+hidden entry drops that server from the collapsed "N servers unreachable" list **and** from its count.
 
 **Server card names** follow §7.2, including the aux-only rule: an endpoint that appears only in a
 profile's `auxiliary` block is named after **the model it serves** (`short_model_name`:

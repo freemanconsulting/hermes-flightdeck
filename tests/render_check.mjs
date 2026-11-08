@@ -50,6 +50,9 @@ const host = {
 }
 const cn = (...args) => args.filter(Boolean).join(' ')
 const profileColor = () => 'var(--ui-accent)'
+const Button = function Button(props) {
+  return { type: 'button', props: { ...(props || {}) } }
+}
 const Component = props => (props && props.children != null ? props.children : null)
 // Keep props for components whose attributes the assertions read.
 // Plain functions (the walker calls them with props) that keep every prop on a
@@ -73,11 +76,11 @@ const factory = new Function(
   'atom', 'Badge', 'Button', 'Codicon', 'EmptyState', 'ErrorState', 'ScrollArea', 'SegmentedControl',
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
-  'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs', 'window',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, drawSwimLane, swimLanes, Section }`
+  'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, drawSwimLane, swimLanes, Section, unreachableReason }`
 )
 const mod = factory(
-  atom, Badge, Component, Component, EmptyState, Component, Component, Component,
+  atom, Badge, Button, Component, EmptyState, Component, Component, Component,
   Component, Component, cn, host, profileColor, useQuery, useValue,
   'palette', 'routes', 'sidebar', 'statusbar',
   useEffect, useMemo, useRef, useState, jsx, jsxs, globalThis
@@ -480,6 +483,111 @@ check('capacity badge shows the free count when slots are open',
 const cloudDetail = cloudLanes.find(lane => /\d+ req · \d+ streamed/.test(lane.detail || ''))
 check('cloud lane detail is the short req/streamed form', !!cloudDetail,
   cloudLanes.map(l => l.detail).join(' | '))
+
+// 12. Unreachable rows: one compact non-overflowing line per dead server —
+//     dot · name · host:port · collapsed reason · down-age · Hide. The raw
+//     per-endpoint dump belongs in the tooltip only. The fixture has one
+//     unreachable server; seed the two screenshot examples into a clone.
+const unreachSnapshot = JSON.parse(JSON.stringify(fixture))
+unreachSnapshot.unreachable = [
+  { name: 'main-llm', base_url: 'http://127.0.0.1:18008', since: 1794161555.0,
+    error: '/health: ConnectionResetError: [Errno 54] Connection reset by peer; /metrics: ConnectionResetError: [Errno 54] Connection reset by peer; /api/ps: ConnectionResetError: [Errno 54] Connection reset by peer; /v1/models: ConnectionResetError: [Errno 54] Connection reset by peer' },
+  { name: 'qwen3.5-9b', base_url: 'http://127.0.0.1:18436', since: 1794161555.0,
+    error: '/health: TimeoutError: timed out; /metrics: TimeoutError: timed out; /api/ps: TimeoutError: timed out' }
+]
+let hiddenItem = null
+const unreachView = mod.ModelView({ snapshot: unreachSnapshot, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: item => { hiddenItem = item } })
+const unreachGroup = elements(unreachView).find(item => item.props['data-unreachable-group'] != null)
+const unreachRows = elements(unreachView).filter(item => item.props['data-unreachable-row'] != null)
+check('unreachable section header keeps the N servers unreachable form',
+  unreachGroup && textOf(unreachGroup).includes('2 servers unreachable'),
+  unreachGroup ? textOf(unreachGroup).slice(0, 40) : 'section missing')
+const rowNamed = name => unreachRows.find(item => textOf(item).includes(name))
+const resetRow = rowNamed('main-llm')
+const timeoutRow = rowNamed('qwen3.5-9b')
+check('unreachable row shows the name and the collapsed reason',
+  resetRow && textOf(resetRow).includes('main-llm') && textOf(resetRow).includes('connection reset')
+    && timeoutRow && textOf(timeoutRow).includes('qwen3.5-9b') && textOf(timeoutRow).includes('timed out'),
+  unreachRows.map(item => textOf(item).slice(0, 60)).join(' | '))
+check('unreachable row drops the scheme from the base_url',
+  resetRow && textOf(resetRow).includes('127.0.0.1:18008') && !textOf(resetRow).includes('http://'),
+  resetRow ? textOf(resetRow).slice(0, 80) : 'row missing')
+check('unreachable row tooltips the full raw error, one endpoint per line',
+  resetRow && resetRow.props.title && resetRow.props.title.includes('/metrics')
+    && resetRow.props.title.includes('\n/metrics:'),
+  resetRow && resetRow.props.title ? resetRow.props.title.slice(0, 60) : 'no tooltip')
+const textCells = unreachRows.map(row =>
+  elements(row).find(e => e.props.style && e.props.style.whiteSpace === 'nowrap'))
+check('unreachable text cell can never overflow: nowrap + ellipsis + minWidth 0',
+  unreachRows.length === 2 && textCells.length === 2
+    && textCells.every(e => e.props.style.textOverflow === 'ellipsis' && e.props.style.minWidth === 0
+      && e.props.style.overflow === 'hidden'),
+  textCells.length ? JSON.stringify(textCells[0].props.style) : 'no ellipsis cell')
+const hideButtons = unreachRows.map(row =>
+  elements(row).find(e => e.props['data-hide-unreachable'] != null && typeof e.props.onClick === 'function'))
+check('every unreachable row carries a Hide button',
+  unreachRows.length === 2 && hideButtons.every(Boolean),
+  `${hideButtons.filter(Boolean).length}/${unreachRows.length} hide buttons`)
+if (hideButtons[0]) hideButtons[0].props.onClick()
+check('Hide routes through the idle group\'s hideServer mechanism',
+  hiddenItem && hiddenItem.base_url === 'http://127.0.0.1:18008',
+  hiddenItem ? hiddenItem.base_url : 'onHide not called')
+const hiddenUnreach = JSON.parse(JSON.stringify(unreachSnapshot))
+// The snapshot echoes the hidden_servers filter it ran with, and a hidden entry
+// also carries `hidden: true`: either way the row is gone, from the list and
+// from the count.
+hiddenUnreach.unreachable = unreachSnapshot.unreachable.map(item =>
+  String(item.base_url || '').replace(/\/+$/, '') === 'http://127.0.0.1:18008'
+    ? { ...item, hidden: true } : item)
+hiddenUnreach.hidden_servers = ['http://127.0.0.1:18008']
+const hiddenUnreachText = textOf(mod.ModelView({ snapshot: hiddenUnreach, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+check('hidden unreachable servers drop from the list and the count',
+  !hiddenUnreachText.includes('main-llm') && hiddenUnreachText.includes('1 server unreachable')
+    && hiddenUnreachText.includes('qwen3.5-9b'),
+  (hiddenUnreachText.match(/\d+ servers? unreachable/) || [''])[0])
+const echoHidden = JSON.parse(JSON.stringify(unreachSnapshot))
+echoHidden.hidden_servers = ['main-llm']
+const echoHiddenText = textOf(mod.ModelView({ snapshot: echoHidden, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+check('hidden_servers matching by name also drops the unreachable row',
+  !echoHiddenText.includes('main-llm') && echoHiddenText.includes('1 server unreachable'),
+  (echoHiddenText.match(/\d+ servers? unreachable/) || [''])[0])
+
+const mixedReason = mod.unreachableReason
+  ? mod.unreachableReason('/health: ConnectionResetError: [Errno 54] Connection reset by peer; /metrics: TimeoutError: timed out; /api/ps: ConnectionRefusedError: [Errno 61] Connection refused')
+  : null
+check('mixed error classes collapse to the first plus (+n more)',
+  mixedReason === 'connection reset (+2 more)', String(mixedReason))
+const httpReason = mod.unreachableReason
+  ? mod.unreachableReason('/health: HTTP 503: Service Unavailable; /metrics: TimeoutError: timed out; /v1/models: HTTP 503: Service Unavailable')
+  : null
+check('an HTTP class is the verdict and folds transport noise behind it',
+  httpReason === 'HTTP 503 (+1 more)', String(httpReason))
+const refusedReason = mod.unreachableReason
+  ? mod.unreachableReason('/health: ConnectionRefusedError: [Errno 61] Connection refused; /metrics: ConnectionRefusedError: [Errno 61] Connection refused')
+  : null
+const hostReason = mod.unreachableReason
+  ? mod.unreachableReason('/health: URLError: nodename nor servname provided, or not known')
+  : null
+check('refused / host-not-found / timeout classes map to plain words',
+  refusedReason === 'connection refused' && hostReason === 'host not found'
+    && mod.unreachableReason('/health: TimeoutError: timed out') === 'timed out',
+  [refusedReason, hostReason].join(' | '))
+const longReason = mod.unreachableReason
+  ? mod.unreachableReason('/health: WeirdVendorError: ' + 'x'.repeat(120))
+  : null
+check('an unknown class falls back to the first message trimmed to ~60 chars',
+  longReason === 'WeirdVendorError: ' + 'x'.repeat(40) + '…', String(longReason))
+const noSince = JSON.parse(JSON.stringify(unreachSnapshot))
+noSince.unreachable = [{ name: 'no-since', base_url: 'http://127.0.0.1:19000', error: '/health: URLError: unknown' }]
+const noSinceRow = elements(mod.ModelView({ snapshot: noSince, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+  .find(item => item.props['data-unreachable-row'] != null)
+check('unreachable row omits the down-age when since is missing',
+  noSinceRow && !textOf(noSinceRow).includes('down') && textOf(noSinceRow).includes('URLError: unknown'),
+  noSinceRow ? textOf(noSinceRow).slice(0, 80) : 'row missing')
 
 const failed = results.filter(item => !item.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)

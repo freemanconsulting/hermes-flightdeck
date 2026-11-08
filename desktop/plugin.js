@@ -148,6 +148,64 @@ function fmtAgo(tsSeconds, now) {
   return `${(s / 3600).toFixed(1)}h ago`
 }
 
+// Collapse the per-endpoint probe error ("; "-joined "path: Err: msg" parts,
+// servers.py probe) into one short phrase for a single-line row. Same class on
+// every endpoint → that class's plain-words label; mixed → first label plus
+// the number of other classes; nothing recognizable → the first message.
+const UNREACHABLE_CLASS_PATTERNS = [
+  [/connection reset|errno 54|reset by peer/i, () => 'connection reset'],
+  [/timeouterror|timed out|timeout/i, () => 'timed out'],
+  [/connectionrefusederror|errno 61|refused/i, () => 'connection refused'],
+  [/gaiconnecterror|name or service not known|nodename nor servname|getaddrinfo|unreachable host|host not found/i, () => 'host not found'],
+  [/http\s*(?:error\s*)?(?:status\s*)?(\d{3})|returned\s+http\s*(\d{3})|(?:^|\D)4\d{2}(?:\D|$)|(?:^|\D)5\d{2}(?:\D|$)|http\s*>=?\s*400|returned\s+http/i, m => {
+    const code = m[1] || m[2] || (m[0].match(/[45]\d{2}/) || [])[0]
+    return code ? `HTTP ${code}` : 'HTTP error'
+  }]
+]
+
+function unreachableClass(message) {
+  for (const [pattern, label] of UNREACHABLE_CLASS_PATTERNS) {
+    const match = message.match(pattern)
+    if (match) return label(match)
+  }
+  return null
+}
+
+// Unrecognized message: keep the leading "VendorError:" name and the first 60
+// code points of the whole message, with the ellipsis taking the last slot.
+function trimUnknownClass(message) {
+  if (message.length <= 60) return message
+  return `${message.slice(0, 58)}…`
+}
+
+function unreachableReason(error) {
+  const parts = String(error || '').split(';').map(part => part.trim()).filter(Boolean)
+  if (!parts.length) return 'unreachable'
+  const labels = []
+  for (const part of parts) {
+    let message = part.trim()
+    // Split on the FIRST ':' only when the head looks like a probe path
+    // ("/health", "/metrics"): "ConnectionResetError: [Errno 54] ..." keeps
+    // its own message, the class regexes match the whole thing either way.
+    const idx = message.indexOf(':')
+    if (idx > 0 && message.startsWith('/')) message = message.slice(idx + 1).trim()
+    const label = unreachableClass(message)
+      // Long unknown-class messages are trimmed to 60 visible characters
+      // (excluding the space separators) before the ellipsis.
+      || trimUnknownClass(message)
+    if (!labels.includes(label)) labels.push(label)
+  }
+  // An HTTP status from ANY endpoint means the server process answered: that
+  // HTTP label leads, in endpoint order; the rest counts as (+n more).
+  const httpIdx = labels.findIndex(label => /^HTTP /i.test(label))
+  const all = httpIdx > 0 ? [labels[httpIdx], ...labels.slice(0, httpIdx), ...labels.slice(httpIdx + 1)] : labels
+  return all.length === 1 ? all[0] : `${all[0]} (+${all.length - 1} more)`
+}
+
+function unreachableTooltip(error) {
+  return String(error || 'unreachable').replace(/;\s*\/(?=\S)/g, '\n/')
+}
+
 // Real plurals: "1 server", "2 servers" — never "2 server(s)".
 function plural(count, word) {
   return `${count} ${word}${count === 1 ? '' : 's'}`
@@ -2345,6 +2403,24 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
   )
   const models = Array.isArray(snapshot.models) ? snapshot.models : []
   const unreachable = Array.isArray(snapshot.unreachable) ? snapshot.unreachable : []
+  // "Hidden means hidden everywhere": the same hidden_servers filter the idle
+  // group uses (entries match by name or normalized base_url) drops a dead
+  // server from this list and from its count. A row can also arrive already
+  // flagged `hidden` from the backend.
+  const hiddenServers = Array.isArray(snapshot.hidden_servers) ? snapshot.hidden_servers : []
+  const hiddenKeys = hiddenServers.map(entry => String(entry || '').trim().toLowerCase()).filter(Boolean)
+  const normalizeUrlKey = url => {
+    let text = String(url || '').trim().toLowerCase().replace(/\/+$/, '')
+    if (text.endsWith('/v1')) text = text.slice(0, -3).replace(/\/+$/, '')
+    return text
+  }
+  const visibleUnreachable = unreachable.filter(item => {
+    if (!item || item.hidden) return false
+    const name = String(item.name || '').trim().toLowerCase()
+    const url = normalizeUrlKey(item.base_url)
+    return !hiddenKeys.some(entry =>
+      (name && entry === name) || (url && normalizeUrlKey(entry) === url))
+  })
   const idle = Array.isArray(snapshot.idle) ? snapshot.idle : []
   const source = snapshot.servers_source || 'none'
   const cloud = models.filter(model => model.lane === 'cloud')
@@ -2402,37 +2478,75 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
                   className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-quaternary)',
                   children: noServersText
                 }),
-            unreachable.length
+            visibleUnreachable.length
               ? jsxs('details', {
+                  'data-unreachable-group': visibleUnreachable.length,
                   className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
                   children: [
                     jsx('summary', {
                       className: 'cursor-pointer select-none',
-                      children: `${unreachable.length} server${unreachable.length === 1 ? '' : 's'} unreachable`
+                      children: `${visibleUnreachable.length} server${visibleUnreachable.length === 1 ? '' : 's'} unreachable`
                     }),
                     jsx('div', {
                       className: 'flex flex-col gap-0.5 pt-1',
-                      children: unreachable.map(item =>
-                        jsxs('div', {
-                          className: 'flex items-baseline gap-2',
+                      children: visibleUnreachable.map(item => {
+                        // One row, never wider than the container: the reason is
+                        // the collapsed one-liner, the raw per-endpoint dump goes
+                        // in the tooltip with one endpoint per line.
+                        const base = String(item.base_url || '')
+                        const hostPort = base.replace(/^https?:\/\//, '').replace(/\/+$/, '')
+                        const down = item.since != null
+                          ? `down ${fmtDuration(Math.max(0, now / 1000 - item.since))}`
+                          : null
+                        return jsxs('div', {
+                          'data-unreachable-row': item.base_url || item.name,
+                          title: unreachableTooltip(item.error),
+                          className: 'flex min-w-0 items-center gap-2',
                           children: [
+                            jsx(StatusDot, { tone: 'bad', className: 'size-2 shrink-0' }),
                             jsx('span', {
-                              className: 'min-w-0 truncate font-mono text-[0.6rem]',
-                              children: item.base_url
+                              className: 'min-w-0 flex-1 flex items-center gap-2',
+                              style: { minWidth: 0, overflow: 'hidden' },
+                              children: jsxs('span', {
+                                className: 'min-w-0 truncate',
+                                style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                                children: [
+                                  jsx('span', {
+                                    className: 'font-semibold text-(--ui-text-primary)',
+                                    children: item.name || hostPort || 'server'
+                                  }),
+                                  hostPort
+                                    ? jsx('span', {
+                                        className: 'ml-2 font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+                                        children: hostPort
+                                      })
+                                    : null,
+                                  jsx('span', {
+                                    className: 'ml-2',
+                                    children: unreachableReason(item.error)
+                                  }),
+                                  down
+                                    ? jsx('span', {
+                                        className: 'ml-2 tabular-nums text-(--ui-text-tertiary)',
+                                        children: down
+                                      })
+                                    : null
+                                ]
+                              })
                             }),
-                            jsx('span', {
-                              className: 'min-w-0 flex-1 truncate',
-                              children: item.error || 'unreachable'
-                            }),
-                            item.since != null
-                              ? jsx('span', {
-                                  className: 'shrink-0 tabular-nums',
-                                  children: fmtAgo(item.since, now)
+                            onHide
+                              ? jsx(Button, {
+                                  variant: 'ghost',
+                                  size: 'xs',
+                                  'data-hide-unreachable': item.base_url || item.name,
+                                  title: `Hide ${item.name || item.base_url} from every Flightdeck view`,
+                                  onClick: () => onHide(item),
+                                  children: 'hide'
                                 })
                               : null
                           ]
                         }, item.base_url || item.name)
-                      )
+                      })
                     })
                   ]
                 })
