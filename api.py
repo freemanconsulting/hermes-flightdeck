@@ -7,7 +7,9 @@ through the pinned Brief A exports (`window_rows`, `in_flight_rows`,
 
 Rules the backend guarantees (DESIGN §9.1): `label` is always `""`; `lane` is
 `local` or `cloud`; `slots` is `None` for cloud and for kinds without a gauge;
-`quota` is always `None` (the UI fills it from `session.stats`); numbers are
+`quota` is `None` in live mode — the desktop plugin reads live plan usage from
+the public gateway method `model.options` instead.  Demo mode injects a
+`quota_cache` explicitly; local lanes always carry `None`.  Numbers are
 `None` when unknown, never `0`-as-unknown.
 """
 
@@ -588,9 +590,13 @@ def _server_name_for(base_url: str | None, server_by_url: dict[str, dict],
 
 def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
                  window_seconds: int = 300,
-                 lane_rows: list[dict] | None = None) -> list[dict]:
+                 lane_rows: list[dict] | None = None,
+                 quota_cache: dict[str, dict | None] | None = None) -> list[dict]:
     server_by_url = {normalize_base_url(card["base_url"]): card for card in server_cards}
     lane_rows = list(lane_rows) if lane_rows else []
+    # Explicit injection path: demo pins the cloud-provider quota dict; live
+    # mode passes nothing and every cloud entry carries `quota: None`.
+    quotas: dict[str, dict | None] = quota_cache if quota_cache is not None else {}
     bucket_seconds = 15
     bucket_count = max(1, int(window_seconds) // bucket_seconds)
     since = now - float(window_seconds)
@@ -729,6 +735,11 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
         else:
             model_requests = []
 
+        if lane == "cloud":
+            quota = quotas.get(provider.strip().lower())
+        else:
+            quota = None
+
         cards.append({
             "key": f"{server_name}|{model}",
             "model": model,
@@ -758,7 +769,7 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
             "tokens": tokens,
             "slots": slots,
             "agents": list(held.values()),
-            "quota": None,
+            "quota": quota,
         })
 
     cards.sort(key=lambda card: (card["lane"] != "local", -(card["in_flight"] or 0),
@@ -1058,7 +1069,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                    hidden_servers: list[str] | None = None,
                    retention_hours: int | None = None,
                    routing: dict | None = None,
-                   session_info: dict | None = None) -> dict:
+                   session_info: dict | None = None,
+                   quota_cache: dict[str, dict | None] | None = None) -> dict:
     """The §9.1 snapshot.  ``servers`` is already-polled samples (dict or list);
     None means poll the declared servers synchronously; [] means no server cards.
     ``servers_source`` overrides the derived source — /servers passes
@@ -1068,7 +1080,12 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     idle-server check (default 24).  ``routing`` pins the routing block (tests,
     dashboard) instead of reading config.yaml; None computes it.
     ``session_info`` pins the per-session title/source/started_at map (demo,
-    tests); None reads each profile's state.db once for the rows in the window."""
+    tests); None reads each profile's state.db once for the rows in the
+    window.  ``quota_cache`` pins the cloud-provider quota dict cache
+    (demo, tests); None leaves every cloud entry's ``quota`` null — live plan
+    usage is read by the desktop plugin from the public gateway method
+    ``model.options``, not here.
+    """
     conn = conn if conn is not None else _open_conn()
     now = _now() if now is None else float(now)
     since = now - float(window_seconds)
@@ -1150,7 +1167,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                 kept.append(card)
         server_cards = kept
     model_cards = _model_cards(rows, server_cards, now, window_seconds,
-                               lane_rows=_request_rows(conn, now, window_seconds))
+                               lane_rows=_request_rows(conn, now, window_seconds),
+                               quota_cache=quota_cache)
     links = _subagent_links(conn)
     routed = _routed_for_links(conn, links)
     agent_nodes = _agent_tree(rows, links,

@@ -478,6 +478,75 @@ function useQuota(provider) {
   })
 }
 
+// Live subscription usage comes from the public model.options RPC, not the
+// backend snapshot: catalog rule, plugins may only use public surfaces. The
+// backend fills model.quota in demo mode only. Fail-open: a failed fetch is an
+// empty Map, so a cloud card simply renders no quota line.
+function providerUsageMap(result) {
+  const map = new Map()
+  const providers = result && Array.isArray(result.providers) ? result.providers : []
+  for (const provider of providers) {
+    if (!provider || !provider.slug || !provider.usage) continue
+    map.set(String(provider.slug).toLowerCase(), provider.usage)
+  }
+  return map
+}
+
+function useProviderUsage() {
+  const query = useQuery({
+    queryKey: [ID, 'provider-usage'],
+    queryFn: () => host.request('model.options', {}),
+    refetchInterval: 60000,
+    staleTime: 30000,
+    retry: 1
+  })
+  return providerUsageMap(query && query.data)
+}
+
+// ProviderUsage -> PlanUsage's shape. A provider-wide gauge is `windows`; a
+// multi-entry credential pool leaves it empty and carries `accounts` instead,
+// so the first account with numeric windows stands in (its label becomes the
+// title). No numeric window anywhere means no quota line, never a fake gauge.
+function providerUsageToQuota(usage) {
+  if (!usage || typeof usage !== 'object') return null
+  const toWindows = windows => (Array.isArray(windows) ? windows : [])
+    .filter(window => window && typeof window === 'object')
+    .map(window => {
+      const used = Number.isFinite(window.used_percent) ? window.used_percent : null
+      const resetMs = window.resets_at ? Date.parse(window.resets_at) : NaN
+      return {
+        label: window.label || '',
+        used_percent: used,
+        remaining_percent: used == null ? null : 100 - used,
+        reset_at: Number.isFinite(resetMs) ? resetMs / 1000 : null,
+        detail: window.scope === 'model' ? 'model-specific cap' : null
+      }
+    })
+  let windows = toWindows(usage.windows)
+  let title = null
+  if (!windows.length && Array.isArray(usage.accounts)) {
+    const account = usage.accounts.find(row => row && Array.isArray(row.windows) && row.windows.length)
+    if (account) {
+      windows = toWindows(account.windows)
+      title = account.label || null
+    }
+  }
+  if (!windows.some(window => Number.isFinite(window.used_percent))) return null
+  return { title, windows }
+}
+
+// The lane's provider may be an alias of the provider row model.options names.
+function providerUsageLookup(usageMap, model) {
+  if (!usageMap || !model) return null
+  const names = [model.provider, ...(Array.isArray(model.provider_aliases) ? model.provider_aliases : [])]
+  for (const name of names) {
+    if (!name) continue
+    const usage = usageMap.get(String(name).toLowerCase())
+    if (usage) return usage
+  }
+  return null
+}
+
 function quotaLine(stats, provider) {
   const limit = stats && stats.rate_limit
   if (!limit || limit.provider !== provider) return null
@@ -954,7 +1023,11 @@ function ServerCard({ server, models, labels, now }) {
       jsxs('div', {
         className: 'flex items-center gap-2 text-[0.6875rem]',
         children: [
-          jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'slots' }),
+          jsx('span', {
+            className: 'text-(--ui-text-tertiary)',
+            title: 'Requests the server can run at once; more than this wait in its queue.',
+            children: 'slots'
+          }),
           jsx(SlotBar, { total: server.slots, running: server.running, waiting: server.waiting }),
           jsx('span', {
             className: 'tabular-nums text-(--ui-text-secondary)',
@@ -1144,12 +1217,17 @@ function PlanUsage({ quota }) {
   })
 }
 
-function CloudCard({ model, labels, now, windowSeconds, snapshot }) {
+function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap }) {
   const quotaQ = useQuota(model.provider)
   // The snapshot's own quota block wins; the live session.stats gauge is only
   // a fallback for a lane the snapshot has no quota for.
   const quota = model.quota != null ? null : quotaLine(quotaQ.data, model.provider)
   const plan = model.quota != null ? null : planLine(quotaQ.data)
+  // Live subscription usage comes from the public model.options RPC; the
+  // backend fills model.quota in demo mode only, so a demo quota wins.
+  const planUsage = model.quota != null
+    ? model.quota
+    : providerUsageToQuota(providerUsageLookup(usageMap, model))
   // `now` is ms (useNow); the tok/s series wants seconds.
   const winEnd = now / 1000
   const samples = cloudSamplesFromRequests(model.requests || [], winEnd - windowSeconds, winEnd)
@@ -1176,7 +1254,8 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot }) {
           jsx(Codicon, { name: 'cloud', size: 12, className: 'text-(--ui-text-tertiary)' }),
           jsx('span', {
             className: 'text-[0.8125rem] font-semibold tracking-tight text-(--ui-text-primary)',
-            children: `${model.provider} / ${model.model}`
+            title: fullModelLabel(model.provider, model.model),
+            children: modelDisplayName(model.model || model.provider)
           }),
           jsx(Badge, { variant: 'outline', size: 'xs', children: 'Hermes traffic only' }),
           jsx('span', {
@@ -1206,14 +1285,14 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot }) {
           }),
           jsx(Metric, {
             label: 'TTFT p50',
-            value: fmtMs(model.ttft_ms_p50),
+            value: wholeResponse ? 'not streamed' : fmtMs(model.ttft_ms_p50),
             title: wholeResponse
               ? 'time to first token (median) — not applicable: this lane returns whole responses'
               : 'time to first token (median)'
           }),
           jsx(Metric, {
             label: 'decode',
-            value: model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—',
+            value: wholeResponse ? 'not streamed' : (model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—'),
             title: 'output tokens per second while streaming'
           }),
           jsx(Metric, {
@@ -1233,7 +1312,7 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot }) {
           })
         ]
       }),
-      jsx(PlanUsage, { quota: model.quota }),
+      jsx(PlanUsage, { quota: planUsage }),
       quota || plan
         ? jsxs('div', {
             className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
@@ -1388,24 +1467,38 @@ function truncateText(ctx2, text, maxWidth) {
   return `${cut}…`
 }
 
-function requestTooltip(request, labels) {
+function requestTooltip(request, labels, snapshot, lane) {
+  // Line 1 is the same agent label By agent shows: the row's own title, or a
+  // subagent's role + goal. The date id is never a tooltip line.
+  const agentRow = agentRowBySession(snapshot).get(request.session_id)
+  const agent = agentRow
+    ? agentLabel(agentRow, labels || {})
+    : (sessionTitle(labels || {}, request.session_id) || 'session')
   const ttft = request.first_chunk_at != null && request.started_at != null
     ? Math.max(0, request.first_chunk_at - request.started_at) * 1000
     : null
   const genEnd = request.ended_at != null ? request.ended_at : Date.now() / 1000
   const genSpan = request.first_chunk_at != null ? Math.max(0, genEnd - request.first_chunk_at) : null
-  const generating = genSpan && genSpan > 0 && request.completion_tokens != null
+  // A generating span under half a second makes tok/s meaningless (a whole
+  // response's span is ~0 s and once read as 60,337 tok/s); skip the rate.
+  const generating = genSpan != null && genSpan >= 0.5 && request.completion_tokens != null
     ? request.completion_tokens / genSpan
     : null
+  const whole = isWholeResponse(request)
+  const timing = whole
+    ? `whole response after ${fmtMs(ttft)} (not streamed)`
+    : (generating != null
+        ? `first token after ${fmtMs(ttft)} · generated ${fmtInt(request.completion_tokens)} tok at ${fmtRate(generating)} tok/s`
+        : `first token after ${fmtMs(ttft)}${request.completion_tokens != null ? ` · generated ${fmtInt(request.completion_tokens)} tok` : ''}`)
+  const inFlight = request.ended_at == null
+  const status = inFlight ? 'running' : (/error/i.test(String(request.status || '')) ? 'error' : 'finished')
   return [
-    agentLabel(request, labels || {}),
-    request.model || 'model unknown',
-    `TTFT ${fmtMs(ttft)}`,
-    `generating ${generating != null ? `${fmtRate(generating)} tok/s` : '—'}`,
-    isWholeResponse(request) ? 'not streamed (whole response)' : 'streamed',
+    agent,
+    `${request.model || 'model unknown'} on ${(lane && lane.label) || 'lane'}`,
+    timing,
     `${tokenText(request.prompt_tokens)} in / ${tokenText(request.completion_tokens)} out`,
-    request.status || 'status unknown'
-  ].join(' · ')
+    status
+  ].join('\n')
 }
 
 // The swim lane's window comes from the snapshot itself, never the page clock:
@@ -2048,7 +2141,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
     const hit = (hitsRef.current || []).find(item =>
       x >= item.x - 1 && x <= item.x + item.w + 1 && y >= item.y - 1 && y <= item.y + item.h + 1
     )
-    if (hit) setHover({ x, y, text: requestTooltip(hit.request, labels) })
+    if (hit) setHover({ x, y, text: requestTooltip(hit.request, labels, snapshot, hit.lane) })
     else if (hover) setHover(null)
   }
 
@@ -2802,7 +2895,7 @@ const EMPTY_REASON_TEXT = {
   no_traffic: 'No model traffic yet. Rows appear the moment an agent talks to a model.'
 }
 
-function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
+function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
   // A declared cloud endpoint is a lane, not a local server: it has no gauge
   // and belongs in the cloud cards, never in the local capacity section.
   const servers = (Array.isArray(snapshot.servers) ? snapshot.servers : []).filter(
@@ -3009,10 +3102,10 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
       cloud.length
         ? jsx(Section, {
             label: 'Cloud lanes',
-            meta: 'Hermes traffic only — hook rows, no server gauge',
+            meta: "only this machine's Hermes requests; providers don't publish server load",
             children: jsx('div', {
               className: 'grid gap-2 xl:grid-cols-2',
-              children: cloud.map(model => jsx(CloudCard, { model, labels, now, windowSeconds, snapshot }, model.key))
+              children: cloud.map(model => jsx(CloudCard, { model, labels, now, windowSeconds, snapshot, usageMap }, model.key))
             })
           })
         : null,
@@ -3051,6 +3144,7 @@ function FlightdeckPage() {
   )
   const labelQ = useSessionLabels(profiles)
   const labels = labelQ.data || {}
+  const usageMap = useProviderUsage()
   const totals = (snapshot && snapshot.totals) || {}
   const reachableServers = snapshot && Array.isArray(snapshot.servers)
     ? snapshot.servers.filter(server => server && !server.error).length
@@ -3191,7 +3285,7 @@ function FlightdeckPage() {
       children:
         view === 'agent'
           ? jsx(AgentView, { snapshot, labels, now, windowSeconds })
-          : jsx(ModelView, { snapshot, labels, now, windowSeconds, onHide: hideServer })
+          : jsx(ModelView, { snapshot, labels, now, windowSeconds, onHide: hideServer, usageMap })
     })
   }
 

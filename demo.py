@@ -122,6 +122,28 @@ def _apply_demo_titles(snapshot: dict, now: float) -> None:
 _EPOCH_KEYS = {
     "generated_at", "since", "started_at", "first_chunk_at", "ended_at",
     "oldest_started_at", "last_active_at", "at", "ts",
+    "fetched_at", "reset_at",
+}
+
+# The demo cloud lane's quota, in exactly the §9.1 shape the desktop plugin
+# reads from the public gateway method `model.options` (provider
+# `usage.windows`): 5-hour window 42% used resetting in ~2h, weekly window
+# 18% used.  Timestamps are placeholders — _shift() moves fetched_at/reset_at
+# with the demo clock so they stay plausible ("resets in ~2h") next to the
+# shifted generated_at.
+_DEMO_QUOTA = {
+    "provider": "anthropic",
+    "plan": "pro",
+    "title": "Claude Pro",
+    "source": "claude-cli",
+    "fetched_at": 0.0,
+    "unavailable_reason": None,
+    "windows": [
+        {"label": "5-hour", "used_percent": 42.0, "remaining_percent": 58.0,
+         "reset_at": 0.0, "detail": None},
+        {"label": "weekly", "used_percent": 18.0, "remaining_percent": 82.0,
+         "reset_at": None, "detail": None},
+    ],
 }
 
 
@@ -157,6 +179,12 @@ def _demo_from_json(window_seconds: int, now: float, anchor: float | None = None
     shifted = _shift(payload, delta)
     shifted["generated_at"] = now
     shifted["window"] = {"seconds": int(window_seconds), "since": now - float(window_seconds)}
+    # Demo cloud lane: the same quota shape the desktop plugin reads live from
+    # `model.options` — 5-hour 42% used resetting in ~2h, weekly 18% used.
+    # Reset stamps ride the shift above so they stay ~2h ahead of `now`.
+    for entry in shifted.get("models", []):
+        if isinstance(entry, dict) and entry.get("lane") == "cloud" and entry.get("quota") is None:
+            entry["quota"] = _DEMO_QUOTA
     # Canonical §9.1 key order, so the fallback passes the same shape pin.
     return {
         "generated_at": now,
@@ -174,6 +202,15 @@ def _demo_from_json(window_seconds: int, now: float, anchor: float | None = None
         "decisions": shifted.get("decisions", []),
         "routing": shifted.get("routing", dict(_DEMO_ROUTING)),
     }
+
+
+def _demo_quota(now: float) -> dict:
+    """``_DEMO_QUOTA`` with stamps anchored to *now* (5-hour resets in ~2h)."""
+    quota = dict(_DEMO_QUOTA)
+    quota["fetched_at"] = now - 120.0
+    quota["windows"] = [dict(window) for window in _DEMO_QUOTA["windows"]]
+    quota["windows"][0]["reset_at"] = now + 7200.0
+    return quota
 
 
 def build_demo_snapshot(window_seconds: int = 300, *, now: float | None = None,
@@ -195,6 +232,11 @@ def build_demo_snapshot(window_seconds: int = 300, *, now: float | None = None,
                 window_seconds, servers=make_example.server_samples(start),
                 conn=conn, now=moment, routing=_DEMO_ROUTING,
                 session_info=demo_sessions(start),
+                # Pin the demo quota: the seeded cloud lane gets the same shape
+                # the desktop plugin reads live from `model.options`, and no
+                # real account state is consulted (the demo must not depend on
+                # this machine's account).
+                quota_cache={"anthropic": _demo_quota(moment)},
             )
         finally:
             conn.close()

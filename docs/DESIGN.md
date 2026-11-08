@@ -434,13 +434,29 @@ declared local server) appear in the same By model list, sorted after local serv
 output tok/s, tokens, errors and 429s. No server gauges, no slot bar — the card says "no server gauge"
 rather than drawing an empty one.
 
-**Quota: hooks cannot see it.** Provider rate-limit headers are parsed into `agent._rate_limit_state`
-(`agent/agent_init.py:497`, `agent/rate_limit_tracker.py:89-105`) and are not part of any hook payload —
-`post_api_request` carries `usage` and the sanitized response body only (`agent/api_request_hooks.py:142-161`),
-and `_usage_summary_for_api_request_hook` normalizes token buckets, nothing else. There is no
+**Quota: hooks cannot see it; live plan usage comes from a public gateway method.** Provider rate-limit
+headers are parsed into `agent._rate_limit_state` (`agent/agent_init.py:497`,
+`agent/rate_limit_tracker.py:89-105`) and are not part of any hook payload — `post_api_request` carries
+`usage` and the sanitized response body only (`agent/api_request_hooks.py:142-161`), and
+`_usage_summary_for_api_request_hook` normalizes token buckets, nothing else. There is no
 `native_usage`/`native_cost` field in any hook payload. So:
 
 - **Per-request quota is not available.** We do not derive it, estimate it, or scrape it.
+- **Live plan usage is read by the desktop plugin from the public gateway method `model.options`.**
+  Each provider row carries `usage: {windows: [{label, used_percent, resets_at (ISO), scope}],
+  accounts}` — the same data `hermes usage` shows. The backend does not import Hermes internals, does
+  not read any account-usage cache, and its cloud entries carry `quota: null` in live mode. The plugin
+  renders the windows itself; no backend quota code is involved.
+- **Backend `quota` is demo-only.** The backend sets it solely for demo mode, injected explicitly
+  through `quota_cache`; live snapshots always carry `quota: null` for cloud entries, and local model
+  entries always carry `quota: null`. A null `quota` means "no data", not "no quota".
+- **Demo `quota` shape.** `null`, or:
+  `{provider, plan, title, source, fetched_at, unavailable_reason, windows}` where `fetched_at` is epoch
+  seconds (null when unknown) and `windows` is a list of
+  `{label, used_percent, remaining_percent, reset_at, detail}` — `remaining_percent` is
+  `100 - used_percent`, `reset_at` is epoch seconds or null, and `detail` is the provider's prose line or
+  null. `unavailable_reason` is null or a plain sentence (e.g. `not signed in`); the UI renders
+  `plan usage unavailable: …` instead of windows.
 - **Live-session quota is available through a public RPC**: `session.stats` returns
   `rate_limit = dataclasses.asdict(RateLimitState)` — `requests_min`, `requests_hour`, `tokens_min`,
   `tokens_hour`, each `{limit, remaining, reset_seconds, captured_at}`, plus `provider` and
@@ -448,7 +464,8 @@ and `_usage_summary_for_api_request_hook` normalizes token buckets, nothing else
   The Desktop half calls it with `host.request('session.stats', {session_id})` for the focused session
   and shows a quota line on the cloud card **only** when `rate_limit.provider` matches that card's
   provider, labelled `quota: 42/100 req/min, resets in 37s (live session)`. It is a last-captured value,
-  not a live gauge, and the label says so.
+  not a live gauge, and the label says so. The plugin's `model.options` plan windows win when present;
+  the live session gauge is only a fallback.
 - **Plan allowance** (`plan_gauge`, the subscription route's usage window) rides the same RPC and is
   shown as `plan: 24.8% used, resets 3h` on the subscription card when present.
 - **`usage.bars`** (`billing_delegation_pets.py:55-74`) gives dollar plan/topup bars for the Nous portal;
@@ -605,8 +622,14 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
 
 Rules the backend guarantees: `label` is always `""` (the UI fills it from `session.list` /
 `child_goal`); `lane` ∈ `local`|`cloud`; `slots` is `null` for cloud and for kinds without a gauge;
-`quota` is always `null` from the backend (the UI fills it from `session.stats`); numbers are `null` when
-unknown, never `0`-as-unknown. `name` is the short card label (declared name → provider key → host:port);
+`quota` is `null` in live mode. Demo mode injects the §7.4 quota block —
+`{provider, plan, title, source, fetched_at, unavailable_reason,
+windows:[{label, used_percent, remaining_percent, reset_at, detail}]}` — explicitly through
+`quota_cache`; live plan usage is read by the desktop plugin from the public gateway method
+`model.options` (provider `usage.windows`, the same data `hermes usage` shows). Local model entries
+always carry `quota: null`. The UI fills the live-session quota line from `session.stats` only when
+`model.options` has no plan windows for that lane. Numbers are `null` when unknown, never `0`-as-unknown.
+`name` is the short card label (declared name → provider key → host:port);
 `title` is `null` or the provider's prose name, for the card tooltip only. `unreachable` is always present
 (`[]` when none): discovered servers that are unreachable and served no request in the window, as
 `{name, base_url, error, since}` — the UI renders one per row: dot · name · `host:port` · the collapsed
@@ -886,7 +909,7 @@ screenshots:
 readme: true
 platforms: []
 known_issues:
-  - "Provider rate-limit headers are not in any hook payload; quota is shown only for the focused live session (session.stats) and the plan allowance, never per request."
+  - "Provider rate-limit headers are not in any hook payload; live plan usage is read by the desktop plugin from the public gateway method `model.options` (provider usage.windows, the same data `hermes usage` shows), the focused live session (session.stats) is a fallback, and backend quota is demo-only — never per request."
   - "Auxiliary (compression/titling) requests carry no first-chunk time, so they show no TTFT."
   - "A request that runs longer than stale_after_seconds shows as abandoned until its post_api_request arrives."
 capabilities:
@@ -1032,8 +1055,8 @@ Other risks:
 1. **No hook carries provider rate-limit headers or cost.** `agent._rate_limit_state` is populated from
    response headers (`agent/rate_limit_tracker.py:89-105`) but never enters a hook payload; `usage` is
    token buckets only (`agent/api_request_hooks.py:35-60`). Per-request quota is therefore impossible
-   without reading agent internals, which rule 9 forbids. §7.4 uses the public `session.stats` RPC and
-   labels it honestly.
+   without reading agent internals, which rule 9 forbids. §7.4 uses the public `model.options` method
+   (plan windows) and the public `session.stats` RPC (live-session fallback), and labels them honestly.
 2. **`post_auxiliary_call` has no `first_chunk_at`, and streaming auxiliary calls report no `usage`**
    (`agent/auxiliary_hooks.py:143-185`). Aux rows show no TTFT and sometimes no tokens; the cloud card
    for compression shows request counts and duration, not throughput.

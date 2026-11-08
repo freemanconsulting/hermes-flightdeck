@@ -29,6 +29,8 @@ const useEffect = () => {}
 const useMemo = fn => fn()
 const useRef = initial => ({ current: initial })
 
+let providerUsageResult = null
+
 function useQuery({ queryKey }) {
   const kind = queryKey[1]
   let data = null
@@ -36,6 +38,7 @@ function useQuery({ queryKey }) {
   else if (kind === 'servers') data = { servers: querySnapshot.servers, totals: querySnapshot.totals, show_chip: true }
   else if (kind === 'labels') data = labels
   else if (kind === 'quota') data = null
+  else if (kind === 'provider-usage') data = host.request('model.options', {})
   return { data, isLoading: false, isError: false, isFetching: false, refetch: () => {} }
 }
 
@@ -44,7 +47,10 @@ const host = {
   state: { focusedSessionId: atom(null), focusedSessionProfile: atom('default') },
   profileRoutes: () => [{ profile: 'default' }],
   requestProfile: async () => ({ sessions: [] }),
-  request: async () => ({}),
+  request: (method, params) => {
+    if (method === 'model.options') return providerUsageResult
+    return {}
+  },
   openSession: (id, opts) => opened.push({ id, opts }),
   navigate: () => {}
 }
@@ -77,7 +83,7 @@ const factory = new Function(
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
   'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason }`
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, requestTooltip, modelDisplayName }`
 )
 const mod = factory(
   atom, Badge, Button, Component, EmptyState, Component, Component, Component,
@@ -830,6 +836,48 @@ const noQuotaText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }
 check('cloud card renders no quota line when the quota is null',
   !noQuotaText.includes('5-hour') && !noQuotaText.includes('plan usage unavailable'),
   noQuotaText.slice(0, 160))
+
+// 14. Live plan usage from the public model.options RPC: the backend only fills
+//     model.quota in demo mode, so a live cloud card reads provider usage.
+const usageIso = new Date((fixture.generated_at + 7200) * 1000).toISOString()
+providerUsageResult = { providers: [
+  { slug: 'claude-subscription-directsdk-experimental', name: 'Claude',
+    usage: { windows: [{ label: '5-hour', used_percent: 42, resets_at: usageIso, scope: 'account' }] } }
+] }
+const usageMap = mod.useProviderUsage()
+check('provider usage map keys by lowercase provider slug',
+  usageMap.get('claude-subscription-directsdk-experimental') != null,
+  `${usageMap.size} providers`)
+const usageText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap }))
+check('cloud card renders live model.options usage when model.quota is null',
+  usageText.includes('5-hour') && usageText.includes('42% used'), usageText.slice(0, 160))
+const demoUsageModel = { ...cloudModel, quota: { windows: [{ label: 'weekly', used_percent: 10,
+  remaining_percent: 90, reset_at: fixture.generated_at + 7200 }] } }
+const demoUsageText = textOf(mod.CloudCard({ model: demoUsageModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap }))
+check('demo model.quota takes precedence over live provider usage',
+  demoUsageText.includes('weekly') && !demoUsageText.includes('5-hour'), demoUsageText.slice(0, 160))
+providerUsageResult = { providers: [
+  { slug: 'claude-subscription-directsdk-experimental', name: 'Claude', usage: null }
+] }
+const noUsageMap = mod.useProviderUsage()
+const noUsageText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: noUsageMap }))
+check('no usage rendered when model.options returns no usage',
+  !noUsageText.includes('5-hour') && !noUsageText.includes('plan usage unavailable'),
+  noUsageText.slice(0, 160))
+const accountQuota = mod.providerUsageToQuota({ windows: [], accounts: [
+  { id: 'a1', label: 'Account 2', windows: [{ label: 'weekly', used_percent: 25,
+    resets_at: usageIso, scope: 'model' }] }
+] })
+check('provider usage falls back to the first account with windows',
+  accountQuota && accountQuota.title === 'Account 2'
+    && accountQuota.windows[0].detail === 'model-specific cap'
+    && accountQuota.windows[0].reset_at === Date.parse(usageIso) / 1000,
+  JSON.stringify(accountQuota))
+check('provider usage with no numeric window returns null',
+  mod.providerUsageToQuota({ windows: [{ label: 'x', used_percent: null }] }) === null)
 const holderSnap = JSON.parse(JSON.stringify(fixture))
 const holderModel = holderSnap.models.find(model => model.lane === 'cloud')
 holderSnap.agents[0].children
@@ -841,6 +889,64 @@ const holderText = textOf(mod.CloudCard({ model: holderModel, labels,
 check('cloud card holder line resolves the agent row title, not the session id',
   holderText.includes('Flightdeck hackathon') && !holderText.includes('session 2026'),
   holderText.slice(0, 160))
+
+// 15. Polish: swim-lane tooltip lines, cloud card title, section meta, whole
+//     responses on cloud cards, and the local slots tooltip.
+const streamedRequest = { session_id: '20261107_174026_d25bb8', model: 'claude-opus-5-5[1m]',
+  started_at: fixture.generated_at - 40, first_chunk_at: fixture.generated_at - 38,
+  ended_at: fixture.generated_at - 20, prompt_tokens: 94000, completion_tokens: 1234,
+  status: 'done' }
+const laneForTooltip = { label: 'claude-subscription-directsdk-experimental / claude-opus-5-5[1m]' }
+const tooltip = mod.requestTooltip(streamedRequest, labels, holderSnap, laneForTooltip)
+const tooltipLines = tooltip.split('\n')
+check('request tooltip line 1 is the By-agent label, never the date id',
+  tooltipLines[0].startsWith('subagent · ') && tooltipLines[0].includes('Flightdeck hackathon')
+    && !tooltip.includes('20261107'), tooltipLines[0])
+check('request tooltip is five lines with model on lane and a finished status',
+  tooltipLines.length === 5
+    && tooltipLines[1] === 'claude-opus-5-5[1m] on claude-subscription-directsdk-experimental / claude-opus-5-5[1m]'
+    && tooltipLines[4] === 'finished' && !tooltip.includes('generating') && !tooltip.includes('done'),
+  tooltipLines.join(' | '))
+check('streamed tooltip line 3 carries first token and a guarded rate',
+  tooltipLines[2].includes('first token after 2.0s')
+    && tooltipLines[2].includes('generated 1,234 tok at') && tooltipLines[2].includes('tok/s'),
+  tooltipLines[2])
+const wholeRequest = { ...streamedRequest, first_chunk_at: fixture.generated_at - 20,
+  ended_at: fixture.generated_at - 20, completion_tokens: 1000 }
+const wholeTooltip = mod.requestTooltip(wholeRequest, labels, holderSnap, laneForTooltip)
+check('whole-response tooltip says not streamed and prints no tok/s',
+  wholeTooltip.includes('whole response after') && wholeTooltip.includes('(not streamed)')
+    && !wholeTooltip.includes('tok/s') && !wholeTooltip.includes('generating'), wholeTooltip)
+const shortRequest = { ...streamedRequest, first_chunk_at: fixture.generated_at - 20.4,
+  ended_at: fixture.generated_at - 20, completion_tokens: 1000 }
+const shortTooltip = mod.requestTooltip(shortRequest, labels, holderSnap, laneForTooltip)
+check('tok/s skipped when the generating span is under 0.5 s',
+  !shortTooltip.includes('tok/s') && shortTooltip.includes('first token after'), shortTooltip)
+const runningRequest = { ...streamedRequest, ended_at: null }
+const runningTooltip = mod.requestTooltip(runningRequest, labels, holderSnap, laneForTooltip)
+check('in-flight tooltip status is running, never done',
+  runningTooltip.split('\n')[4] === 'running' && !runningTooltip.includes('done'), runningTooltip.split('\n')[4])
+const titleEl = elements(mod.CloudCard({ model: cloudModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+  .find(el => el.props.title === 'claude-subscription-directsdk-experimental/claude-opus-5-5[1m]')
+check('cloud card title shows the short model with the full provider/model tooltip',
+  titleEl && textOf(titleEl) === 'claude-opus-5-5[1m]', titleEl ? textOf(titleEl) : 'title element missing')
+check('cloud section meta names Hermes-only requests and no server load',
+  textOf(page).includes("only this machine's Hermes requests; providers don't publish server load"))
+const wholeCloudModel = { ...cloudModel, quota: null,
+  requests: cloudModel.requests.map(row => ({ ...row, first_chunk_at: row.ended_at })) }
+const wholeCloudText = textOf(mod.CloudCard({ model: wholeCloudModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+const wholeCloudMetrics = elements(mod.CloudCard({ model: wholeCloudModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+check('cloud card shows not streamed for TTFT and decode when every request is whole',
+  wholeCloudMetrics.some(el => textOf(el) === 'TTFT p50not streamed')
+    && wholeCloudMetrics.some(el => textOf(el) === 'decodenot streamed'),
+  wholeCloudText.slice(0, 160))
+const slotsEl = elements(page).find(el =>
+  el.props.title === 'Requests the server can run at once; more than this wait in its queue.')
+check('local card slots label carries the queue tooltip',
+  slotsEl && textOf(slotsEl) === 'slots', slotsEl ? textOf(slotsEl) : 'slots label missing')
 
 const failed = results.filter(item => !item.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)
