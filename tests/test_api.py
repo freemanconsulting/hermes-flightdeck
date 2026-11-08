@@ -25,6 +25,7 @@ if str(ROOT / "tests") not in sys.path:
 import api  # noqa: E402
 import make_example  # noqa: E402
 import poller  # noqa: E402
+import servers  # noqa: E402
 
 NOW = make_example.NOW
 DS4 = make_example.DS4
@@ -71,7 +72,7 @@ def test_snapshot_shape_is_pinned(conn):
     assert list(ds4) == [
         "name", "title", "aux", "roles", "base_url", "kind", "healthy", "models", "running",
         "waiting", "slots",
-        "decode_tps", "prefill_tps", "in_flight", "unattributed", "over_attributed",
+        "decode_tps", "prefill_tps", "health", "in_flight", "unattributed", "over_attributed",
         "agents", "requests", "samples", "error", "sampled_at",
     ]
     assert ds4["aux"] is None and ds4["roles"] == []
@@ -674,3 +675,92 @@ def test_poller_cache_hit_still_applies_the_aux_fields():
     assert sample["name"] == "qwen3.5-9b"
     assert sample["aux"] is True
     assert sample["roles"] == ["skills_hub"]
+
+
+# --- server health (docs/METRICS.md § Server health) ------------------------
+
+
+def test_server_card_health_from_the_live_ds4_capture(conn):
+    """normalize() → build_servers: the real capture lands on the card, rounded."""
+    responses = {
+        "/metrics": (ROOT / "tests" / "fixtures" / "servers" / "tensorfold-ds4" / "metrics.txt").read_text(),
+        "/health": (ROOT / "tests" / "fixtures" / "servers" / "tensorfold-ds4" / "health.json").read_text(),
+    }
+    snap = servers.normalize("tensorfold", responses)
+    payload = api.build_servers(servers=[snap], conn=conn, now=NOW,
+                                servers_source="declared")
+    health = payload["servers"][0]["health"]
+    assert list(health) == [
+        "kv_cache_usage", "kv_cache_usage_mean", "prefix_cache_hit_rate", "spec_accept_rate",
+        "server_ttft_p50", "server_ttft_p95", "server_latency_p50", "server_latency_p95",
+        "server_tpot_p50", "preemptions_total", "preemptions_delta", "disconnects_total",
+        "disconnects_delta", "memory_bytes", "memory_peak_bytes",
+    ]
+    assert health["kv_cache_usage"] == 0.0
+    assert health["prefix_cache_hit_rate"] == 0.93
+    assert health["spec_accept_rate"] == 0.72
+    assert health["server_ttft_p50"] == 4.55 and health["server_ttft_p95"] == 75.97
+    assert health["server_latency_p50"] == 25.97 and health["server_latency_p95"] == 212.48
+    assert health["server_tpot_p50"] == 0.0349  # seconds; the UI prints 34.9 ms
+    assert health["preemptions_total"] == 0 and health["preemptions_delta"] is None
+    assert health["disconnects_total"] == 21 and health["disconnects_delta"] is None
+    assert health["memory_bytes"] == 226966809104
+
+
+def test_server_card_health_is_none_for_llamacpp(conn):
+    """llama.cpp reports no engine health: the card carries ``health: None``."""
+    responses = {
+        "/metrics": (ROOT / "tests" / "fixtures" / "servers" / "llamacpp" / "metrics.txt").read_text(),
+        "/slots": (ROOT / "tests" / "fixtures" / "servers" / "llamacpp" / "slots.json").read_text(),
+        "/health": (ROOT / "tests" / "fixtures" / "servers" / "llamacpp" / "health.json").read_text(),
+    }
+    snap = servers.normalize("llamacpp", responses)
+    payload = api.build_servers(servers=[snap], conn=conn, now=NOW,
+                                servers_source="declared")
+    assert payload["servers"][0]["health"] is None
+
+
+def test_poller_health_deltas_across_two_samples(monkeypatch):
+    """Prefix hit and MTP accept become interval ratios; counters become deltas."""
+    _fake_probe(monkeypatch, [
+        {"name": "ds4", "base_url": DS4, "kind": "tensorfold",
+         "prefix_cache_queries_total": 1000, "prefix_cache_hits_total": 800,
+         "spec_drafted_total": 500, "spec_accepted_total": 300,
+         "preemptions_total": 2, "disconnects_total": 10,
+         "preemptions_delta": None, "disconnects_delta": None,
+         "prefix_cache_hit_rate": 0.8, "spec_accept_rate": 0.6,
+         "sampled_at": api._now_iso(NOW - 5)},
+        {"name": "ds4", "base_url": DS4, "kind": "tensorfold",
+         "prefix_cache_queries_total": 1500, "prefix_cache_hits_total": 1250,
+         "spec_drafted_total": 700, "spec_accepted_total": 440,
+         "preemptions_total": 5, "disconnects_total": 12,
+         "preemptions_delta": None, "disconnects_delta": None,
+         "prefix_cache_hit_rate": 0.833, "spec_accept_rate": 0.628,
+         "sampled_at": api._now_iso(NOW)},
+    ])
+    poller.clear_cache()
+    servers = [{"name": "ds4", "base_url": DS4, "kind": "tensorfold"}]
+    first = poller.poll_sync(servers, ttl=5.0)[DS4]
+    assert first["prefix_cache_hit_rate"] == 0.8  # lifetime: no interval yet
+    assert first["preemptions_delta"] is None and first["disconnects_delta"] is None
+    poller._CACHE[DS4]["at"] -= 10
+    second = poller.poll_sync(servers, ttl=5.0)[DS4]
+    assert second["prefix_cache_hit_rate"] == pytest.approx(450 / 500)  # interval
+    assert second["spec_accept_rate"] == pytest.approx(140 / 200)
+    assert second["preemptions_delta"] == 3
+    assert second["disconnects_delta"] == 2
+
+
+def test_poller_health_delta_ignores_a_counter_reset():
+    """A restarted server's counters go backwards: keep the lifetime ratio."""
+    prev = {"prefix_cache_queries_total": 1000, "prefix_cache_hits_total": 900,
+            "spec_drafted_total": 500, "spec_accepted_total": 300,
+            "preemptions_total": 5, "disconnects_total": 12}
+    cur = {"prefix_cache_queries_total": 10, "prefix_cache_hits_total": 9,
+           "spec_drafted_total": 5, "spec_accepted_total": 3,
+           "preemptions_total": 0, "disconnects_total": 0,
+           "prefix_cache_hit_rate": 0.9, "spec_accept_rate": 0.6}
+    poller._derive_health(prev, cur)
+    assert cur["prefix_cache_hit_rate"] == 0.9
+    assert cur["spec_accept_rate"] == 0.6
+    assert cur["preemptions_delta"] is None and cur["disconnects_delta"] is None

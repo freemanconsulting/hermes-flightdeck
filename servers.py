@@ -68,6 +68,29 @@ class Snapshot:
     prompt_tokens_total: int | None = None
     cached_tokens_total: int | None = None
     generation_tokens_total: int | None = None
+    # Engine health (docs/METRICS.md § Server health).  Ratios are 0-1, times
+    # are seconds, memory is bytes; every field is None when not reported.
+    kv_cache_usage: float | None = None
+    kv_cache_usage_mean: float | None = None
+    prefix_cache_hit_rate: float | None = None
+    spec_accept_rate: float | None = None
+    server_ttft_p50: float | None = None
+    server_ttft_p95: float | None = None
+    server_latency_p50: float | None = None
+    server_latency_p95: float | None = None
+    server_tpot_p50: float | None = None
+    preemptions_total: int | None = None
+    preemptions_delta: int | None = None
+    disconnects_total: int | None = None
+    disconnects_delta: int | None = None
+    memory_bytes: int | None = None
+    memory_peak_bytes: int | None = None
+    # Lifetime counters behind the interval ratios and deltas (poller reads
+    # them from the previous sample; normalize fills them from one capture).
+    prefix_cache_queries_total: int | None = None
+    prefix_cache_hits_total: int | None = None
+    spec_drafted_total: int | None = None
+    spec_accepted_total: int | None = None
     sampled_at: str = ""
     error: str | None = None
 
@@ -243,6 +266,83 @@ def _sum_float(metrics, *names: str) -> float | None:
     return None
 
 
+def _ratio(numerator: int | None, denominator: int | None) -> float | None:
+    """numerator / denominator, or None when the denominator is absent or zero."""
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _gauge_max(metrics, *names: str) -> float | None:
+    """Highest sample of the first metric name present (max over streams)."""
+    for name in names:
+        samples = metrics.get(name)
+        if samples:
+            return max(value for _, value in samples)
+    return None
+
+
+def _gauge_mean(metrics, *names: str) -> float | None:
+    """Mean of the first metric name present, across its label sets."""
+    for name in names:
+        samples = metrics.get(name)
+        if samples:
+            return sum(value for _, value in samples) / len(samples)
+    return None
+
+
+def _quantile(metrics, names: tuple[str, ...], pct: float) -> float | None:
+    """A percentile from histogram buckets or a summary's quantile labels.
+
+    Buckets are aggregated by ``le`` across label sets (the snapshot sums across
+    models).  Linear interpolation within the bucket that holds the rank; a rank
+    landing in a zero-width bucket returns its bound; a ``+Inf`` bucket clamps to
+    the highest finite bound.  A summary reads the quantile label nearest the
+    requested percentile.  None when neither shape is present.
+    """
+    for name in names:
+        buckets = metrics.get(name + "_bucket")
+        if buckets:
+            counts: dict[float, float] = {}
+            for labels, value in buckets:
+                try:
+                    bound = float(labels["le"])
+                except (KeyError, ValueError):
+                    continue
+                counts[bound] = counts.get(bound, 0.0) + value
+            ordered = sorted(counts.items())
+            total = counts.get(float("inf"))
+            if total is None:
+                total = _sum(metrics, name + "_count")
+            if not ordered or not total:
+                continue
+            rank = pct / 100.0 * total
+            prev_bound, prev_cum = 0.0, 0.0
+            for bound, cum in ordered:
+                if cum >= rank:
+                    if bound == float("inf"):
+                        return prev_bound
+                    if cum <= prev_cum:
+                        return bound
+                    return prev_bound + (rank - prev_cum) / (cum - prev_cum) * (bound - prev_bound)
+                prev_bound, prev_cum = bound, cum
+            return prev_bound
+        samples = metrics.get(name)
+        if samples:
+            target = pct / 100.0
+            best: tuple[float, float] | None = None
+            for labels, value in samples:
+                try:
+                    quantile = float(labels["quantile"])
+                except (KeyError, ValueError):
+                    continue
+                if best is None or abs(quantile - target) < abs(best[0] - target):
+                    best = (quantile, value)
+            if best is not None:
+                return best[1]
+    return None
+
+
 def _label_values(metrics, label: str = "model_name") -> list[str]:
     seen: list[str] = []
     for samples in metrics.values():
@@ -367,6 +467,36 @@ def _normalize_tensorfold(responses: dict[str, Any], snap: Snapshot) -> None:
     snap.cached_tokens_total = _sum_int(metrics, "tensorfold:prompt_tokens_cached_total")
     snap.generation_tokens_total = _sum_int(metrics, "tensorfold:generation_tokens_total")
 
+    # Engine health: one capture gives lifetime ratios and totals; the poller
+    # replaces the ratios with interval deltas when it has a previous sample.
+    snap.kv_cache_usage = _gauge_max(metrics, "tensorfold:kv_cache_usage_ratio",
+                                     "tensorfold:kv_cache_usage_perc")
+    snap.kv_cache_usage_mean = _gauge_mean(metrics, "tensorfold:kv_cache_usage_ratio",
+                                           "tensorfold:kv_cache_usage_perc")
+    snap.prefix_cache_queries_total = _sum_int(metrics, "tensorfold:prefix_cache_queries_total")
+    snap.prefix_cache_hits_total = _sum_int(metrics, "tensorfold:prefix_cache_hits_total")
+    snap.prefix_cache_hit_rate = _ratio(snap.prefix_cache_hits_total, snap.prefix_cache_queries_total)
+    snap.spec_drafted_total = _sum_int(metrics, "tensorfold:mtp_drafted_total",
+                                       "tensorfold:spec_decode_num_draft_tokens_total")
+    snap.spec_accepted_total = _sum_int(metrics, "tensorfold:mtp_accepted_total",
+                                        "tensorfold:spec_decode_num_accepted_tokens_total")
+    snap.spec_accept_rate = _ratio(snap.spec_accepted_total, snap.spec_drafted_total)
+    ttft = ("tensorfold:time_to_first_token_seconds",)
+    latency = ("tensorfold:request_latency_seconds", "tensorfold:e2e_request_latency_seconds")
+    tpot = ("tensorfold:request_time_per_output_token_seconds",)
+    snap.server_ttft_p50 = _quantile(metrics, ttft, 50)
+    snap.server_ttft_p95 = _quantile(metrics, ttft, 95)
+    snap.server_latency_p50 = _quantile(metrics, latency, 50)
+    snap.server_latency_p95 = _quantile(metrics, latency, 95)
+    snap.server_tpot_p50 = _quantile(metrics, tpot, 50)
+    snap.preemptions_total = _sum_int(metrics, "tensorfold:preemptions_total")
+    snap.disconnects_total = _sum_int(metrics, "tensorfold:client_disconnections_total")
+    # CUDA servers count device memory; macOS servers count process footprint.
+    snap.memory_bytes = _int(_gauge_max(metrics, "tensorfold:device_memory_bytes",
+                                        "tensorfold:process_footprint_bytes"))
+    snap.memory_peak_bytes = _int(_gauge_max(metrics, "tensorfold:device_memory_peak_bytes",
+                                             "tensorfold:process_footprint_peak_bytes"))
+
     if isinstance(health, dict):
         ids = health.get("model_ids")
         if isinstance(ids, list):
@@ -395,6 +525,29 @@ def _normalize_vllm(responses: dict[str, Any], snap: Snapshot) -> None:
     snap.generation_tokens_total = _sum_int(
         metrics, "vllm:generation_tokens", "vllm:generation_tokens_total"
     )
+    # Engine health under vLLM's names (docs/METRICS.md § Server health).
+    snap.kv_cache_usage = _gauge_max(metrics, "vllm:kv_cache_usage_perc")
+    snap.kv_cache_usage_mean = _gauge_mean(metrics, "vllm:kv_cache_usage_perc")
+    snap.prefix_cache_queries_total = _sum_int(metrics, "vllm:prefix_cache_queries_total",
+                                               "vllm:prefix_cache_queries")
+    snap.prefix_cache_hits_total = _sum_int(metrics, "vllm:prefix_cache_hits_total",
+                                            "vllm:prefix_cache_hits")
+    snap.prefix_cache_hit_rate = _ratio(snap.prefix_cache_hits_total, snap.prefix_cache_queries_total)
+    snap.spec_drafted_total = _sum_int(metrics, "vllm:spec_decode_num_draft_tokens",
+                                       "vllm:spec_decode_num_draft_tokens_total")
+    snap.spec_accepted_total = _sum_int(metrics, "vllm:spec_decode_num_accepted_tokens",
+                                        "vllm:spec_decode_num_accepted_tokens_total")
+    snap.spec_accept_rate = _ratio(snap.spec_accepted_total, snap.spec_drafted_total)
+    ttft = ("vllm:time_to_first_token_seconds",)
+    latency = ("vllm:e2e_request_latency_seconds",)
+    tpot = ("vllm:time_per_output_token_seconds",)
+    snap.server_ttft_p50 = _quantile(metrics, ttft, 50)
+    snap.server_ttft_p95 = _quantile(metrics, ttft, 95)
+    snap.server_latency_p50 = _quantile(metrics, latency, 50)
+    snap.server_latency_p95 = _quantile(metrics, latency, 95)
+    snap.server_tpot_p50 = _quantile(metrics, tpot, 50)
+    snap.preemptions_total = _sum_int(metrics, "vllm:num_preemptions_total", "vllm:num_preemptions")
+    # vLLM exposes no memory gauge on /metrics: memory stays None.
     snap.models = _models_from_v1(responses.get("/v1/models")) or _label_values(metrics)
     # vLLM exposes no max_num_seqs gauge and no tok/s gauge: both are derived
     # from counters by the poller (see token_rate / docs/METRICS.md).
@@ -416,6 +569,12 @@ def _normalize_sglang(responses: dict[str, Any], snap: Snapshot) -> None:
     snap.decode_tps = _sum_float(metrics, "sglang:gen_throughput")
     snap.prompt_tokens_total = _sum_int(metrics, "sglang:prompt_tokens_total")
     snap.generation_tokens_total = _sum_int(metrics, "sglang:generation_tokens_total")
+    # SGLang's documented health gauges: token_usage is the KV occupancy and
+    # cache_hit_rate the prefix hit rate.  No spec-decode, latency or memory
+    # metrics are documented for it, so those fields stay None.
+    snap.kv_cache_usage = _gauge_max(metrics, "sglang:token_usage")
+    snap.kv_cache_usage_mean = _gauge_mean(metrics, "sglang:token_usage")
+    snap.prefix_cache_hit_rate = _gauge_mean(metrics, "sglang:cache_hit_rate")
     # SGLang reports no cached-token counter and no prefill tok/s gauge; the
     # poller derives both (cache_hit_rate * prompt_tokens, counter rate).
     snap.slots = _int(info.get("max_running_requests"))

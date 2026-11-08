@@ -515,6 +515,16 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
       "healthy": true, "models": ["qwen38-27b-q4-q8kv-mtp3"],
       "running": 3, "waiting": 0, "slots": 4,
       "decode_tps": 42.1, "prefill_tps": 3100.0,
+      "health": {
+        "kv_cache_usage": 0.34, "kv_cache_usage_mean": 0.31,
+        "prefix_cache_hit_rate": 0.91, "spec_accept_rate": 0.72,
+        "server_ttft_p50": 0.82, "server_ttft_p95": 3.1,
+        "server_latency_p50": 4.6, "server_latency_p95": 12.4,
+        "server_tpot_p50": 0.024,
+        "preemptions_total": 2, "preemptions_delta": 0,
+        "disconnects_total": 21, "disconnects_delta": 1,
+        "memory_bytes": 226966809104, "memory_peak_bytes": 229918256328
+      },
       "in_flight": 3, "unattributed": 0, "over_attributed": 0,
       "agents": [{"profile": "default", "session_id": "s1", "label": "", "kind": "session",
                   "model": "qwen38-27b-q4-q8kv-mtp3", "requests": 2, "oldest_started_at": 1762540759.0}],

@@ -115,6 +115,10 @@ def _sample_dict(sample: Any) -> dict[str, Any]:
         "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "prompt_tokens_total", "cached_tokens_total",
         "generation_tokens_total", "sampled_at", "error",
+        "kv_cache_usage", "kv_cache_usage_mean", "prefix_cache_hit_rate", "spec_accept_rate",
+        "server_ttft_p50", "server_ttft_p95", "server_latency_p50", "server_latency_p95",
+        "server_tpot_p50", "preemptions_total", "preemptions_delta", "disconnects_total",
+        "disconnects_delta", "memory_bytes", "memory_peak_bytes",
     )
     return {field: getattr(sample, field, None) for field in fields}
 
@@ -286,6 +290,33 @@ def _default_servers(conn: sqlite3.Connection | None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _server_health(sample: dict) -> dict | None:
+    """The card's ``health`` block: normalized engine fields, display-rounded.
+
+    A card with no reported health field carries ``health: None`` — llama.cpp,
+    Ollama and cloud lanes report none of these (DESIGN §9.1).  Bytes stay
+    bytes; the UI formats GB.  ``preemptions_delta``/``disconnects_delta`` are
+    None on a first sample (no interval yet) and the lifetime totals ride
+    beside them.
+    """
+    health: dict[str, Any] = {}
+    for field, digits in (
+        ("kv_cache_usage", 4), ("kv_cache_usage_mean", 4),
+        ("prefix_cache_hit_rate", 3), ("spec_accept_rate", 3),
+        ("server_ttft_p50", 2), ("server_ttft_p95", 2),
+        ("server_latency_p50", 2), ("server_latency_p95", 2),
+        ("server_tpot_p50", 4),
+    ):
+        value = _num(sample.get(field))
+        health[field] = None if value is None else round(value, digits)
+    for field in ("preemptions_total", "preemptions_delta", "disconnects_total",
+                  "disconnects_delta", "memory_bytes", "memory_peak_bytes"):
+        health[field] = _int_or_none(sample.get(field))
+    if all(value is None for value in health.values()):
+        return None
+    return health
+
+
 def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list[dict],
                   sample_rows: list[dict], now: float) -> list[dict]:
     by_url: dict[str, list[dict]] = {}
@@ -363,6 +394,7 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
             "slots": slots,
             "decode_tps": decode_tps,
             "prefill_tps": prefill_tps,
+            "health": _server_health(sample),
             "in_flight": in_flight_count,
             "unattributed": None if running is None else max(0, running - in_flight_count),
             "over_attributed": None if running is None else max(0, in_flight_count - running),

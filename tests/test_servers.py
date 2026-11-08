@@ -55,16 +55,30 @@ def test_tensorfold_ds4_live():
     assert snap.kind == "tensorfold"
     assert snap.healthy is True
     assert snap.models == ["ds4"]
-    assert snap.running == 1
+    assert snap.running == 0
     assert snap.waiting == 0
     assert snap.slots == 4
-    assert snap.decode_tps == 51.0
-    assert snap.prefill_tps == 479.7
-    assert snap.prompt_tokens_total == 199577631
-    assert snap.cached_tokens_total == 184607107
-    assert snap.generation_tokens_total == 2131780
+    assert snap.decode_tps == 35.5
+    assert snap.prefill_tps == 0.0
+    assert snap.prompt_tokens_total == 254445809
+    assert snap.cached_tokens_total == 236725598
+    assert snap.generation_tokens_total == 2626588
     assert snap.sampled_at.endswith("Z")
     assert snap.error is None
+    # Engine health from the live /metrics capture (docs/METRICS.md).
+    assert snap.kv_cache_usage == 0.0
+    assert snap.kv_cache_usage_mean == 0.0
+    assert snap.prefix_cache_hit_rate == pytest.approx(236725598 / 254445809)
+    assert snap.spec_accept_rate == pytest.approx(1384829 / 1923076)
+    assert snap.server_ttft_p50 == pytest.approx(4.5497, abs=1e-4)
+    assert snap.server_ttft_p95 == pytest.approx(75.9712, abs=1e-4)
+    assert snap.server_latency_p50 == pytest.approx(25.972350, abs=1e-6)
+    assert snap.server_latency_p95 == pytest.approx(212.475983, abs=1e-6)
+    assert snap.server_tpot_p50 == pytest.approx(0.034921, abs=1e-6)
+    assert snap.preemptions_total == 0 and snap.preemptions_delta is None
+    assert snap.disconnects_total == 21 and snap.disconnects_delta is None
+    assert snap.memory_bytes == 226966809104
+    assert snap.memory_peak_bytes == 229918256328
 
 
 def test_tensorfold_gn100_live():
@@ -76,14 +90,28 @@ def test_tensorfold_gn100_live():
     snap = normalize("tensorfold", responses)
     assert snap.healthy is True
     assert snap.models == ["qwen38-flash-next-tf-fp4"]
-    assert snap.running == 0
+    assert snap.running == 1
     assert snap.waiting == 0
     assert snap.slots == 5
     assert snap.decode_tps == 0.0
     assert snap.prefill_tps == 0.0
-    assert snap.prompt_tokens_total == 76374727
-    assert snap.cached_tokens_total == 71627393
-    assert snap.generation_tokens_total == 513870
+    assert snap.prompt_tokens_total == 93547932
+    assert snap.cached_tokens_total == 87415290
+    assert snap.generation_tokens_total == 608772
+    # CUDA server: device memory, not process footprint.
+    assert snap.kv_cache_usage == pytest.approx(0.699524)
+    assert snap.kv_cache_usage_mean == pytest.approx(0.699524)
+    assert snap.prefix_cache_hit_rate == pytest.approx(87415290 / 93547932)
+    assert snap.spec_accept_rate == pytest.approx(500954 / 736703)
+    assert snap.server_ttft_p50 == pytest.approx(0.818484, abs=1e-6)
+    assert snap.server_ttft_p95 == pytest.approx(8.159722, abs=1e-6)
+    assert snap.server_latency_p50 == pytest.approx(3.187050, abs=1e-6)
+    assert snap.server_latency_p95 == pytest.approx(28.535385, abs=1e-6)
+    assert snap.server_tpot_p50 == pytest.approx(0.019209, abs=1e-6)
+    assert snap.preemptions_total == 0
+    assert snap.disconnects_total == 4
+    assert snap.memory_bytes == 98813168878
+    assert snap.memory_peak_bytes == 108580588870
 
 
 def test_tensorfold_metrics_only_still_reports_load():
@@ -91,12 +119,13 @@ def test_tensorfold_metrics_only_still_reports_load():
     assert detect_kind(responses) == "tensorfold"
 
     snap = normalize("tensorfold", responses)
-    assert snap.running == 1  # tensorfold:requests_running fallback
+    assert snap.running == 0  # tensorfold:requests_running fallback
     assert snap.waiting == 0
     assert snap.slots is None  # max_batch_size only lives in /health
     assert snap.decode_tps is None
     assert snap.models == []
     assert snap.healthy is True
+    assert snap.kv_cache_usage == 0.0  # health needs no /health body
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +153,19 @@ def test_vllm_current_names():
     assert snap.slots is None
     assert snap.decode_tps is None
     assert snap.prefill_tps is None
+    # Health aliases: vllm:kv_cache_usage_perc, prefix_cache_*, spec_decode_*,
+    # histogram percentiles, num_preemptions_total.  vLLM has no memory gauge.
+    assert snap.kv_cache_usage == pytest.approx(0.42)
+    assert snap.kv_cache_usage_mean == pytest.approx(0.42)
+    assert snap.prefix_cache_hit_rate == pytest.approx(0.8)
+    assert snap.spec_accept_rate == pytest.approx(0.6)
+    assert snap.server_ttft_p50 == pytest.approx(0.4)
+    assert snap.server_ttft_p95 == pytest.approx(3.5)
+    assert snap.server_latency_p50 == pytest.approx(3.0)
+    assert snap.server_latency_p95 == pytest.approx(9.0)
+    assert snap.server_tpot_p50 == pytest.approx(0.015)
+    assert snap.preemptions_total == 7
+    assert snap.memory_bytes is None and snap.memory_peak_bytes is None
 
 
 def test_vllm_legacy_total_suffix():
@@ -163,6 +205,12 @@ def test_sglang():
     assert snap.prompt_tokens_total == 8128902
     assert snap.generation_tokens_total == 7557572
     assert snap.cached_tokens_total is None  # only a cache_hit_rate gauge
+    # Documented SGLang health gauges only; no latency/spec/memory metrics.
+    assert snap.kv_cache_usage == pytest.approx(0.28)
+    assert snap.kv_cache_usage_mean == pytest.approx(0.28)
+    assert snap.prefix_cache_hit_rate == pytest.approx(0.007507552643049313)
+    assert snap.server_ttft_p50 is None and snap.server_latency_p50 is None
+    assert snap.spec_accept_rate is None and snap.memory_bytes is None
 
 
 def test_sglang_slots_from_server_args():
@@ -203,6 +251,10 @@ def test_llamacpp():
     assert snap.prompt_tokens_total == 2658
     assert snap.generation_tokens_total == 12877
     assert snap.cached_tokens_total is None
+    # llama.cpp reports no engine health: every health field stays None.
+    assert snap.kv_cache_usage is None and snap.prefix_cache_hit_rate is None
+    assert snap.server_ttft_p50 is None and snap.server_latency_p50 is None
+    assert snap.preemptions_total is None and snap.memory_bytes is None
 
 
 def test_llamacpp_without_metrics_uses_slots():
@@ -312,10 +364,10 @@ def test_normalize_does_not_raise_on_bad_bodies():
 
 def test_parse_prometheus_labels_and_values():
     parsed = parse_prometheus(load("tensorfold-ds4", "metrics.txt"))
-    assert parsed["tensorfold:requests_running"] == [({}, 1.0)]
-    assert parsed["tensorfold:prompt_tokens_total"] == [({}, 199577631.0)]
-    assert parsed["tensorfold:kv_cache_usage_ratio"] == [({"pool": "0"}, pytest.approx(0.052803))]
-    assert parsed["tensorfold:kv_cache_usage_perc"] == [({"stream": "0"}, pytest.approx(0.052803))]
+    assert parsed["tensorfold:requests_running"] == [({}, 0.0)]
+    assert parsed["tensorfold:prompt_tokens_total"] == [({}, 254445809.0)]
+    assert parsed["tensorfold:kv_cache_usage_ratio"] == [({"pool": "0"}, 0.0)]
+    assert parsed["tensorfold:kv_cache_usage_perc"] == [({"stream": "0"}, 0.0)]
     assert len(parsed["tensorfold:request_latency_seconds_bucket"]) == 14
 
 
@@ -345,6 +397,34 @@ def test_token_rate():
     assert token_rate(None, 1600, 10.0) is None
     assert token_rate(1000, 1600, 0) is None
     assert token_rate(1600, 1000, 10.0) is None  # counter reset, not a rate
+
+
+# ---------------------------------------------------------------------------
+# Histogram and summary quantiles (docs/METRICS.md § Server health)
+# ---------------------------------------------------------------------------
+
+
+def test_summary_quantiles_read_the_nearest_label():
+    text = (
+        "# TYPE tensorfold:request_latency_seconds summary\n"
+        'tensorfold:request_latency_seconds{quantile="0.5"} 1.5\n'
+        'tensorfold:request_latency_seconds{quantile="0.95"} 4.25\n'
+        "tensorfold:request_latency_seconds_count 10\n"
+    )
+    snap = normalize("tensorfold", {"metrics": text})
+    assert snap.server_latency_p50 == pytest.approx(1.5)
+    assert snap.server_latency_p95 == pytest.approx(4.25)
+
+
+def test_inf_bucket_clamps_to_the_highest_finite_bound():
+    text = (
+        "# TYPE tensorfold:time_to_first_token_seconds histogram\n"
+        'tensorfold:time_to_first_token_seconds_bucket{le="1"} 5\n'
+        'tensorfold:time_to_first_token_seconds_bucket{le="+Inf"} 10\n'
+    )
+    snap = normalize("tensorfold", {"metrics": text})
+    assert snap.server_ttft_p95 == pytest.approx(1.0)  # rank lands in +Inf
+    assert snap.server_ttft_p50 == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +480,9 @@ def test_probe_matches_normalize(fixture_server):
     assert snap.kind == "tensorfold"
     assert snap.base_url == fixture_server
     assert snap.error is None
-    assert snap.running == expected.running == 1
+    assert snap.running == expected.running == 0
     assert snap.slots == expected.slots == 4
-    assert snap.decode_tps == expected.decode_tps == 51.0
+    assert snap.decode_tps == expected.decode_tps == 35.5
     assert snap.prompt_tokens_total == expected.prompt_tokens_total
     assert snap.models == ["ds4"]
     assert snap.name == "ds4"

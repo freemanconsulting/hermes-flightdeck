@@ -84,6 +84,12 @@ def _sample_dict(snap: Any) -> dict[str, Any]:
         "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "prompt_tokens_total", "cached_tokens_total",
         "generation_tokens_total", "sampled_at", "error",
+        "kv_cache_usage", "kv_cache_usage_mean", "prefix_cache_hit_rate", "spec_accept_rate",
+        "server_ttft_p50", "server_ttft_p95", "server_latency_p50", "server_latency_p95",
+        "server_tpot_p50", "preemptions_total", "preemptions_delta", "disconnects_total",
+        "disconnects_delta", "memory_bytes", "memory_peak_bytes",
+        "prefix_cache_queries_total", "prefix_cache_hits_total",
+        "spec_drafted_total", "spec_accepted_total",
     )
     return {field: getattr(snap, field, None) for field in fields}
 
@@ -106,6 +112,42 @@ def _derive_rates(prev: dict[str, Any] | None, cur: dict[str, Any]) -> None:
         cur["prefill_tps"] = token_rate(
             prev.get("prompt_tokens_total"), cur.get("prompt_tokens_total"), window
         )
+
+
+def _delta(prev_total: Any, cur_total: Any) -> int | None:
+    """cur - prev for a lifetime counter; None when missing or reset backwards."""
+    try:
+        prev_int = None if prev_total is None or isinstance(prev_total, bool) else int(prev_total)
+        cur_int = None if cur_total is None or isinstance(cur_total, bool) else int(cur_total)
+    except (TypeError, ValueError):
+        return None
+    if prev_int is None or cur_int is None:
+        return None
+    delta = cur_int - prev_int
+    return delta if delta >= 0 else None
+
+
+def _derive_health(prev: dict[str, Any] | None, cur: dict[str, Any]) -> None:
+    """Replace lifetime health ratios with interval ones and fill the deltas.
+
+    One capture has no interval: normalize already set the lifetime ratio and
+    the poller leaves it alone.  With a previous sample, a ratio is the counter
+    delta over the poll window, and a delta field is the counter difference;
+    a reset counter (server restart) leaves the field None rather than
+    inventing a number (docs/METRICS.md § Server health).
+    """
+    if prev is None:
+        return
+    queries = _delta(prev.get("prefix_cache_queries_total"), cur.get("prefix_cache_queries_total"))
+    hits = _delta(prev.get("prefix_cache_hits_total"), cur.get("prefix_cache_hits_total"))
+    if queries is not None and queries > 0 and hits is not None:
+        cur["prefix_cache_hit_rate"] = hits / queries
+    drafted = _delta(prev.get("spec_drafted_total"), cur.get("spec_drafted_total"))
+    accepted = _delta(prev.get("spec_accepted_total"), cur.get("spec_accepted_total"))
+    if drafted is not None and drafted > 0 and accepted is not None:
+        cur["spec_accept_rate"] = accepted / drafted
+    cur["preemptions_delta"] = _delta(prev.get("preemptions_total"), cur.get("preemptions_total"))
+    cur["disconnects_delta"] = _delta(prev.get("disconnects_total"), cur.get("disconnects_total"))
 
 
 def _write_sample(conn: sqlite3.Connection | None, sample: dict[str, Any]) -> None:
@@ -177,6 +219,7 @@ async def _one(server: dict[str, Any], ttl: float, timeout: float,
         sample["base_url"] = base_url
         _apply_server_fields(sample, server)
         _derive_rates(_LAST.get(base_url), sample)
+        _derive_health(_LAST.get(base_url), sample)
         _LAST[base_url] = sample
         _CACHE[base_url] = {"at": time.monotonic(), "sample": sample}
         try:
