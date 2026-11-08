@@ -285,6 +285,58 @@ def _default_servers(conn: sqlite3.Connection | None) -> list[dict]:
     return list(_settings(conn).get("servers") or [])
 
 
+def _decisions(conn: sqlite3.Connection, now: float, retention_hours: float = 24) -> list[dict]:
+    """Newest routing decisions inside the retention window (CAPACITY.md §6.2)."""
+    store = _store_module()
+    if store is None or not hasattr(store, "decisions_since"):
+        return []
+    try:
+        return list(store.decisions_since(
+            conn, float(now) - float(retention_hours) * 3600.0, limit=20))
+    except sqlite3.Error:
+        return []
+
+
+def _routed_for_links(conn: sqlite3.Connection, links: dict[str, dict]) -> dict[str, dict]:
+    """``child_session_id → routed``; {} when the store has no decisions table."""
+    store = _store_module()
+    if store is None or not hasattr(store, "decisions_for_links"):
+        return {}
+    try:
+        return store.decisions_for_links(conn, links)
+    except sqlite3.Error:
+        return {}
+
+
+def _routing(settings: dict) -> dict:
+    """``capacity.arm_status`` for the page; a safe off block when capacity.py is absent."""
+    capacity = _load_sibling("capacity")
+    config = _config_module()
+    if capacity is None or config is None:
+        return {"armed": False, "backend": "default", "inner_backend": "default",
+                "blocked_by": None, "message": "", "eligible_lanes": []}
+    try:
+        return capacity.arm_status(settings, config.delegation_section(),
+                                   servers=settings.get("servers") or [])
+    except Exception:
+        return {"armed": False, "backend": "default", "inner_backend": "default",
+                "blocked_by": None, "message": "", "eligible_lanes": []}
+
+
+def routing_block(snapshot: dict) -> dict:
+    """The snapshot's ``routing`` block plus the newest decision, for the tool/one-liner."""
+    routing = dict(snapshot.get("routing") or {})
+    last = (snapshot.get("decisions") or [None])[0]
+    routing["last_decision"] = None if not last else {
+        "action": last.get("action"),
+        "lane": last.get("chosen_lane") or last.get("requested_lane"),
+        "requested_lane": last.get("requested_lane"),
+        "reason": last.get("reason"),
+        "at": _now_iso(last.get("at")),
+    }
+    return routing
+
+
 # ---------------------------------------------------------------------------
 # Server cards
 # ---------------------------------------------------------------------------
@@ -685,8 +737,10 @@ def _agent_models(items: list[dict], server_by_url: dict[str, dict]) -> list[dic
 
 
 def _agent_tree(rows: list[dict], links: dict[str, dict],
-                server_by_url: dict[str, dict] | None = None) -> list[dict]:
+                server_by_url: dict[str, dict] | None = None,
+                routed: dict[str, dict] | None = None) -> list[dict]:
     server_by_url = server_by_url or {}
+    routed = routed or {}
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
         groups.setdefault((row.get("profile") or "", row.get("session_id") or ""), []).append(row)
@@ -697,6 +751,12 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
         in_flight_rows = [row for row in items if row.get("status") == "in-flight"]
         started = [_num(row.get("started_at")) for row in in_flight_rows]
         started = [value for value in started if value is not None]
+        # Last activity is the last request this session finished (or its start
+        # while still in flight) inside the window — a real timestamp, not a
+        # "requests in the window" guess.
+        active = [_num(row.get("ended_at")) if row.get("ended_at") is not None else _num(row.get("started_at"))
+                  for row in items]
+        active = [value for value in active if value is not None]
         parent = next((row.get("parent_session_id") for row in items if row.get("parent_session_id")), None)
         cron_job = next((row.get("cron_job_name") or row.get("cron_job_id") for row in items
                          if row.get("cron_job_name") or row.get("cron_job_id")), None)
@@ -723,6 +783,7 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
             "errors_5m": sum(1 for row in items if row.get("status") == "error"),
             "models": _agent_models(items, server_by_url),
             "oldest_started_at": min(started) if started else None,
+            "last_active_at": max(active) if active else None,
             "tokens_in": sum(_int_or_none(row.get("prompt_tokens")) or 0 for row in items),
             "tokens_out": sum(_int_or_none(row.get("completion_tokens")) or 0 for row in items),
             "cached_tokens": sum(_int_or_none(row.get("cached_tokens")) or 0 for row in items),
@@ -748,6 +809,17 @@ def _agent_tree(rows: list[dict], links: dict[str, dict],
     for node in roots:
         node["children"].sort(key=lambda child: (-child["in_flight"], -child["requests_5m"],
                                                  child["session_id"] or ""))
+    # Only subagent nodes carry `routed`; root sessions and cron nodes never do.
+    if routed:
+        for node in roots:
+            if node.get("kind") == "subagent":
+                info = routed.get(node.get("session_id") or "")
+                if info:
+                    node["routed"] = dict(info)
+            for child in node.get("children") or []:
+                info = routed.get(child.get("session_id") or "")
+                if info:
+                    child["routed"] = dict(info)
     return roots
 
 
@@ -784,14 +856,16 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                    conn: sqlite3.Connection | None = None, now: float | None = None,
                    servers_source: str | None = None,
                    hidden_servers: list[str] | None = None,
-                   retention_hours: int | None = None) -> dict:
+                   retention_hours: int | None = None,
+                   routing: dict | None = None) -> dict:
     """The §9.1 snapshot.  ``servers`` is already-polled samples (dict or list);
     None means poll the declared servers synchronously; [] means no server cards.
     ``servers_source`` overrides the derived source — /servers passes
     ``discovered`` so dead servers fold out of the chip too (DESIGN §7.2).
     ``hidden_servers`` filters passed samples by name or base_url; the live path
     is already filtered by ``config.load``.  ``retention_hours`` bounds the
-    idle-server check (default 24)."""
+    idle-server check (default 24).  ``routing`` pins the routing block (tests,
+    dashboard) instead of reading config.yaml; None computes it."""
     conn = conn if conn is not None else _open_conn()
     now = _now() if now is None else float(now)
     since = now - float(window_seconds)
@@ -871,8 +945,13 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                 kept.append(card)
         server_cards = kept
     model_cards = _model_cards(rows, server_cards, now, window_seconds)
-    agent_nodes = _agent_tree(rows, _subagent_links(conn),
-                              {normalize_base_url(card["base_url"]): card for card in server_cards})
+    links = _subagent_links(conn)
+    routed = _routed_for_links(conn, links)
+    agent_nodes = _agent_tree(rows, links,
+                              {normalize_base_url(card["base_url"]): card for card in server_cards},
+                              routed=routed)
+    decisions = _decisions(conn, now, float(retention_hours if retention_hours is not None else 24))
+    routing_value = _routing(_settings(conn)) if routing is None else dict(routing)
 
     totals = {
         "in_flight": len(in_flight),
@@ -893,6 +972,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
         "hidden_servers": hidden_list,
         "models": model_cards,
         "agents": agent_nodes,
+        "decisions": decisions,
+        "routing": routing_value,
     }
 
 
@@ -908,7 +989,8 @@ def build_agents(window_seconds: int = 300, *, conn: sqlite3.Connection | None =
         for server in (_settings(conn).get("servers") or [])
         if server.get("base_url")
     }
-    return {"agents": _agent_tree(rows, _subagent_links(conn), server_by_url)}
+    return {"agents": _agent_tree(rows, _subagent_links(conn), server_by_url,
+                                  routed=_routed_for_links(conn, _subagent_links(conn)))}
 
 def build_models(window_seconds: int = 300, *, servers: Any = None,
                  conn: sqlite3.Connection | None = None, now: float | None = None,
@@ -1085,7 +1167,7 @@ def fleet_status(snapshot: dict | None = None, *, window_seconds: int = 300,
             break
 
     return {"as_of": _now_iso(snapshot.get("generated_at")), "lanes": lanes,
-            "cloud": cloud, "pick": pick}
+            "cloud": cloud, "pick": pick, "routing": routing_block(snapshot)}
 
 
 def fleet_status_text(snapshot: dict | None = None, *, window_seconds: int = 300,
@@ -1098,7 +1180,7 @@ def fleet_status_text(snapshot: dict | None = None, *, window_seconds: int = 300
     """
     status = fleet_status(snapshot, window_seconds=window_seconds, servers=servers,
                           conn=conn, now=now)
-    parts = []
+    lane_parts = []
     for lane in status["lanes"]:
         if lane.get("healthy") is not True:
             continue
@@ -1109,15 +1191,38 @@ def fleet_status_text(snapshot: dict | None = None, *, window_seconds: int = 300
                 text += f" (q {lane['queue']})"
         else:
             text = f"{lane['name']} {lane.get('in_flight') or 0} in flight"
-        parts.append(text)
+        lane_parts.append(text)
     for card in status["cloud"]:
         window_requests = card.get("requests_1m") if window_seconds <= 60 else card.get("requests_5m")
         if (card.get("in_flight") or 0) > 0 or (window_requests or 0) > 0:
-            parts.append(f"{card['provider']}/{card['model']} {card['in_flight']} in flight")
-    parts.append(f"pick: {status['pick']['lane']}" if status["pick"] else "pick: none")
-    # Under ~160 chars: drop the least important lane before the pick.
-    while len(" · ".join(parts)) > 160 and len(parts) > 2:
-        del parts[-2]
+            lane_parts.append(f"{card['provider']}/{card['model']} {card['in_flight']} in flight")
+    tail = [f"pick: {status['pick']['lane']}" if status["pick"] else "pick: none"]
+    routing = status.get("routing") or {}
+    last = routing.get("last_decision")
+    clause = ""
+    if routing.get("blocked_by"):
+        if routing.get("backend") != "flightdeck":
+            clause = f"routing off: delegation.backend is {routing.get('backend')}"
+        else:
+            clause = f"routing off: inner_backend is {routing.get('inner_backend')}"
+    elif routing.get("armed") and last:
+        generated = snapshot.get("generated_at") if snapshot else None
+        moment = float(generated) if isinstance(generated, (int, float)) and not isinstance(
+            generated, bool) else _now()
+        at = last.get("at")
+        age = moment - float(at) if isinstance(at, (int, float)) else None
+        if age is not None and age <= 300:
+            if last.get("action") == "skip":
+                clause = f"unrouted: {last.get('reason') or 'no free local lane'}"
+            else:
+                clause = f"routed: {last.get('lane')} ({last.get('reason')})"
+    if clause:
+        tail.append(clause)
+    # Under ~160 chars: drop the least important lane, keeping pick and routing.
+    parts = lane_parts + tail
+    while len(" · ".join(parts)) > 160 and lane_parts:
+        lane_parts.pop()
+        parts = lane_parts + tail
     return " · ".join(parts)
 
 

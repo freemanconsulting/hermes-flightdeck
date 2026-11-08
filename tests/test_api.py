@@ -62,7 +62,8 @@ def model(snapshot_payload, key):
 def test_snapshot_shape_is_pinned(conn):
     payload = snapshot(conn)
     assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
-                             "unreachable", "idle", "hidden_servers", "models", "agents"]
+                             "unreachable", "idle", "hidden_servers", "models", "agents",
+                             "decisions", "routing"]
     assert payload["servers_source"] == "declared"
     assert payload["window"] == {"seconds": 300, "since": NOW - 300}
     assert list(payload["totals"]) == ["in_flight", "requests_1m", "requests_5m", "errors_5m"]
@@ -100,6 +101,7 @@ def test_snapshot_shape_is_pinned(conn):
     assert list(agent) == [
         "profile", "session_id", "label", "kind", "parent_session_id", "cron_job",
         "in_flight", "requests_5m", "errors_5m", "models", "oldest_started_at",
+        "last_active_at",
         "tokens_in", "tokens_out", "cached_tokens", "latency_ms_p50", "ttft_ms_p50", "children",
     ]
     assert agent["label"] == ""
@@ -576,7 +578,8 @@ def test_plugin_api_handlers_answer_from_the_store(conn, monkeypatch):
 
     payload = asyncio.run(module.snapshot("5m"))
     assert list(payload) == ["generated_at", "window", "totals", "servers_source", "servers",
-                             "unreachable", "idle", "hidden_servers", "models", "agents"]
+                             "unreachable", "idle", "hidden_servers", "models", "agents",
+                             "decisions", "routing"]
     assert payload["totals"]["in_flight"] == 6
 
     assert len(module.agents("1m")["agents"]) == 2

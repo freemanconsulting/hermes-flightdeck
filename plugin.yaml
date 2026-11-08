@@ -2,6 +2,7 @@ name: flightdeck
 version: "0.1.0"
 description: "Live air-traffic control for Hermes agents and model servers: see every agent, subagent and cron run talking to a model right now, which model and server it is on, and how loaded each local model server is (slots in use, queue, prefill/decode tok/s, time to first token) — by agent and by model. Observer hooks write request rows to one shared local SQLite store; a poller reads each configured server's metrics; the Desktop plugin renders the fleet; fleet_status lets the agent pick a lane with free capacity."
 author: "Nous Research"
+requires_hermes: ">=0.21.6"
 provides_tools:
   - fleet_status
 provides_hooks:
@@ -61,3 +62,36 @@ config_schema:
   show_quota:
     type: boolean
     default: true
+  route_delegation:
+    type: boolean
+    default: false
+    description: "Opt-in: place delegate_task subagents on a local server with free slots. Off means the flightdeck backend behaves exactly like default."
+  inner_backend:
+    type: string
+    default: default
+    description: "The backend that would run without routing. Only 'default' is supported; any other value reports routing unavailable and refuses to arm."
+  reserve_slots:
+    type: integer
+    default: 0
+    minimum: 0
+    description: "Slots to keep free on every local server when placing a task."
+  max_queue:
+    type: integer
+    default: 2
+    minimum: 0
+    description: "A requested lane with this many queued requests is skipped instead of deepened."
+  routing_staleness_seconds:
+    type: integer
+    default: 20
+    minimum: 5
+    description: "A server sample older than this is stale; routing never places a task on a stale sample."
+  routing_ledger_seconds:
+    type: integer
+    default: 60
+    minimum: 0
+    description: "How long a placement counts against a lane's free slots (the in-process ledger)."
+  routing_servers:
+    type: array
+    description: "Local servers routing may use, by name or base_url. Empty means every local server."
+    items:
+      type: string

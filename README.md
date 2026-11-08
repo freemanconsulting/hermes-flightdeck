@@ -23,6 +23,19 @@ their private provider URLs, deduped by base_url, with the profiles that referen
 shown on the card. Only loopback and private addresses are probed by default; declare a public
 URL explicitly if you want it polled.
 
+## Capacity routing (opt-in)
+
+Off by default. When enabled (`route_delegation: true`) and `delegation.backend: flightdeck`
+is active, Flightdeck changes where `delegate_task` subagents run: each task is placed on a
+local server with free slots instead of the configured delegation route, and every decision
+is recorded (goal, requested and chosen lane/model, reason, sampled slots). It never routes to
+a cloud endpoint, never rewrites a profile route or an explicit `api_key` route, and when no
+local lane has capacity it leaves the requested route unchanged and records that skip. It
+never writes `delegation.backend` itself: switch with `/delegation flightdeck --now` (or
+`hermes config set delegation.backend flightdeck`), and turn it off with
+`route_delegation: false`. With routing off the `flightdeck` backend behaves exactly like
+`default`.
+
 ## Disclosure
 
 Flightdeck records LLM request metadata — ids, profile, session, model, provider, base_url,
@@ -38,6 +51,15 @@ server settings; it never writes to them. No telemetry, no network calls to thir
 services, no shell commands, no credential reads. Quota shown on cloud cards comes from the
 public `session.stats` RPC for the focused session only, and is labelled as such.
 
+Capacity routing is opt-in and off by default. When enabled, it changes where `delegate_task`
+subagents run: each task is placed on a local server with free slots instead of the configured
+delegation route. It never routes to a cloud endpoint, never rewrites a profile route or an
+explicit `api_key` route, and when no local lane has capacity it leaves the requested route
+unchanged and records that decision. It does not write `delegation.backend`; switch with
+`/delegation flightdeck --now` (or `hermes config set delegation.backend flightdeck`). Decision
+rows record the task goal, the requested and chosen lane/model, the reason, and the sampled
+slots — no message text, prompts, tool arguments or credentials — for 24 h (2000-row cap).
+
 ## Layout
 
 - `store.py` — shared SQLite request/sample store and rollups
@@ -45,6 +67,7 @@ public `session.stats` RPC for the focused session only, and is labelled as such
 - `config.py` — declared servers, machine-wide discovery, poll knobs
 - `poller.py` — GET-only server probes
 - `api.py` — snapshot/agents/models/servers payloads
+- `capacity.py` — opt-in capacity-aware delegation provider and decision algorithm
 - `dashboard/`, `desktop/` — dashboard API and Desktop page
 - `tools.py` — the `fleet_status` agent tool
 

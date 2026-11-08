@@ -50,6 +50,7 @@ SCRIPT = textwrap.dedent(r'''
             self.hooks = []
             self.tools = []
             self.commands = []
+            self.providers = []
 
         def register_hook(self, name, fn):
             self.hooks.append(name)
@@ -60,6 +61,9 @@ SCRIPT = textwrap.dedent(r'''
 
         def register_command(self, name, fn, **kwargs):
             self.commands.append(name)
+
+        def register_delegation_provider(self, provider):
+            self.providers.append(provider)
 
     ctx = Ctx()
     agent.register(ctx)

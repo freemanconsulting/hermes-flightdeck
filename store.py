@@ -25,7 +25,7 @@ from typing import Any, Iterable, Optional
 
 PLUGIN_ID = "flightdeck"
 DB_FILENAME = "requests.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # One connection is shared by hook threads (check_same_thread=False); this lock
 # serialises the BEGIN IMMEDIATE write windows so two callbacks never interleave.
@@ -86,6 +86,25 @@ CREATE TABLE IF NOT EXISTS rollups_minute (
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS decisions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  decided_at    REAL NOT NULL,
+  profile       TEXT NOT NULL,
+  host          TEXT NOT NULL,
+  pid           INTEGER NOT NULL,
+  batch_id      INTEGER,
+  task_index    INTEGER,
+  goal          TEXT,
+  action        TEXT NOT NULL,
+  requested_lane TEXT, requested_provider TEXT, requested_model TEXT,
+  chosen_lane   TEXT, chosen_provider TEXT, chosen_model TEXT,
+  reason        TEXT,
+  stale         INTEGER NOT NULL DEFAULT 0,
+  lanes_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_dec_decided ON decisions(decided_at);
+CREATE INDEX IF NOT EXISTS ix_dec_goal    ON decisions(goal, decided_at);
 """
 
 _COLUMNS = (
@@ -144,8 +163,10 @@ def open_store(path: Optional[str | Path] = None) -> sqlite3.Connection:
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
-    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
-                 (str(SCHEMA_VERSION),))
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(SCHEMA_VERSION),))
 
 
 def _write(conn: sqlite3.Connection, fn):
@@ -314,7 +335,7 @@ def _request_values(kind: str, kw: dict[str, Any], *, status: str,
                     error_type: Any = None, error_message: Any = None) -> dict[str, Any]:
     profile, pid, host = _identity(kw.get("profile"), kw.get("pid"), kw.get("host"))
     session_id = kw.get("session_id")
-    values = {column: None for column in _COLUMNS}
+    values: dict[str, Any] = {column: None for column in _COLUMNS}
     values.update(
         id=_row_id(profile, pid, kw.get("api_request_id"), kind),
         schema_version=SCHEMA_VERSION,
@@ -572,6 +593,16 @@ def sweep(conn: sqlite3.Connection, retention_hours: float = 24, rollup_days: fl
         (moment - float(rollup_days) * 86400.0,),
     ))
     deleted_rollups = cursor.rowcount
+    cursor = _write(conn, lambda: conn.execute(
+        "DELETE FROM decisions WHERE decided_at < ?",
+        (moment - float(retention_hours) * 3600.0,),
+    ))
+    deleted_decisions = cursor.rowcount
+    cursor = _write(conn, lambda: conn.execute(
+        "DELETE FROM decisions WHERE id NOT IN "
+        "(SELECT id FROM decisions ORDER BY id DESC LIMIT 2000)",
+    ))
+    deleted_decisions += cursor.rowcount
     meta_set(conn, "last_sweep", moment)
     return {
         "rolled_up": rolled,
@@ -579,6 +610,7 @@ def sweep(conn: sqlite3.Connection, retention_hours: float = 24, rollup_days: fl
         "deleted_rows": deleted_rows,
         "deleted_samples": deleted_samples,
         "deleted_rollups": deleted_rollups,
+        "deleted_decisions": deleted_decisions,
         "last_sweep": moment,
     }
 
@@ -622,6 +654,129 @@ def record_server_samples(conn: sqlite3.Connection, samples: Iterable[Any]) -> i
             })
         count += 1
     return count
+
+
+# ─── decisions ──────────────────────────────────────────────────────────────
+
+
+_DECISION_COLUMNS = (
+    "decided_at", "profile", "host", "pid", "batch_id", "task_index", "goal", "action",
+    "requested_lane", "requested_provider", "requested_model",
+    "chosen_lane", "chosen_provider", "chosen_model",
+    "reason", "stale", "lanes_json",
+)
+
+
+def _json_list(raw: Any) -> list:
+    if isinstance(raw, list):
+        return raw
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def record_decision(conn: sqlite3.Connection, **kw: Any) -> int:
+    """One routing decision row (CAPACITY.md §6.1). ``lanes`` may be a list."""
+    profile, pid, host = _identity(kw.get("profile"), kw.get("pid"), kw.get("host"))
+    lanes_json = kw.get("lanes_json")
+    if lanes_json is None and kw.get("lanes") is not None:
+        lanes_json = json.dumps(kw.get("lanes"), default=str)
+    decided_at = kw.get("decided_at")
+    moment = float(decided_at) if isinstance(decided_at, (int, float)) and not isinstance(
+        decided_at, bool) else time.time()
+    values = {
+        "decided_at": moment,
+        "profile": profile,
+        "host": host,
+        "pid": pid,
+        "batch_id": _num(kw.get("batch_id")),
+        "task_index": _num(kw.get("task_index")),
+        "goal": _clip(kw.get("goal"), 300),
+        "action": str(kw.get("action") or "skip"),
+        "requested_lane": _clip(kw.get("requested_lane"), 200),
+        "requested_provider": _clip(kw.get("requested_provider"), 200),
+        "requested_model": _clip(kw.get("requested_model"), 300),
+        "chosen_lane": _clip(kw.get("chosen_lane"), 200),
+        "chosen_provider": _clip(kw.get("chosen_provider"), 200),
+        "chosen_model": _clip(kw.get("chosen_model"), 300),
+        "reason": _clip(kw.get("reason"), 500),
+        "stale": 1 if kw.get("stale") else 0,
+        "lanes_json": lanes_json,
+    }
+    cursor = _write(conn, lambda: conn.execute(
+        f"INSERT INTO decisions ({', '.join(_DECISION_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in _DECISION_COLUMNS)})",
+        tuple(values[column] for column in _DECISION_COLUMNS),
+    ))
+    return int(cursor.lastrowid or 0)
+
+
+def decisions_since(conn: sqlite3.Connection, since: float, limit: int = 20) -> list[dict]:
+    """Newest decisions since *since*; ``lanes_json`` decoded into ``lanes``."""
+    rows = _rows(conn.execute(
+        "SELECT * FROM decisions WHERE decided_at >= ? "
+        "ORDER BY decided_at DESC, id DESC LIMIT ?",
+        (float(since), int(limit)),
+    ))
+    for row in rows:
+        row["lanes"] = _json_list(row.pop("lanes_json", None))
+        row["stale"] = bool(row.get("stale"))
+    return rows
+
+
+def last_decision(conn: sqlite3.Connection) -> Optional[dict]:
+    """The newest decision row, or None."""
+    rows = decisions_since(conn, 0, limit=1)
+    return rows[0] if rows else None
+
+
+def decisions_for_links(conn: sqlite3.Connection, links: Any,
+                        window: float = 60.0) -> dict[str, dict]:
+    """``child_session_id → routed`` for subagent links (CAPACITY.md §6.3).
+
+    A decision belongs to a link when its goal matches and its ``decided_at`` is
+    within *window* seconds of the link's ``started_at``; the nearest wins.
+    """
+    if not isinstance(links, dict) or not links:
+        return {}
+    goals = {str(link.get("goal") or "") for link in links.values()
+             if isinstance(link, dict) and link.get("goal")}
+    starts = [float(link["started_at"]) for link in links.values()
+              if isinstance(link, dict) and link.get("started_at") is not None]
+    if not goals or not starts:
+        return {}
+    placeholders = ", ".join("?" for _ in goals)
+    rows = _rows(conn.execute(
+        f"SELECT * FROM decisions WHERE goal IN ({placeholders}) "
+        "AND decided_at >= ? AND decided_at <= ? ORDER BY decided_at DESC",
+        (*sorted(goals), min(starts) - float(window), max(starts) + float(window)),
+    ))
+    by_goal: dict[str, list[dict]] = {}
+    for row in rows:
+        by_goal.setdefault(row.get("goal") or "", []).append(row)
+    routed: dict[str, dict] = {}
+    for child_id, link in links.items():
+        if not isinstance(link, dict) or link.get("goal") is None or link.get("started_at") is None:
+            continue
+        started = float(link["started_at"])
+        candidates = [row for row in by_goal.get(str(link["goal"]), [])
+                      if abs(float(row["decided_at"]) - started) <= float(window)]
+        if not candidates:
+            continue
+        row = min(candidates, key=lambda item: abs(float(item["decided_at"]) - started))
+        routed[str(child_id)] = {
+            "action": row.get("action"),
+            "lane": row.get("chosen_lane") or row.get("requested_lane"),
+            "requested_lane": row.get("requested_lane"),
+            "reason": row.get("reason"),
+            "model": row.get("chosen_model") or row.get("requested_model"),
+            "at": row.get("decided_at"),
+        }
+    return routed
 
 
 # ─── queries ────────────────────────────────────────────────────────────────
@@ -771,6 +926,7 @@ __all__ = [
     "record_pre", "record_post", "record_error", "record_aux_pre", "record_aux_post",
     "record_subagent_start", "record_subagent_stop",
     "record_server_sample", "record_server_samples",
+    "record_decision", "decisions_since", "last_decision", "decisions_for_links",
     "close_own_stale", "close_stale", "sweep",
     "window_rows", "in_flight_rows", "agent_nodes", "model_nodes",
     "server_samples_since", "health",

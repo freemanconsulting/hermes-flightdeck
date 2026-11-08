@@ -76,8 +76,9 @@ def error_kwargs(**over):
 def test_schema_creates(conn):
     tables = {row["name"] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
-    assert {"requests", "subagent_links", "server_samples", "rollups_minute", "meta"} <= tables
-    assert store.meta_get(conn, "schema_version") == "1"
+    assert {"requests", "subagent_links", "server_samples", "rollups_minute", "meta",
+            "decisions"} <= tables
+    assert store.meta_get(conn, "schema_version") == "2"
     indexes = {row["name"] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
     assert {"ix_req_started", "ix_req_status", "ix_req_base", "ix_req_session", "ix_req_model"} <= indexes

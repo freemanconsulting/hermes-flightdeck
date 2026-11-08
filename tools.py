@@ -154,6 +154,7 @@ def fleet_status(window: str = "5m", include_cloud: bool = True, **_: Any) -> st
         "lanes": lanes,
         "cloud": _cloud_lanes(models) if include_cloud else [],
         "pick": _pick(lanes),
+        "routing": _api().routing_block(snapshot),
     }
     return json.dumps(payload, default=str)
 

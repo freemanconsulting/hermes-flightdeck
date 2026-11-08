@@ -55,6 +55,14 @@ DEFAULTS: dict[str, Any] = {
     "show_cloud": True,
     "show_chip": True,
     "show_quota": True,
+    # Capacity routing (CAPACITY.md §8.2).  Off by default; opt-in only.
+    "route_delegation": False,
+    "inner_backend": "default",
+    "reserve_slots": 0,
+    "max_queue": 2,
+    "routing_staleness_seconds": 20,
+    "routing_ledger_seconds": 60,
+    "routing_servers": [],
 }
 
 _PRIVATE_NETS = (
@@ -520,7 +528,133 @@ def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> d
         "show_cloud": _as_bool(settings.get("show_cloud"), True),
         "show_chip": _as_bool(settings.get("show_chip"), True),
         "show_quota": _as_bool(settings.get("show_quota"), True),
+        "route_delegation": _as_bool(settings.get("route_delegation"), False),
+        "inner_backend": str(settings.get("inner_backend") or "default").strip().lower() or "default",
+        "reserve_slots": _as_int(settings.get("reserve_slots"), 0, minimum=0),
+        "max_queue": _as_int(settings.get("max_queue"), 2, minimum=0),
+        "routing_staleness_seconds": _as_int(settings.get("routing_staleness_seconds"), 20, minimum=5),
+        "routing_ledger_seconds": _as_int(settings.get("routing_ledger_seconds"), 60, minimum=0),
+        "routing_servers": _normalize_hidden(settings.get("routing_servers")),
     }
+
+
+def delegation_section(config: Optional[dict] = None) -> dict:
+    """The ``delegation`` config section, read-only; {} when absent."""
+    data = config if isinstance(config, dict) else _read_config()
+    section = data.get("delegation")
+    return dict(section) if isinstance(section, dict) else {}
+
+
+def _model_names(raw: Any) -> list[str]:
+    if isinstance(raw, dict):
+        return [str(key) for key in raw]
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    return []
+
+
+def provider_routes(config: Optional[dict] = None) -> dict[str, dict]:
+    """Provider key, models and extra_body per normalized base_url (CAPACITY.md §4).
+
+    Built from every profile's ``providers.<key>``; an auxiliary-only endpoint
+    is included too, but a provider key on the same base_url wins.  A lane with
+    no provider key is never a routing target (it has no route personality).
+    """
+    routes: dict[str, dict] = {}
+    sources = _config_sources(config)
+    for profile, data in sources:
+        providers = data.get("providers")
+        if not isinstance(providers, dict):
+            continue
+        for key, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            api = entry.get("api") or entry.get("base_url")
+            if not api:
+                continue
+            base_url = normalize_base_url(api)
+            if not base_url:
+                continue
+            models = _model_names(entry.get("models"))
+            existing = routes.get(base_url)
+            if existing is not None:
+                if profile not in existing["profiles"]:
+                    existing["profiles"].append(profile)
+                if not existing["models"] and models:
+                    existing["models"] = models
+                if not existing["default_model"] and entry.get("default_model"):
+                    existing["default_model"] = str(entry["default_model"])
+                if existing["extra_body"] is None and isinstance(entry.get("extra_body"), dict):
+                    existing["extra_body"] = dict(entry["extra_body"])
+                continue
+            routes[base_url] = {
+                "provider": str(key),
+                "base_url": str(api),
+                "default_model": str(entry.get("default_model") or "") or None,
+                "models": models,
+                "extra_body": dict(entry["extra_body"]) if isinstance(entry.get("extra_body"), dict) else None,
+                "profiles": [profile],
+                "aux": False,
+            }
+    # Auxiliary-only endpoints: a provider key on the same base_url wins.
+    for profile, data in sources:
+        auxiliary = data.get("auxiliary")
+        if not isinstance(auxiliary, dict):
+            continue
+        for key, entry in auxiliary.items():
+            if not isinstance(entry, dict):
+                continue
+            urls = [entry.get("base_url")]
+            chain = entry.get("fallback_chain")
+            if isinstance(chain, list):
+                for item in chain:
+                    if isinstance(item, dict):
+                        urls.append(item.get("base_url"))
+            for api in urls:
+                if not api:
+                    continue
+                base_url = normalize_base_url(api)
+                if not base_url:
+                    continue
+                model = short_model_name(entry.get("model"))
+                models = [model] if model else []
+                existing = routes.get(base_url)
+                if existing is not None:
+                    if profile not in existing["profiles"]:
+                        existing["profiles"].append(profile)
+                    if not existing["models"] and models:
+                        existing["models"] = models
+                    continue
+                routes[base_url] = {
+                    "provider": None,
+                    "base_url": str(api),
+                    "default_model": model or None,
+                    "models": models,
+                    "extra_body": dict(entry["extra_body"]) if isinstance(entry.get("extra_body"), dict) else None,
+                    "profiles": [profile],
+                    "aux": True,
+                }
+    return routes
+
+
+def eligible_lanes(servers: list[dict], settings: dict) -> list[dict]:
+    """Local server cards routing may use: not cloud, private URL, not hidden, in routing_servers."""
+    routing = _normalize_hidden(settings.get("routing_servers") if isinstance(settings, dict) else None)
+    hidden = _normalize_hidden(settings.get("hidden_servers") if isinstance(settings, dict) else None)
+    lanes: list[dict] = []
+    for server in servers or []:
+        if not isinstance(server, dict):
+            continue
+        if str(server.get("kind") or "").lower() == "cloud":
+            continue
+        if not _private_url(server.get("base_url")):
+            continue
+        if _is_hidden_server(server, hidden):
+            continue
+        if routing and not _is_hidden_server(server, routing):
+            continue
+        lanes.append(server)
+    return lanes
 
 
 def server_for_url(servers: list[dict], base_url: Any) -> Optional[dict]:
@@ -537,4 +671,5 @@ def server_for_url(servers: list[dict], base_url: Any) -> Optional[dict]:
 __all__ = [
     "DEFAULTS", "DISCOVERY_CACHE_KEY", "DISCOVERY_TTL_SECONDS",
     "normalize_base_url", "is_private_host", "discover", "load", "server_for_url",
+    "delegation_section", "provider_routes", "eligible_lanes",
 ]

@@ -149,19 +149,66 @@ function agentColorMap(servers) {
   return colors
 }
 
+// A session's resolved metadata from session.list: title, preview, source,
+// started_at. Older builds stored a bare title string, so both shapes read.
+function sessionMeta(labels, sessionId) {
+  const entry = labels && labels[sessionId]
+  if (!entry) return null
+  return typeof entry === 'string' ? { title: entry } : entry
+}
+
+// Title first, then the preview's first line, then nothing — the caller falls
+// back to the short id. A date-prefixed id is never a label.
+function sessionTitle(labels, sessionId) {
+  const meta = sessionMeta(labels, sessionId)
+  const title = meta && meta.title
+  if (title) return title
+  const preview = meta && meta.preview
+  if (preview) {
+    const line = String(preview).split('\n')[0].trim()
+    if (line) return line
+  }
+  return ''
+}
+
 // A row's display label. Snapshot labels are always ""; sessions resolve from
 // session.list, subagents from role + goal, cron runs from the job name.
 function agentLabel(row, labels) {
   if (!row) return 'unknown'
-  if (row.kind === 'cron') return row.cron_job ? `cron: ${row.cron_job}` : 'cron run'
+  const title = sessionTitle(labels, row.session_id)
+  if (row.kind === 'cron') {
+    const base = row.cron_job ? `cron: ${row.cron_job}` : 'cron run'
+    return title ? `${base} · ${title}` : base
+  }
   if (row.kind === 'subagent') {
     const role = row.role || 'subagent'
-    return row.goal ? `${role} · ${row.goal}` : role
+    const base = row.goal ? `${role} · ${row.goal}` : role
+    return title ? `${base} · ${title}` : base
   }
-  const title = labels[row.session_id]
   if (title) return title
   const id = String(row.session_id || '')
   return id ? `session ${id.slice(0, 8)}` : 'session'
+}
+
+// "started Nov 4 · active 2m ago" — real timestamps only; a missing piece is
+// omitted rather than rendered as an em dash.
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+function fmtDay(tsSeconds) {
+  if (tsSeconds == null || !Number.isFinite(tsSeconds)) return null
+  const date = new Date(tsSeconds * 1000)
+  return `${MONTHS[date.getMonth()]} ${date.getDate()}`
+}
+
+function sessionActivity(row, labels, now) {
+  const meta = sessionMeta(labels, row.session_id) || {}
+  const parts = []
+  const started = fmtDay(meta.started_at)
+  if (started) parts.push(`started ${started}`)
+  const last = row.last_active_at != null ? row.last_active_at : meta.last_active_at
+  const active = fmtAgo(last, now)
+  if (active !== '—') parts.push(`active ${active}`)
+  return parts.join(' · ')
 }
 
 function serverVerdict(server) {
@@ -208,6 +255,18 @@ function useServers() {
   })
 }
 
+// session.list reaches older and hidden rows with a large limit; the newest-200
+// default window can push a long-lived session out. A row resolves by id,
+// resolved_id (compression tip) or lineage root, so a snapshot id that differs
+// from the stored row still finds its title.
+const LABEL_LIST_PARAMS = { limit: 2000, include_hidden: true }
+
+function routeRank(route, profile) {
+  if (!route) return -1
+  return (route.profile === profile ? 4 : 0) + (route.targetProfile === profile ? 4 : 0)
+    + (route.mode === 'local' ? 2 : 0) + (route.primary ? 1 : 0)
+}
+
 function useSessionLabels(profiles) {
   const key = profiles.join('|')
   return useQuery({
@@ -218,20 +277,35 @@ function useSessionLabels(profiles) {
     queryFn: async () => {
       let routes = []
       try {
-        routes = host.profileRoutes() || []
+        // profileRoutes is async; an un-awaited Promise has no .find and threw
+        // into the catch below, which left every label empty.
+        routes = await host.profileRoutes()
       } catch {
         routes = []
       }
+      routes = Array.isArray(routes) ? routes : []
       const out = {}
       for (const profile of profiles) {
-        const route = routes.find(r => r && (r.profile === profile || r.targetProfile === profile || r.name === profile))
+        const candidates = routes
+          .filter(r => r && (r.profile === profile || r.targetProfile === profile || r.name === profile))
+          .sort((a, b) => routeRank(b, profile) - routeRank(a, profile))
+        const route = candidates[0]
         try {
           const res = route
-            ? await host.requestProfile(route, 'session.list', {})
-            : await host.requestProfile(profile, 'session.list', {})
+            ? await host.requestProfile(route, 'session.list', LABEL_LIST_PARAMS)
+            : await host.requestProfile(profile, 'session.list', LABEL_LIST_PARAMS)
           const rows = res && Array.isArray(res.sessions) ? res.sessions : []
           for (const session of rows) {
-            if (session && session.id) out[session.id] = session.title || ''
+            if (!session || !session.id) continue
+            const meta = {
+              title: session.title || '',
+              preview: session.preview || '',
+              source: session.source || '',
+              started_at: session.started_at || 0
+            }
+            out[session.id] = meta
+            if (session.resolved_id && !out[session.resolved_id]) out[session.resolved_id] = meta
+            if (session._lineage_root_id && !out[session._lineage_root_id]) out[session._lineage_root_id] = meta
           }
         } catch {
           // Labels are a nicety; ids stay readable without them.
@@ -1402,7 +1476,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
     const entries = [...colors.entries()].slice(0, 8)
     return entries.map(([key, color]) => {
       const [profile, session] = key.split('|')
-      const label = labels[session] || (session ? `session ${session.slice(0, 8)}` : profile)
+      const label = sessionTitle(labels, session) || (session ? `session ${session.slice(0, 8)}` : profile)
       return { key, color, label: `${profile} · ${label}` }
     })
   }, [lanes, labels])
@@ -1672,12 +1746,30 @@ function AgentRow({ row, labels, now, depth }) {
   const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
   const models = Array.isArray(row.models) ? row.models : []
   const label = agentLabel(row, labels)
+  const meta = sessionMeta(labels, row.session_id) || {}
+  const source = meta.source || ''
+  // A stored session opens core-style through the SDK; subagent rows keep their
+  // own label (their stored row is not a chat the user opened).
+  const openable = row.kind !== 'subagent' && !!row.session_id && typeof host.openSession === 'function'
+  const open = openable
+    ? () => {
+        try {
+          host.openSession(row.session_id, { profile: row.profile })
+        } catch {
+          // A stale id leaves the row inert; the label still reads.
+        }
+      }
+    : undefined
+  const activity = row.kind === 'subagent' ? '' : sessionActivity(row, labels, now)
   return jsxs('div', {
     'data-agent-row': row.session_id || row.profile || 'agent',
     className: 'flex flex-col',
     children: [
       jsxs('div', {
         className: 'flex items-center gap-2',
+        onClick: open,
+        role: open ? 'button' : undefined,
+        title: open ? `Open ${row.session_id}` : undefined,
         style: {
           paddingLeft: `${depth ? 24 : 8}px`,
           paddingRight: '8px',
@@ -1685,6 +1777,7 @@ function AgentRow({ row, labels, now, depth }) {
           paddingBottom: '2px',
           borderRadius: '4px',
           fontSize: '0.75rem',
+          cursor: open ? 'pointer' : 'default',
           background: inFlight > 0 ? 'var(--ui-row-hover-background)' : 'transparent'
         },
         children: [
@@ -1701,12 +1794,15 @@ function AgentRow({ row, labels, now, depth }) {
               fontWeight: inFlight > 0 ? 600 : 400,
               color: inFlight > 0 ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
             },
-            title: label,
+            title: row.session_id ? `${label} — ${row.session_id}` : label,
             children: label
           }),
           row.kind === 'subagent' || row.kind === 'cron'
             ? jsx(Badge, { variant: 'outline', size: 'xs', children: row.kind })
-            : null,
+            : source
+              ? jsx(Badge, { variant: 'outline', size: 'xs', children: source })
+              : null,
+          routedChip(row),
           jsx(ModelMixBar, { models }),
           jsx('span', {
             'data-col': 'flight',
@@ -1748,6 +1844,22 @@ function AgentRow({ row, labels, now, depth }) {
           })
         ]
       }),
+      activity
+        ? jsx('span', {
+            'data-session-meta': row.session_id,
+            style: {
+              paddingLeft: `${depth ? 24 : 8}px`,
+              paddingRight: '8px',
+              fontSize: '0.625rem',
+              color: 'var(--ui-text-quaternary)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap'
+            },
+            title: row.session_id,
+            children: activity
+          })
+        : null,
       models.map(model => jsx(ModelSubRow, { model, now, depth: true }, model.lane_id))
     ]
   })
@@ -1912,6 +2024,148 @@ function AgentTree({ agents, labels, now }) {
 }
 
 // ---------------------------------------------------------------------------
+// Routing (CAPACITY.md §9): the placement chip on a subagent row and the strip
+// at the top of By model.  The snapshot carries no `state` field: armed, blocked
+// by a backend, off and unavailable are the four real answers.
+
+function routingState(routing) {
+  if (!routing || typeof routing !== 'object') {
+    return {
+      label: 'unavailable',
+      tone: 'muted',
+      title: 'No routing block in this snapshot: capacity routing needs a Flightdeck build with capacity.py.'
+    }
+  }
+  if (routing.armed) {
+    const lanes = Array.isArray(routing.eligible_lanes) ? routing.eligible_lanes : []
+    return {
+      label: 'armed',
+      tone: 'outline',
+      title: lanes.length
+        ? `Routing is armed: delegate_task spills to ${lanes.length} eligible local lane${lanes.length === 1 ? '' : 's'} (${lanes.map(lane => lane.name || lane.base_url).join(', ')}).`
+        : 'Routing is armed: delegate_task spills to a local lane with free slots.'
+    }
+  }
+  if (routing.blocked_by) {
+    return {
+      label: `blocked by ${routing.blocked_by}`,
+      tone: 'warn',
+      title: routing.message ||
+        `Routing is blocked by ${routing.blocked_by}. Switch with \`/delegation flightdeck --now\`.`
+    }
+  }
+  return {
+    label: 'off',
+    tone: 'muted',
+    title: 'Routing is off. Enable it in Settings → Plugins → Flightdeck (route_delegation), then switch with `/delegation flightdeck --now` (or `hermes config set delegation.backend flightdeck`).'
+  }
+}
+
+// A goal is often a whole brief path: the strip shows its first line, clipped,
+// and the full goal rides in the row's tooltip.
+function goalSnippet(goal) {
+  const text = String(goal || '').split('\n')[0].trim()
+  if (!text) return ''
+  return text.length > 48 ? `${text.slice(0, 47)}…` : text
+}
+
+function decisionTooltip(decision) {
+  return [
+    `${decision.action || 'skip'} ${decision.requested_lane || '—'} → ${decision.chosen_lane || 'unrouted'}`,
+    decision.reason,
+    decision.chosen_model ? `model: ${decision.chosen_model}` : null,
+    decision.goal ? `goal: ${decision.goal}` : null
+  ].filter(Boolean).join(' · ')
+}
+
+// The last five placements, one line each: time, from → to, reason, goal.
+function RoutingStrip({ snapshot, now }) {
+  const state = routingState(snapshot.routing)
+  const decisions = (Array.isArray(snapshot.decisions) ? snapshot.decisions : []).slice(0, 5)
+  return jsxs('div', {
+    'data-routing-strip': state.label,
+    className: 'flex flex-col gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        title: state.title,
+        children: [
+          jsx('span', {
+            className: 'text-[0.65rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)',
+            children: 'Routing'
+          }),
+          jsx(Badge, { variant: state.tone, size: 'xs', title: state.title, children: state.label }),
+          jsx('span', {
+            className: 'min-w-0 flex-1 truncate text-[0.625rem] text-(--ui-text-quaternary)',
+            children: decisions.length
+              ? `last ${decisions.length} placement${decisions.length === 1 ? '' : 's'}`
+              : 'no placements in the retention window'
+          })
+        ]
+      }),
+      decisions.length
+        ? jsx('div', {
+            className: 'flex flex-col gap-0.5',
+            children: decisions.map((decision, index) => jsxs('div', {
+              'data-decision': index,
+              className: 'flex items-baseline gap-2 text-[0.625rem]',
+              title: decisionTooltip(decision),
+              children: [
+                jsx('span', {
+                  className: 'shrink-0 tabular-nums text-(--ui-text-quaternary)',
+                  children: fmtAgo(decision.decided_at, now)
+                }),
+                jsx('span', {
+                  className: 'shrink-0 font-mono',
+                  children: `${decision.requested_lane || '—'} → ${decision.chosen_lane || 'unrouted'}`
+                }),
+                jsx('span', {
+                  className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+                  children: decision.reason || '—'
+                }),
+                jsx('span', {
+                  className: 'min-w-0 flex-1 truncate text-(--ui-text-quaternary)',
+                  children: goalSnippet(decision.goal)
+                })
+              ]
+            }, `decision-${index}`))
+          })
+        : null
+    ]
+  })
+}
+
+// A subagent row's placement: the lane it actually ran on, the full reason in
+// the tooltip.  Only rows the store matched to a decision carry `routed`.
+function routedChip(row) {
+  const routed = row && row.routed
+  if (!routed) return null
+  const action = routed.action || 'skip'
+  const lane = routed.lane || routed.requested_lane || '—'
+  const reason = routed.reason || ''
+  const text = action === 'move'
+    ? `routed → ${lane}${reason ? ` (${reason})` : ''}`
+    : action === 'stay'
+      ? `stay ${lane}${reason ? ` (${reason})` : ''}`
+      : `unrouted${reason ? ` (${reason})` : ''}`
+  const title = [
+    reason,
+    routed.model ? `model: ${routed.model}` : null,
+    row.goal ? `goal: ${row.goal}` : null
+  ].filter(Boolean).join(' · ')
+  return jsxs('span', {
+    'data-routed': lane,
+    className: 'inline-flex shrink-0',
+    title: title || text,
+    children: [jsx(Badge, {
+      variant: action === 'move' ? 'outline' : 'muted',
+      size: 'xs',
+      children: text
+    })]
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Page.
 
 function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
@@ -1956,6 +2210,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
   return jsxs('div', {
     className: 'flex flex-col gap-4',
     children: [
+      jsx(RoutingStrip, { snapshot, now }),
       jsx(Section, {
         label: 'Local servers',
         meta: servers.length

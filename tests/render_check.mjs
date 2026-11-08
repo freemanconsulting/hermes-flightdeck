@@ -39,11 +39,13 @@ function useQuery({ queryKey }) {
   return { data, isLoading: false, isError: false, isFetching: false, refetch: () => {} }
 }
 
+const opened = []
 const host = {
   state: { focusedSessionId: atom(null), focusedSessionProfile: atom('default') },
   profileRoutes: () => [{ profile: 'default' }],
   requestProfile: async () => ({ sessions: [] }),
   request: async () => ({}),
+  openSession: (id, opts) => opened.push({ id, opts }),
   navigate: () => {}
 }
 const cn = (...args) => args.filter(Boolean).join(' ')
@@ -182,6 +184,48 @@ const subagentLabel = subagentRow && elements(subagentRow).find(e => e.props.tit
 check('subagent label is role-prefixed and tooltipped', subagentLabel && subagentLabel.props.title.includes('Execute /Users/openclaw/.hermes/cache/scratch/flightdeck-briefs/I2-health-backend.md'), subagentLabel ? subagentLabel.props.title.slice(0, 60) : 'label missing')
 check('subagent label text is one line', subagentLabel && !textOf(subagentLabel).includes('\n'), subagentLabel ? `${textOf(subagentLabel).length} chars` : 'label missing')
 
+// 4b. Session labels: the real title replaces the date id, the source badge and
+//     started/active line render, the full id is tooltipped, and the row opens
+//     the conversation through the SDK.
+const SESSION_ID = '20261104_044650_9024bf'
+const titledSnapshot = JSON.parse(JSON.stringify(fixture))
+titledSnapshot.agents[0].last_active_at = fixture.generated_at - 120
+const titledLabels = {
+  [SESSION_ID]: {
+    title: 'Redefine Gerard role and responsibilities',
+    preview: 'Redefine Gerard??',
+    source: 'desktop',
+    started_at: 1793789991.450546
+  }
+}
+const titledTree = mod.AgentView({ snapshot: titledSnapshot, labels: titledLabels, now: fixture.generated_at * 1000, windowSeconds: 60 })
+const titledText = textOf(titledTree)
+check('session row shows the real title, not the date id',
+  titledText.includes('Redefine Gerard role and responsibilities') && !titledText.includes('session 20261104'),
+  titledText.includes('Redefine Gerard role and responsibilities') ? 'title rendered' : 'title missing')
+check('session row shows the source badge', titledText.includes('desktop'), titledText.includes('desktop') ? 'desktop badge' : 'badge missing')
+check('session row shows started and last activity',
+  titledText.includes('started Nov 4') && titledText.includes('active 2m ago'), titledText.slice(0, 120))
+const idTooltip = elements(titledTree).find(item => item.props.title === SESSION_ID)
+check('session row tooltips the full id', !!idTooltip, idTooltip ? idTooltip.props.title : 'no full-id tooltip')
+const clickable = elements(titledTree).find(item => typeof item.props.onClick === 'function' && item.props['data-agent-row'] == null)
+check('session row is clickable to open the conversation', !!clickable, clickable ? 'onClick present' : 'no onClick')
+if (clickable) clickable.props.onClick()
+check('click opens the session through host.openSession',
+  opened.length === 1 && opened[0].id === SESSION_ID && opened[0].opts.profile === 'default',
+  opened.length ? JSON.stringify(opened[0]) : 'openSession not called')
+const previewTree = mod.AgentView({
+  snapshot: titledSnapshot,
+  labels: { [SESSION_ID]: { title: '', preview: 'First preview line\nsecond line', source: 'signal', started_at: 1793789991.450546 } },
+  now: fixture.generated_at * 1000,
+  windowSeconds: 60
+})
+check('session label falls back to the preview first line',
+  textOf(previewTree).includes('First preview line') && !textOf(previewTree).includes('second line'),
+  textOf(previewTree).slice(0, 100))
+check('session label falls back to the short id with no title or preview',
+  textOf(agentTree).includes('session 20261104'), textOf(agentTree).includes('session 20261104') ? 'short id' : 'missing')
+
 // 5. Local server card health row: one compact line under the slot bar, every
 //    server-side number labelled, missing fields omitted, inline bars for KV and
 //    MTP acceptance. The fixture carries no health block, so this is a copy of
@@ -235,6 +279,109 @@ const page = mod.FlightdeckPage({})
 const pageElements = elements(page)
 const canvas = pageElements.find(item => item.type === 'canvas')
 check('page renders the swim lane canvas', canvas && String(canvas.props['aria-label'] || '').includes('cloud lane'), canvas ? canvas.props['aria-label'].slice(0, 60) : 'canvas missing')
+
+// 7. Routing: the placement chip on a routed subagent row and the Routing strip
+//    at the top of By model (CAPACITY.md §9). The fixture carries no routing
+//    block or decisions, so this is a copy with both seeded.
+const routingSnapshot = JSON.parse(JSON.stringify(fixture))
+routingSnapshot.routing = {
+  armed: true, backend: 'flightdeck', inner_backend: 'default', blocked_by: null, message: '',
+  eligible_lanes: [{ name: 'ds4', base_url: 'http://127.0.0.1:18010' },
+                   { name: 'GN100', base_url: 'http://127.0.0.1:18009' }]
+}
+routingSnapshot.decisions = [
+  { decided_at: fixture.generated_at - 30, action: 'move', requested_lane: 'ds4', chosen_lane: 'GN100',
+    chosen_model: 'qwen38-flash-next-tf-fp4', reason: 'ds4 full 4/4, model qwen38-flash-next-tf-fp4',
+    goal: 'metrics adapters' },
+  { decided_at: fixture.generated_at - 90, action: 'stay', requested_lane: 'ds4', chosen_lane: 'ds4',
+    chosen_model: 'ds4', reason: '2 of 4 slots free, queue empty', goal: 'write the capacity tests' },
+  { decided_at: fixture.generated_at - 150, action: 'skip', requested_lane: 'ds4', chosen_lane: null,
+    chosen_model: null, reason: 'all local lanes full: ds4 4/4, GN100 5/5', goal: 'review the routing chip' },
+  { decided_at: fixture.generated_at - 210, action: 'move', requested_lane: 'ds4', chosen_lane: 'GN100',
+    chosen_model: 'qwen38-flash-next-tf-fp4', reason: 'ds4 queue 2', goal: 'seed the fixture' },
+  { decided_at: fixture.generated_at - 270, action: 'stay', requested_lane: 'ds4', chosen_lane: 'ds4',
+    chosen_model: 'ds4', reason: '1 of 4 slots free, queue empty', goal: 'wire the strip' },
+  { decided_at: fixture.generated_at - 330, action: 'move', requested_lane: 'ds4', chosen_lane: 'GN100',
+    chosen_model: 'qwen38-flash-next-tf-fp4', reason: 'oldest placement', goal: 'must not render' }
+]
+routingSnapshot.agents[0].children[0].routed = {
+  action: 'move', lane: 'GN100', requested_lane: 'ds4',
+  reason: 'ds4 full 4/4, model qwen38-flash-next-tf-fp4',
+  model: 'qwen38-flash-next-tf-fp4', at: fixture.generated_at - 30
+}
+const routedTree = mod.AgentView({ snapshot: routingSnapshot, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60 })
+const routedChipEl = elements(routedTree).find(item => item.props['data-routed'] != null)
+check('routed subagent row carries the routed chip',
+  routedChipEl && routedChipEl.props['data-routed'] === 'GN100' &&
+  textOf(routedChipEl).includes('routed → GN100'),
+  routedChipEl ? textOf(routedChipEl) : 'chip missing')
+check('routed chip tooltips the full reason and goal',
+  routedChipEl && routedChipEl.props.title.includes('ds4 full 4/4, model qwen38-flash-next-tf-fp4') &&
+  routedChipEl.props.title.includes('goal: Execute /Users/openclaw'),
+  routedChipEl ? routedChipEl.props.title.slice(0, 90) : 'chip missing')
+check('only the routed subagent row carries the chip',
+  countIn(routedTree, 'data-routed') === 1, `${countIn(routedTree, 'data-routed')} chips`)
+
+function stripTitle(strip) {
+  const header = elements(strip).find(item => item.props.title && item.props['data-decision'] == null)
+  return header ? header.props.title : ''
+}
+const routingView = mod.ModelView({ snapshot: routingSnapshot, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null })
+const strip = elements(routingView).find(item => item.props['data-routing-strip'] != null)
+check('By model opens with the Routing strip',
+  strip && strip.props['data-routing-strip'] === 'armed',
+  strip ? strip.props['data-routing-strip'] : 'strip missing')
+const stripText = textOf(strip || {})
+check('Routing strip shows the armed state',
+  stripText.includes('Routing') && stripText.includes('armed'), stripText.slice(0, 80))
+check('Routing strip shows the last 5 decisions, not the 6th',
+  countIn(strip, 'data-decision') === 5 && !stripText.includes('must not render'),
+  `${countIn(strip, 'data-decision')} rows`)
+check('Routing strip shows time, from → to, reason and goal',
+  stripText.includes('30s ago') && stripText.includes('ds4 → GN100') &&
+  stripText.includes('ds4 full 4/4, model qwen38-flash-next-tf-fp4') &&
+  stripText.includes('metrics adapters'), stripText.slice(0, 160))
+check('Routing strip shows a skip with no chosen lane as unrouted',
+  stripText.includes('ds4 → unrouted'), stripText.includes('ds4 → unrouted') ? 'skip row' : stripText.slice(0, 160))
+
+const blockedSnapshot = JSON.parse(JSON.stringify(routingSnapshot))
+blockedSnapshot.routing = {
+  armed: false, backend: 'model_map', inner_backend: 'default', blocked_by: 'model_map',
+  message: "Flightdeck routing is on but delegation.backend is 'model_map' (capacity-routing). "
+    + "Switch with `/delegation flightdeck --now` (or `hermes config set delegation.backend flightdeck`).",
+  eligible_lanes: []
+}
+const blockedStrip = elements(mod.ModelView({ snapshot: blockedSnapshot, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+  .find(item => item.props['data-routing-strip'] != null)
+check('Routing strip names the backend that blocks it',
+  blockedStrip && blockedStrip.props['data-routing-strip'] === 'blocked by model_map' &&
+  stripTitle(blockedStrip).includes('/delegation flightdeck --now'),
+  blockedStrip ? stripTitle(blockedStrip).slice(0, 90) : 'strip missing')
+
+const offSnapshot = JSON.parse(JSON.stringify(routingSnapshot))
+offSnapshot.routing = {
+  armed: false, backend: 'flightdeck', inner_backend: 'default', blocked_by: null,
+  message: '', eligible_lanes: []
+}
+const offStrip = elements(mod.ModelView({ snapshot: offSnapshot, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+  .find(item => item.props['data-routing-strip'] != null)
+check('Routing strip says off and tooltips the enable instruction',
+  offStrip && offStrip.props['data-routing-strip'] === 'off' &&
+  stripTitle(offStrip).includes('route_delegation') &&
+  stripTitle(offStrip).includes('/delegation flightdeck --now'),
+  offStrip ? stripTitle(offStrip).slice(0, 90) : 'strip missing')
+
+const unavailableStrip = elements(mod.ModelView({ snapshot: fixture, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+  .find(item => item.props['data-routing-strip'] != null)
+check('Routing strip says unavailable with no routing block',
+  unavailableStrip && unavailableStrip.props['data-routing-strip'] === 'unavailable' &&
+  stripTitle(unavailableStrip).includes('capacity.py'),
+  unavailableStrip ? stripTitle(unavailableStrip).slice(0, 90) : 'strip missing')
 
 const failed = results.filter(item => !item.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)

@@ -41,6 +41,7 @@ class FakeCtx:
         self.hooks: list[tuple[str, object]] = []
         self.tools: list[dict] = []
         self.commands: list[tuple[str, object, dict]] = []
+        self.providers: list[object] = []
         self._settings = settings or {}
         self._cron = cron
 
@@ -57,6 +58,10 @@ class FakeCtx:
 
     def register_command(self, name, handler, **kwargs):
         self.commands.append((name, handler, kwargs))
+        return object()
+
+    def register_delegation_provider(self, provider):
+        self.providers.append(provider)
         return object()
 
     def current_cron_execution(self):

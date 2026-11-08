@@ -581,9 +581,25 @@ SQLite so FastAPI runs them in its threadpool; the poller path is `async`. All r
       "tokens_in": 66000, "tokens_out": 3600, "cached_tokens": 50000,
       "latency_ms_p50": 2000.0, "ttft_ms_p50": 200.0,
       "children": [{"session_id": "s2", "label": "", "kind": "subagent",
-                    "role": "general", "goal": "metrics adapters", "in_flight": 1, "requests_5m": 4}]
+                    "role": "general", "goal": "metrics adapters", "in_flight": 1, "requests_5m": 4,
+                    "routed": {"action": "move", "lane": "GN100", "requested_lane": "ds4",
+                               "reason": "ds4 full 4/4, model qwen38-flash-next-tf-fp4",
+                               "model": "qwen38-flash-next-tf-fp4", "at": 1762540790.0}}]
     }
-  ]
+  ],
+  "decisions": [
+    {"id": 1, "at": 1762540790.0, "action": "move", "task_index": 0,
+     "requested_lane": "ds4", "chosen_lane": "GN100",
+     "requested_model": "ds4", "chosen_model": "qwen38-flash-next-tf-fp4",
+     "reason": "ds4 full 4/4, model qwen38-flash-next-tf-fp4", "stale": false,
+     "goal": "metrics adapters",
+     "lanes": [{"name": "ds4", "slots": 4, "running": 4, "waiting": 0, "queue": 0, "free": 0, "stale": false},
+               {"name": "GN100", "slots": 5, "running": 1, "waiting": 0, "queue": 0, "free": 4, "stale": false}]}
+  ],
+  "routing": {
+    "armed": true, "backend": "flightdeck", "inner_backend": "default",
+    "blocked_by": null, "message": "", "eligible_lanes": ["ds4", "GN100"]
+  }
 }
 ```
 
@@ -596,6 +612,15 @@ unknown, never `0`-as-unknown. `name` is the short card label (declared name →
 `{name, base_url, error, since}`. Declared servers never move there. `servers_source` is
 `declared`|`discovered`|`none` — `discovered` even when discovery found nothing, so the UI can tell
 "discovery is on and empty" from "nothing declared".
+
+`decisions` is always present (`[]` when none): the newest 20 routing decisions inside the
+retention window, newest first, each `{id, at, action, task_index, requested_lane, chosen_lane,
+requested_model, chosen_model, reason, stale, goal, lanes}` with `lanes` the sampled slots at
+decision time. `routing` is always present: `{armed, backend, inner_backend, blocked_by, message,
+eligible_lanes}`; `armed` is true only when routing is on, `delegation.backend` is `flightdeck`
+and `inner_backend` is `default`. A subagent node carries `routed` (`{action, lane,
+requested_lane, reason, model, at}`) only when a decision joins its link by goal within 60 s;
+root sessions and cron nodes never do.
 
 `idle` is always present (`[]` when none): discovered **non-cloud** servers with no Hermes request in the
 retention window (`retention_hours`, default 24 h) and no running/waiting slot, as

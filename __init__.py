@@ -1,8 +1,11 @@
 """Flightdeck plugin entry: open the shared store, register observers and surfaces.
 
 ``register()`` is deliberately only: open store, close this process's stale rows,
-seven observer hooks, one agent tool, one slash command (DESIGN §16.7). No
-network, no threads, no gateway — the capability probe runs this in isolation.
+seven observer hooks, one agent tool, one slash command, and (when this Hermes
+has the public delegation seam) the opt-in ``flightdeck`` delegation provider
+(DESIGN §16.7). No network, no threads, no gateway — the capability probe runs
+this in isolation.  A Hermes without the seam logs one line and registers
+nothing; the rest of the plugin keeps working.
 """
 
 from __future__ import annotations
@@ -22,6 +25,22 @@ tools = _load_sibling("tools", __package__)
 logger = logging.getLogger(__name__)
 
 
+def _register_delegation_provider(ctx, conn) -> None:
+    """Register the opt-in provider only when the public seam exists."""
+    try:
+        from agent.delegation_provider import DelegationProvider  # noqa: F401
+    except ModuleNotFoundError as exc:
+        if exc.name != "agent.delegation_provider":
+            raise
+        logger.info(
+            "flightdeck: delegation provider API absent; capacity routing unavailable on this Hermes")
+        return
+    capacity = _load_sibling("capacity", __package__)
+    config = _load_sibling("config", __package__)
+    ctx.register_delegation_provider(
+        capacity.Provider(lambda: config.load(ctx, conn), conn=conn))
+
+
 def register(ctx) -> None:
     """Called once by the plugin loader."""
     conn = store.open_store()
@@ -37,3 +56,4 @@ def register(ctx) -> None:
         description="One-line fleet status: slots in use, queue, and the recommended lane.",
         args_hint="[1m|5m]",
     )
+    _register_delegation_provider(ctx, conn)
