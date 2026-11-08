@@ -33,7 +33,7 @@ cloud) and per-request attribution.
 
 ## Decisions (Aubrey, 2026-11-07 evening)
 - Capacity-aware delegation: YES (the "acts, not just watches" feature). Design in docs/CAPACITY.md, then one build worker.
-- Public repo + catalog PR: probably Sat 2026-11-08.
+- Public repo + catalog PR: ON HOLD (Aubrey, 2026-11-08) until his notes are worked and it is polished; he gives the go.
 
 ## Working rules
 - Subagents for this project run on **ds4** (`delegate_task option=general`), per Aubrey 2026-11-07. Not GN100.

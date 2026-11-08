@@ -113,6 +113,7 @@ def test_snapshot_shape_is_pinned(conn):
     assert list(agent["models"][0]) == [
         "lane_id", "label", "local", "requests", "in_flight",
         "tokens_in", "tokens_out", "cached_tokens",
+        "latency_ms_p50", "ttft_ms_p50", "errors_5m",
     ]
     assert agent["models"][0]["label"] == "ds4 · qwen38-27b-q4-q8kv-mtp3"
     assert agent["models"][0]["local"] is True
@@ -205,6 +206,33 @@ def test_ttft_and_tokens_formulas(conn):
     assert ds4_model["decode_tps"] == 42.1
     assert ds4_model["prefill_tps"] == 3100.0
     assert ds4_model["slots"] == {"used": 3, "total": 4, "queue": 0}
+
+
+def test_model_subrow_latency_ttft_errors_per_lane(conn):
+    """Per-model p50s are computed per lane, not copied from the node.
+
+    s1 mixes three lanes: the ds4 latency p50 (1000 ms) and TTFT p50 (100 ms)
+    differ from the node's (2000/200), the ds4 lane owns the only error row,
+    and the cron node's GN100 lane has no timing at all -> None, not 0.
+    """
+    agent = next(node for node in snapshot(conn)["agents"] if node["session_id"] == "s1")
+    by_label = {entry["label"]: entry for entry in agent["models"]}
+    ds4 = by_label["ds4 · qwen38-27b-q4-q8kv-mtp3"]
+    gn100 = by_label["GN100 · qwen38-flash-next-tf-fp4"]
+    assert ds4["latency_ms_p50"] == 1000.0 and ds4["ttft_ms_p50"] == 100.0
+    assert gn100["latency_ms_p50"] == 4000.0 and gn100["ttft_ms_p50"] == 500.0
+    # Distinct per lane, and distinct from the node's mixed-lane numbers.
+    assert ds4["latency_ms_p50"] != gn100["latency_ms_p50"]
+    assert ds4["ttft_ms_p50"] != gn100["ttft_ms_p50"]
+    assert agent["latency_ms_p50"] == 2000.0 and agent["ttft_ms_p50"] == 200.0
+    assert ds4["errors_5m"] == 1 and gn100["errors_5m"] == 0
+    # Empty-timing lane (only in-flight rows): null is unknown, never zero.
+    cron = next(node for node in snapshot(conn)["agents"] if node["session_id"] == "cron-nightly-1")
+    cron_gn = cron["models"][0]
+    assert cron_gn["label"] == "GN100 · qwen38-flash-next-tf-fp4"
+    assert cron_gn["requests"] == 1 and cron_gn["in_flight"] == 1
+    assert cron_gn["latency_ms_p50"] is None and cron_gn["ttft_ms_p50"] is None
+    assert cron_gn["errors_5m"] == 0
 
 
 def test_null_is_not_zero(conn):

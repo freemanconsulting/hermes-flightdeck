@@ -1,0 +1,4 @@
+# Test-only deps. Hermes core deps (fastapi, ruamel.yaml, rich, ...) come from
+# hermes-agent's pyproject; these two are not in its core dependency list.
+pytest==9.1.1
+pyyaml==6.0.3

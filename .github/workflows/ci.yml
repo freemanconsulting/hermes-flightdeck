@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Hermes CLI
+        run: |
+          # Main is the only ref at or above the plugin's requires_hermes >=0.21.6
+          # (the newest release tag, v2026.9.24, is 0.21.5).
+          # Clone outside the repo: a checkout inside it would be collected by pytest
+          # and scanned by validate's isolation audit as plugin code.
+          git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          # Editable install: the wheel/sdist build is deliberately guarded upstream.
+          python -m pip install -e "$RUNNER_TEMP/hermes-agent" --no-deps
+          # Install the CLI's runtime deps from its own pyproject. browser-harness is
+          # dropped because it pins pillow==12.3.0 while hermes pins Pillow==13.0.0;
+          # the CLI and these tests do not import it.
+          python - <<'PY' > "$RUNNER_TEMP/hermes-deps.txt"
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pyproject = Path(os.environ["RUNNER_TEMP"]) / "hermes-agent" / "pyproject.toml"
+          deps = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+          print("\n".join(d for d in deps if not d.startswith("browser-harness")))
+          PY
+          python -m pip install -r "$RUNNER_TEMP/hermes-deps.txt" -r tests/requirements.txt
+
+      - name: pytest
+        run: python -m pytest -q
+
+      - name: node render check
+        run: node tests/render_check.mjs
+
+      - name: hermes plugins validate
+        working-directory: ${{ runner.temp }}
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: hermes plugins validate "$GITHUB_WORKSPACE"

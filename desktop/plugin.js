@@ -1647,7 +1647,8 @@ function tokenColText(node) {
 
 // One indented sub-row per model an agent used in the window: a local/cloud
 // dot, the lane label, and the model's own columns. Per-model latency, TTFT and
-// errors are not in the snapshot yet, so they render as "—".
+// errors come from the snapshot's model entries (null renders as "—"), using the
+// same formatters, data-col names and widths as the parent agent row.
 function ModelSubRow({ model, now, depth }) {
   const inFlight = model.in_flight || 0
   return jsxs('div', {

@@ -178,6 +178,24 @@ const emptyColumns = [...agentRows, ...modelRows].filter(item =>
 )
 check('no column renders empty', agentRows.length + modelRows.length > 0 && emptyColumns.length === 0, `${emptyColumns.length} rows with empty columns`)
 
+// 3b. Model sub-row timing columns: the captured fixture predates the
+//     per-model latency/ttft/errors fields, so inject them into a cloned node
+//     and require the sub-row to render the values, not the "—" fallback.
+const timingFixture = structuredClone(fixture)
+const timingAgent = timingFixture.agents.find(node => (node.models || []).length > 0)
+timingAgent.models[0] = { ...timingAgent.models[0], latency_ms_p50: 1234.0, ttft_ms_p50: 56.0, errors_5m: 2 }
+const timingTree = mod.AgentView({ snapshot: timingFixture, labels, now: fixture.generated_at * 1000, windowSeconds: 60 })
+const timingModelRow = elements(timingTree)
+  .filter(item => item.props['data-model-row'] != null)
+  .find(item => textOf(item).includes(timingAgent.models[0].label))
+const colText = col => {
+  const span = timingModelRow && elements(timingModelRow).find(e => e.props['data-col'] === col)
+  return span ? textOf(span).trim() : null
+}
+check('model sub-row renders per-model latency/ttft/errors', timingModelRow != null
+  && colText('lat') === '1.2s' && colText('ttft') === '56ms' && colText('err') === '2',
+  timingModelRow ? `lat=${colText('lat')} ttft=${colText('ttft')} err=${colText('err')}` : 'sub-row missing')
+
 // 4. Subagent labels: one line, full text in the tooltip, role prefixed.
 const subagentRow = agentRows.find(item => item.props['data-agent-row'] === '20261107_174026_d25bb8')
 const subagentLabel = subagentRow && elements(subagentRow).find(e => e.props.title && e.props.title.startsWith('leaf · '))

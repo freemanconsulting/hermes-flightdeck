@@ -705,6 +705,9 @@ def _agent_models(items: list[dict], server_by_url: dict[str, dict]) -> list[dic
     cloud lane, so the UI can merge chips across sessions and profile rows.
     """
     grouped: dict[str, dict] = {}
+    # Timing/error samples per lane, kept out of the returned dicts and
+    # finalized into p50/error counts after the loop.
+    timings: dict[str, dict] = {}
     for row in items:
         base_url = normalize_base_url(row.get("base_url"))
         # Same rule as ``_lane_for``: a card decides by kind, else the address
@@ -726,12 +729,29 @@ def _agent_models(items: list[dict], server_by_url: dict[str, dict]) -> list[dic
                 "requests": 0, "in_flight": 0,
                 "tokens_in": 0, "tokens_out": 0, "cached_tokens": 0,
             }
+            timings[lane_id] = {"latencies": [], "ttfts": [], "errors": 0}
         entry["requests"] += 1
         if row.get("status") == "in-flight":
             entry["in_flight"] += 1
+        if row.get("status") == "error":
+            timings[lane_id]["errors"] += 1
         entry["tokens_in"] += _int_or_none(row.get("prompt_tokens")) or 0
         entry["tokens_out"] += _int_or_none(row.get("completion_tokens")) or 0
         entry["cached_tokens"] += _int_or_none(row.get("cached_tokens")) or 0
+        # Same formulas as the node-level latency/ttft in ``_agent_tree``.
+        row_started = _num(row.get("started_at"))
+        first = _num(row.get("first_chunk_at"))
+        ended = _num(row.get("ended_at"))
+        latency = _latency(row_started, ended)
+        if latency is not None:
+            timings[lane_id]["latencies"].append(latency * 1000.0)
+        if row_started is not None and first is not None and first >= row_started:
+            timings[lane_id]["ttfts"].append((first - row_started) * 1000.0)
+    for lane_id, entry in grouped.items():
+        sample = timings[lane_id]
+        entry["latency_ms_p50"] = _round(_percentile(sample["latencies"], 50), 1)
+        entry["ttft_ms_p50"] = _round(_percentile(sample["ttfts"], 50), 1)
+        entry["errors_5m"] = sample["errors"]
     return sorted(grouped.values(), key=lambda entry: (-entry["in_flight"], -entry["requests"],
                                                        entry["label"]))
 
