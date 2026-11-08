@@ -472,10 +472,10 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
                 entry["oldest_started_at"] = started
 
         in_flight_count = len(held)
-        # The swim-lane's rows: in-flight plus ended in the last 60 s, newest
-        # first, capped per server (DESIGN §9.1).
+        # The swim-lane's rows: in-flight plus ended in the selected window,
+        # newest first, capped per server (DESIGN §9.1).
         lane = sorted(lane_rows.get(base_url, []),
-                      key=lambda item: _num(item.get("started_at")) or 0, reverse=True)[:50]
+                      key=lambda item: _num(item.get("started_at")) or 0, reverse=True)[:200]
         cards.append({
             "name": sample.get("name") or _host_port(base_url),
             "title": sample.get("title"),
@@ -513,12 +513,14 @@ def _row_kind(row: dict) -> str:
     return "session"
 
 
-def _request_rows(conn: sqlite3.Connection, now: float) -> list[dict]:
-    """Rows the swim-lane draws: every in-flight row plus rows ended in the last 60 s."""
+def _request_rows(conn: sqlite3.Connection, now: float,
+                  window_seconds: float = 300.0) -> list[dict]:
+    """Rows the swim-lane draws: every in-flight row plus rows ended in the
+    selected window (the page's 1m/5m selector — not a hardcoded 60 s)."""
     return _dict_rows(conn.execute(
         "SELECT * FROM requests WHERE status = 'in-flight' "
         "OR (ended_at IS NOT NULL AND ended_at >= ?) ORDER BY started_at DESC",
-        (float(now) - 60.0,),
+        (float(now) - max(float(window_seconds), 0.0),),
     ))
 
 
@@ -704,23 +706,26 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
 
         # Per-request swim-lane rows. Cloud lanes have no server card to hang
         # them on, so the model card carries them itself: same selection
-        # (in-flight + ended in the last 60 s), same attribution as
+        # (in-flight + ended in the selected window), same attribution as
         # ``requests_buckets`` (the window group's model/provider/base_url —
         # cloud groups are keyed by normalized base_url, so rows written under
         # ``https://api.anthropic.com/v1`` match a card opened at any other
-        # path on the same host), same per-card cap as the server cards (50),
+        # path on the same host), same per-card cap as the server cards (200),
         # oldest first.
         # Local model entries stay ``[]`` — the keys are pinned uniform so the
         # UI can read ``requests`` on any entry — and their rows live on the
         # server card.
         if lane == "cloud":
+            # Newest-first so the cap keeps the most recent rows, then sort
+            # back to ascending for output.
             model_requests = sorted(
                 (row for row in lane_rows
                  if (row.get("model") or "") == model
                  and str(row.get("provider") or "") == key_provider
                  and normalize_base_url(row.get("base_url")) == base_url),
-                key=lambda row: _num(row.get("started_at")) or 0,
-            )[-50:]
+                key=lambda row: -(_num(row.get("started_at")) or 0),
+            )[:200]
+            model_requests.sort(key=lambda row: _num(row.get("started_at")) or 0)
         else:
             model_requests = []
 
@@ -1103,7 +1108,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
     if session_info is None:
         session_info = _session_info(rows)
 
-    server_cards = _server_cards(samples, _request_rows(conn, now), in_flight, sample_rows, now)
+    server_cards = _server_cards(samples, _request_rows(conn, now, window_seconds), in_flight, sample_rows, now)
     # Dead-server noise (DESIGN §7.2): a discovered server that is unreachable
     # and served no request in the window is not a card — it is one line in
     # `unreachable`. Declared servers always stay in `servers`.
@@ -1145,7 +1150,7 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
                 kept.append(card)
         server_cards = kept
     model_cards = _model_cards(rows, server_cards, now, window_seconds,
-                               lane_rows=_request_rows(conn, now))
+                               lane_rows=_request_rows(conn, now, window_seconds))
     links = _subagent_links(conn)
     routed = _routed_for_links(conn, links)
     agent_nodes = _agent_tree(rows, links,
@@ -1214,6 +1219,8 @@ def build_servers(*, servers: Any = None, conn: sqlite3.Connection | None = None
     member.  Defaults to the discovered rule; the dashboard passes the real
     source so a declared server keeps its card.
     """
+    # No window selector of its own: the card lane rows use the same default
+    # the page's 5m view uses.
     snapshot = build_snapshot(300, servers=servers, conn=conn, now=now,
                               servers_source=servers_source or "discovered")
     return {"servers": snapshot["servers"], "unreachable": snapshot["unreachable"]}

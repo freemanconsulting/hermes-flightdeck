@@ -45,7 +45,14 @@ def conn(tmp_path):
 def snapshot(conn, **kw):
     kw.setdefault("servers", make_example.server_samples())
     kw.setdefault("now", NOW)
-    return api.build_snapshot(300, conn=conn, **kw)
+    return api.build_snapshot(kw.pop("window_seconds", 300), conn=conn, **kw)
+
+
+def snapshot_window(conn, window_seconds, **kw):
+    """The page's 1m/5m selector: build_snapshot with an explicit window."""
+    kw.setdefault("servers", make_example.server_samples())
+    kw.setdefault("now", NOW)
+    return api.build_snapshot(window_seconds, conn=conn, **kw)
 
 
 def card(snapshot_payload, name):
@@ -198,14 +205,17 @@ def test_agent_rows_tolerate_missing_state_db_and_columns(conn, monkeypatch, tmp
 
 
 def test_server_requests_rows_shape_and_selection(conn):
-    """`requests`: every in-flight row plus rows ended in the last 60 s, newest first."""
+    """`requests` (window 60 — the page's 1m view): every in-flight row plus
+    rows ended in the selected window, newest first.  The window follows
+    build_snapshot's ``window_seconds``; see test_lane_rows_follow_the_window_selector
+    for the 5m view."""
     make_example.insert_request(
         conn, id="default|4242|d3", session_id="s1", api_request_id="d3",
         model=make_example.DS4_MODEL, provider="main-llm", base_url=DS4 + "/v1",
         started_at=NOW - 40, first_chunk_at=NOW - 39.5, ended_at=NOW - 5,
         status="done", prompt_tokens=1000, cached_tokens=200, completion_tokens=50,
     )
-    ds4 = card(snapshot(conn), "ds4")
+    ds4 = card(snapshot(conn, window_seconds=60), "ds4")
     rows = ds4["requests"]
     assert list(rows[0]) == [
         "id", "profile", "session_id", "parent_session_id", "kind", "model", "started_at",
@@ -251,7 +261,7 @@ def test_cloud_model_requests_rows(conn):
         started_at=NOW - 10, first_chunk_at=NOW - 9.5, ended_at=NOW - 8,
         status="done",
     )
-    payload = snapshot(conn)
+    payload = snapshot(conn, window_seconds=60)
     cloud = model(payload, f"anthropic|{make_example.CLOUD_MODEL}")
     assert cloud["lane"] == "cloud"
     rows = cloud["requests"]
@@ -969,3 +979,61 @@ def test_poller_health_delta_ignores_a_counter_reset():
     assert cur["prefix_cache_hit_rate"] == 0.9
     assert cur["spec_accept_rate"] == 0.6
     assert cur["preemptions_delta"] is None and cur["disconnects_delta"] is None
+
+
+def test_lane_rows_follow_the_window_selector(conn):
+    """A request that ended 3 minutes ago is in the card lane only for a window
+    wide enough to cover it — the 5m view shows 5 minutes, not 60 seconds."""
+    make_example.insert_request(
+        conn, id="default|4242|w3", session_id="s1", api_request_id="w3",
+        model=make_example.DS4_MODEL, provider="main-llm", base_url=DS4 + "/v1",
+        started_at=NOW - 200, first_chunk_at=NOW - 199.5, ended_at=NOW - 180,
+        status="done",
+    )
+    ids_5m = {row["id"] for row in card(snapshot_window(conn, 300), "ds4")["requests"]}
+    ids_1m = {row["id"] for row in card(snapshot_window(conn, 60), "ds4")["requests"]}
+    assert "default|4242|w3" in ids_5m
+    assert "default|4242|w3" not in ids_1m
+
+
+def test_lane_row_cap_keeps_the_newest(conn):
+    """210 finished rows on one server: the 200-row cap drops the OLDEST —
+    the most recent request must always be drawn."""
+    for i in range(210):
+        make_example.insert_request(
+            conn, id=f"default|4242|fan{i}", session_id="s1", api_request_id=f"fan{i}",
+            model=make_example.DS4_MODEL, provider="main-llm", base_url=DS4 + "/v1",
+            started_at=NOW - 290 + i, first_chunk_at=NOW - 289.5 + i, ended_at=NOW - 290 + i,
+            status="done",
+        )
+    rows = card(snapshot_window(conn, 300), "ds4")["requests"]
+    assert len(rows) == 200
+    # The three seeded in-flight ds4 rows sit at the top; the 15 oldest
+    # seeded ds4 rows fall off the 200-row cap (fan0..fan15 dropped).
+    assert [row["id"] for row in rows[:3]] == [
+        "default|4242|r2", "default|4242|r3", "default|4242|r1",
+    ]
+    assert rows[3]["id"] == "default|4242|fan209"  # the newest survives
+    assert rows[4]["id"] == "default|4242|fan208"
+    assert rows[-1]["id"] == "default|4242|fan16"  # oldest kept (fan0..fan15 dropped)
+    assert rows == sorted(rows, key=lambda row: row["started_at"], reverse=True)
+
+
+def test_cloud_lane_cap_keeps_the_newest(conn):
+    """The cloud model card's `requests` cap keeps the newest rows too, and the
+    output stays ascending by started_at."""
+    for i in range(210):
+        make_example.insert_request(
+            conn, id=f"default|4242|cf{i}", session_id="s1", api_request_id=f"cf{i}",
+            model=make_example.CLOUD_MODEL, provider="anthropic",
+            base_url=make_example.ANTHROPIC + "/v1",
+            started_at=NOW - 290 + i, first_chunk_at=NOW - 289.5 + i, ended_at=NOW - 290 + i,
+            status="done",
+        )
+    rows = model(snapshot_window(conn, 300), f"anthropic|{make_example.CLOUD_MODEL}")["requests"]
+    assert len(rows) == 200
+    # The seeded in-flight c1 row is the newest row; the 13 oldest fan rows
+    # (cf0..cf12) fall off the cap along with the two seeded cloud rows.
+    assert rows[0]["id"] == "default|4242|cf12"  # oldest kept
+    assert rows[-1]["id"] == "default|4242|c1"  # the newest (in-flight) survives
+    assert rows == sorted(rows, key=lambda row: row["started_at"])

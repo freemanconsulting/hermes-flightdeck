@@ -196,6 +196,29 @@ const cloudRowCtx = { ...fakeCtx, fillRect() { cloudRowDraw.fillRect += 1 }, str
 mod.drawSwimLane(cloudRowCtx, 900, 190, cloudRows.lanes, cloudRows.win, cloudRowCtx, labels)
 check('cloud lane right label reads peak 3', cloudRowDraw.fillText.includes('peak 3'),
   cloudRowDraw.fillText.filter(t => String(t).startsWith('peak')).join(', '))
+
+// 2c. A 150-request fan-out must draw the NEWEST request, not the oldest:
+//     requestRows used to .slice(0, 40), keeping the 40 OLDEST rows.
+const manyRequests = Array.from({ length: 150 }, (_, i) => ({
+  id: `many-${i}`, started_at: win.end - 150 + i, first_chunk_at: win.end - 149 + i,
+  ended_at: win.end - 146 + i, profile: 'default', session_id: 's1',
+  status: 'done', model: cloudRowModel.model, prompt_tokens: 100, completion_tokens: 20,
+}))
+const manyClone = JSON.parse(JSON.stringify(fixture))
+const manyModel = manyClone.models.find(m => m.lane === 'cloud')
+manyModel.requests = manyRequests
+const manyRows = mod.swimLanes(manyClone, 300, fixture.generated_at * 1000)
+const manyLane = manyRows.lanes.find(lane => lane.kind === 'cloud' && (lane.requests || []).length > 40)
+check('lane given 150 requests keeps rows past the old 40-row slice',
+  manyLane && manyLane.bars.length > 40,
+  manyLane ? `${manyLane.bars.length} bars` : 'lane missing')
+const manyIds = manyLane ? (manyLane.requests || []).map(row => row.id) : []
+check('lane given 150 requests keeps the newest row in its bars',
+  manyLane && manyIds.includes('many-149') && manyLane.bars.some(bar => bar.request && bar.request.id === 'many-149'),
+  manyLane ? (manyIds.includes('many-149') ? 'many-149 drawn' : 'newest row dropped') : 'lane missing')
+check('lane given 150 requests drops the OLDEST rows under the cap, not the newest',
+  manyLane && !manyIds.includes('many-0'),
+  manyLane ? (manyIds.includes('many-0') ? 'oldest kept — cap wrong' : 'oldest dropped') : 'lane missing')
 check('local lane right labels carry peak and slots',
   drawn.fillText.some(t => /^peak \d+$/.test(String(t))) && drawn.fillText.some(t => /^of \d+ slots$/.test(String(t))),
   drawn.fillText.filter(t => /^peak \d+$/.test(String(t)) || /^of \d+ slots$/.test(String(t))).join(', '))

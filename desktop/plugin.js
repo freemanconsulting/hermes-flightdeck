@@ -1316,7 +1316,8 @@ function swimLanes(snapshot, windowSeconds, now) {
   const requestRows = rows => (Array.isArray(rows) ? rows : [])
     .filter(row => row && row.started_at != null && (row.ended_at == null || row.ended_at >= win.start))
     .sort((a, b) => a.started_at - b.started_at)
-    .slice(0, 40)
+    // Newest-first: backend caps can drop the oldest, never the most recent.
+    .slice(-120)
   for (const server of servers) {
     if (!server || server.kind === 'cloud') continue
     const requests = requestRows(server.requests)
