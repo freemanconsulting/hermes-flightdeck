@@ -55,6 +55,41 @@ function fmtRate(value) {
   return value.toFixed(1)
 }
 
+// ---------------------------------------------------------------------------
+// Provider/model labels — the ONE place a model string becomes display text.
+// A provider/model such as 'claude-subscription-directsdk-experimental/claude-
+// opus-5-5' renders as just the model half; the full string always rides in the
+// title tooltip.  Every card, sub-row and swim-lane label routes through here.
+const MODEL_SHORT_MAX = 48
+
+// 'provider/model' (or a bare model) → short display text.  A model name can
+// itself carry slashes (org/collection names), so prefer the split on the LAST
+// '/' of 'provider/model'; if what follows is still unreasonably long, take the
+// last segment.
+function modelDisplayName(value) {
+  const text = String(value == null ? '' : value)
+  if (!text) return 'model'
+  const index = text.lastIndexOf('/')
+  const tail = index >= 0 ? text.slice(index + 1) : text
+  if (!tail) return text.replace(/\//g, ' · ')
+  return tail.length > MODEL_SHORT_MAX ? tail.split('/').pop() : tail
+}
+
+// The display half of a lane/model label's `model` field, which may already be
+// 'provider/model'.
+function laneModelShort(value) {
+  const text = String(value == null ? '' : value)
+  return text ? modelDisplayName(text) : 'model'
+}
+
+// Tooltip form: the full 'provider/model', one slash, no spaces.
+function fullModelLabel(provider, model) {
+  const prov = String(provider || '').trim()
+  const mod = String(model || '').trim()
+  if (prov && mod) return `${prov}/${mod}`
+  return mod || prov || 'model'
+}
+
 function fmtMs(value) {
   if (value == null) return '—'
   if (value < 1000) return `${Math.round(value)}ms`
@@ -171,17 +206,43 @@ function sessionTitle(labels, sessionId) {
   return ''
 }
 
+// Row-first label resolution. The snapshot now carries the row's own title /
+// label / source / started_at read from that profile's state.db, so those win;
+// session.list labels are the fallback, then the caller's date-id fallback.
+function rowTitle(row) {
+  const own = row && (row.title || (row.label && String(row.label).trim()))
+  if (own) return String(own)
+  return sessionTitle(null, row && row.session_id)
+}
+
+function rowSource(row) {
+  const own = row && row.source
+  if (own) return String(own)
+  const meta = sessionMeta(null, row && row.session_id)
+  return (meta && meta.source) || ''
+}
+
+function rowStartedAt(row) {
+  const own = row && row.started_at
+  if (own != null) return own
+  const meta = sessionMeta(null, row && row.session_id)
+  return (meta && meta.started_at) || null
+}
+
 // A row's display label. Snapshot labels are always ""; sessions resolve from
 // session.list, subagents from role + goal, cron runs from the job name.
 function agentLabel(row, labels) {
   if (!row) return 'unknown'
-  const title = sessionTitle(labels, row.session_id)
+  // The row's own title/label from state.db wins; session.list is the fallback.
+  const title = rowTitle(row) || sessionTitle(labels, row.session_id)
   if (row.kind === 'cron') {
     const base = row.cron_job ? `cron: ${row.cron_job}` : 'cron run'
     return title ? `${base} · ${title}` : base
   }
   if (row.kind === 'subagent') {
-    const role = row.role || 'subagent'
+    // The raw internal role 'leaf' is jargon; readers care that it is a
+    // subagent. 'orchestrator' (and any future named role) stays as-is.
+    const role = !row.role || row.role === 'leaf' ? 'subagent' : row.role
     const base = row.goal ? `${role} · ${row.goal}` : role
     return title ? `${base} · ${title}` : base
   }
@@ -203,7 +264,7 @@ function fmtDay(tsSeconds) {
 function sessionActivity(row, labels, now) {
   const meta = sessionMeta(labels, row.session_id) || {}
   const parts = []
-  const started = fmtDay(meta.started_at)
+  const started = fmtDay(rowStartedAt(row) ?? meta.started_at)
   if (started) parts.push(`started ${started}`)
   const last = row.last_active_at != null ? row.last_active_at : meta.last_active_at
   const active = fmtAgo(last, now)
@@ -219,7 +280,10 @@ function serverVerdict(server) {
   if (server.waiting > 0) return { label: 'queueing', variant: 'warn', tone: 'warn' }
   if (used >= server.slots) return { label: 'saturated', variant: 'warn', tone: 'warn' }
   if (server.slots > 0 && used / server.slots >= 0.5) return { label: 'busy', variant: 'default', tone: 'good' }
-  return { label: 'spare', variant: 'success', tone: 'good' }
+  // 'spare' on a server with 1/5 slots busy said nothing; the free count is the
+  // number a reader wants. saturated/queueing/busy keep their own wording.
+  const free = Math.max(0, (server.slots != null ? server.slots : 0) - used)
+  return { label: `${free} free`, variant: 'success', tone: 'good' }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,8 +538,8 @@ function ServerHealth({ health }) {
     if (ttftP50 != null) parts.push(`p50 ${ttftP50}`)
     if (ttftP95 != null) parts.push(`p95 ${ttftP95}`)
     items.push(jsx('span', {
-      title: 'time to first token from the server\'s own histogram — p50 median and p95; server-side numbers cover ALL traffic, not just Hermes',
-      children: `TTFT ${parts.join(' / ')}`
+      title: "time to first token from the server's own /metrics histogram — p50 median and p95. Server-side numbers cover ALL traffic hitting the server, not just requests from this machine's Hermes",
+      children: `server TTFT ${parts.join(' / ')}`
     }))
   }
   const tpot = health.server_tpot_p50 != null ? `${Math.round(health.server_tpot_p50 * 1000)} ms` : null
@@ -490,6 +554,30 @@ function ServerHealth({ health }) {
     items.push(jsx('span', {
       title: 'device memory the engine holds; server-side, all traffic',
       children: `mem ${mem}`
+    }))
+  }
+  // Preemptions/disconnects were rendered nowhere, so the check below could
+  // never see them; a server that preempted a request should say so.
+  const preempt = health.preemptions_delta != null
+    ? `${health.preemptions_delta} preempted${health.preemptions_total != null ? ` (of ${health.preemptions_total})` : ''}`
+    : health.preemptions_total
+      ? `${health.preemptions_total} preempted`
+      : null
+  if (preempt) {
+    items.push(jsx('span', {
+      title: 'requests the engine preempted (evicted to free KV) in the last sample interval, and its lifetime total; server-side, all traffic',
+      children: preempt
+    }))
+  }
+  const drops = health.disconnects_delta != null
+    ? `${health.disconnects_delta} dropped${health.disconnects_total != null ? ` (of ${health.disconnects_total})` : ''}`
+    : health.disconnects_total
+      ? `${health.disconnects_total} dropped`
+      : null
+  if (drops) {
+    items.push(jsx('span', {
+      title: 'client connections dropped in the last sample interval, and the lifetime total; server-side, all traffic',
+      children: drops
     }))
   }
   if (!items.length) return null
@@ -766,16 +854,14 @@ function ServerCard({ server, models, labels, now }) {
             title: 'prompt tokens processed per second before the first token'
           }),
           jsx(Metric, {
-            label: 'latency p50',
+            label: 'Hermes latency p50',
             value: fmtMs(latency),
-            title: 'request duration (median)'
+            title: "request duration (median) as observed by this machine's Hermes — only the requests Hermes sent, unlike the server-side numbers in the health row"
           }),
           jsx(Metric, {
-            label: 'TTFT p50',
+            label: 'Hermes TTFT p50',
             value: fmtMs(ttft),
-            title: `${wholeResponse
-              ? 'time to first token (median) — not applicable: this server returns whole responses'
-              : 'time to first token (median)'}${busiest && busiest.provider_aliases && busiest.provider_aliases.length > 1 ? ` · providers: ${busiest.provider_aliases.join(', ')}` : ''}`
+            title: `time to first token (median) as observed by this machine's Hermes — only the requests Hermes sent, unlike the server's own /metrics quantiles in the health row${wholeResponse ? '; not applicable: this server returns whole responses' : ''}${busiest && busiest.provider_aliases && busiest.provider_aliases.length > 1 ? ` · providers: ${busiest.provider_aliases.join(', ')}` : ''}`
           }),
           jsx(Metric, {
             label: 'in flight',
@@ -1194,7 +1280,8 @@ function swimLanes(snapshot, windowSeconds, now) {
       kind: 'cloud',
       id: `cloud:${model.key || model.provider}`,
       label: `${model.provider || 'cloud'} / ${model.model || 'model'}`,
-      detail: `cloud · ${fmtInt(model.streamed)} streamed · ${fmtInt(model.non_streamed)} whole response`,
+      // Short enough for the 124 px left gutter: the long form truncated.
+      detail: `${fmtInt(model.requests_1m || model.total || total)} req · ${fmtInt(model.streamed)} streamed`,
       model,
       requests: [],
       bars: bucketTicks(buckets, win),
@@ -1214,6 +1301,27 @@ function swimLanes(snapshot, windowSeconds, now) {
 // decode; a whole response (no first chunk) is one uniform hatched bar. Cloud
 // lanes draw the 15 s request buckets as ticks. The faint throughput trace keeps
 // its own right-side scale (max tok/s).
+// A lane's right-side scale labels, sized to their widest rendering. Measured
+// with the drawing context (the gutter is computed inside the draw, where the
+// ctx exists), so '1 concurrent request' and 'max 50.0 tok/s out' never clip.
+function laneRightLabels(lane) {
+  if (lane.kind === 'cloud') {
+    return [
+      `${fmtInt(lane.total)} req`,
+      '15s buckets',
+      '0 req'
+    ]
+  }
+  return [
+    `${lane.concurrency} concurrent request${lane.concurrency === 1 ? '' : 's'}`,
+    `max ${fmtRate(lane.maxDecode)} tok/s out`,
+    '0 tok/s'
+  ]
+}
+
+const RIGHT_GUTTER_MIN = 60
+const RIGHT_GUTTER_PAD = 18
+
 function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
   const style = getComputedStyle(canvas)
   const accent = style.getPropertyValue('--ui-accent').trim() || 'currentColor'
@@ -1222,7 +1330,18 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
   const text = style.getPropertyValue('--ui-text-tertiary').trim() || 'currentColor'
 
   const gutter = 124
-  const right = 56
+  // Right gutter: wide enough for the widest right-side scale label of any lane
+  // ('1 concurrent request', 'max 50.0 tok/s out'), measured with the real
+  // font.  A fixed 56 px clipped those labels at the canvas edge.
+  let right = RIGHT_GUTTER_MIN
+  if (lanes.length) {
+    ctx2.font = '9px sans-serif'
+    for (const lane of lanes) {
+      right = Math.max(right, ...laneRightLabels(lane).map(
+        label => Math.ceil((ctx2.measureText(label).width || 0) + RIGHT_GUTTER_PAD)
+      ))
+    }
+  }
   const axisH = 16
   const top = 4
   const plotW = Math.max(40, width - gutter - right)
@@ -1247,6 +1366,9 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     const lane = lanes[li]
     const y = top + li * laneH
     const innerH = laneH - 6
+    // The exact strings this lane paints on its right edge — the same strings
+    // the gutter was measured from, so they can never clip.
+    const rightLabels = laneRightLabels(lane)
 
     ctx2.fillStyle = 'transparent'
     ctx2.strokeStyle = stroke
@@ -1257,12 +1379,12 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
       // Throughput history: decode bright area + line, prefill dim line, faint.
       const samples = lane.samples
       let maxDecode = 0
+      let maxPrefill = 0
+      for (const s of samples) {
+        if (s[1] > maxDecode) maxDecode = s[1]
+        if (s[2] > maxPrefill) maxPrefill = s[2]
+      }
       if (samples.length >= 2) {
-        let maxPrefill = 0
-        for (const s of samples) {
-          if (s[1] > maxDecode) maxDecode = s[1]
-          if (s[2] > maxPrefill) maxPrefill = s[2]
-        }
         const baseY = y + innerH - 4
         const plotH = innerH - 12
         const decodePath = []
@@ -1273,7 +1395,7 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
           prefillPath.push([x, baseY - (maxPrefill > 0 ? (s[2] / maxPrefill) * plotH : 0)])
         }
         ctx2.save()
-        ctx2.globalAlpha = 0.10
+        ctx2.globalAlpha = 0.100
         ctx2.fillStyle = accent
         ctx2.beginPath()
         ctx2.moveTo(decodePath[0][0], baseY)
@@ -1360,15 +1482,37 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
         ctx2.fillText(String(slot + 1), gutter + 3, barTop + slot * (barH + barGap) + barH / 2)
       }
 
+      // Idle local lane: no in-flight and nothing decoded recently — draw a flat
+      // zero baseline plus a muted 'idle' label instead of leaving the decode/
+      // prefill sparkline area blank.
+      if (!lane.bars.length && !(lane.requestRows || []).length && maxDecode <= 0) {
+        const flatY = y + innerH - 4
+        ctx2.save()
+        ctx2.strokeStyle = stroke
+        ctx2.globalAlpha = 0.7
+        ctx2.lineWidth = 1
+        ctx2.beginPath()
+        ctx2.moveTo(gutter + 1, flatY + 0.5)
+        ctx2.lineTo(gutter + plotW, flatY + 0.5)
+        ctx2.stroke()
+        ctx2.restore()
+        ctx2.save()
+        ctx2.fillStyle = dim
+        ctx2.font = '9px sans-serif'
+        ctx2.globalAlpha = 0.85
+        ctx2.fillText('idle', gutter + plotW / 2 - 8, y + innerH / 2 + 3)
+        ctx2.restore()
+      }
+
       // Right edge: concurrency and the throughput trace's own scale.
       ctx2.fillStyle = text
       ctx2.font = '600 10px sans-serif'
-      ctx2.fillText(`${lane.concurrency} concurrent`, gutter + plotW + 6, y + 10)
+      ctx2.fillText(rightLabels[0], gutter + plotW + 6, y + 10)
       ctx2.fillStyle = dim
       ctx2.font = '9px sans-serif'
       if (maxDecode > 0) {
-        ctx2.fillText(`max ${fmtRate(maxDecode)} tok/s`, gutter + plotW + 6, y + 22)
-        ctx2.fillText('0 tok/s', gutter + plotW + 6, y + innerH - 6)
+        ctx2.fillText(rightLabels[1], gutter + plotW + 6, y + 22)
+        ctx2.fillText(rightLabels[2], gutter + plotW + 6, y + innerH - 6)
       }
     } else {
       // Cloud lane: one tick per 15 s bucket with traffic, height by count.
@@ -1391,11 +1535,11 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
       ctx2.restore()
       ctx2.fillStyle = text
       ctx2.font = '600 10px sans-serif'
-      ctx2.fillText(`${fmtInt(lane.total)} req`, gutter + plotW + 6, y + 10)
+      ctx2.fillText(rightLabels[0], gutter + plotW + 6, y + 10)
       ctx2.fillStyle = dim
       ctx2.font = '9px sans-serif'
-      ctx2.fillText('15s buckets', gutter + plotW + 6, y + 22)
-      ctx2.fillText('0 req', gutter + plotW + 6, y + innerH - 6)
+      ctx2.fillText(rightLabels[1], gutter + plotW + 6, y + 22)
+      ctx2.fillText(rightLabels[2], gutter + plotW + 6, y + innerH - 6)
     }
 
     // Lane label in the gutter: local/cloud first, then the lane's own name.
@@ -1404,7 +1548,8 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     ctx2.fillText(truncateText(ctx2, lane.kind, gutter - 14), 8, y + 10)
     ctx2.fillStyle = text
     ctx2.font = '600 11px sans-serif'
-    ctx2.fillText(truncateText(ctx2, lane.label, gutter - 14), 8, y + 24)
+    // Provider prefixes never make the gutter — a lane shows its model half.
+    ctx2.fillText(truncateText(ctx2, laneModelShort(lane.label), gutter - 14), 8, y + 24)
     ctx2.fillStyle = dim
     ctx2.font = '10px sans-serif'
     ctx2.fillText(truncateText(ctx2, lane.detail, gutter - 14), 8, y + 36)
@@ -1474,10 +1619,22 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
   const legend = useMemo(() => {
     const colors = agentColorMap(lanes.filter(lane => lane.kind === 'local').map(lane => lane.server))
     const entries = [...colors.entries()].slice(0, 8)
+    // Same label builder as the By agent rows, so the legend and the tree never
+    // read differently. Two sessions can still share a title (e.g. two
+    // untitled 'default' sessions) — disambiguate with the id tail.
+    const seen = new Map()
     return entries.map(([key, color]) => {
       const [profile, session] = key.split('|')
-      const label = sessionTitle(labels, session) || (session ? `session ${session.slice(0, 8)}` : profile)
-      return { key, color, label: `${profile} · ${label}` }
+      const row = { kind: 'session', profile, session_id: session }
+      const base = agentLabel(row, labels) || (session ? `session ${session.slice(0, 8)}` : profile)
+      const label = `${profile} · ${base}`
+      const n = (seen.get(label) || 0) + 1
+      seen.set(label, n)
+      return {
+        key,
+        color,
+        label: n > 1 && session ? `${label} · ${session.slice(-6)}` : label
+      }
     })
   }, [lanes, labels])
 
@@ -1747,8 +1904,8 @@ function AgentRow({ row, labels, now, depth }) {
   const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
   const models = Array.isArray(row.models) ? row.models : []
   const label = agentLabel(row, labels)
-  const meta = sessionMeta(labels, row.session_id) || {}
-  const source = meta.source || ''
+  // Row's own source from state.db first, session.list as fallback.
+  const source = rowSource(row) || (sessionMeta(labels, row.session_id) || {}).source || ''
   // A stored session opens core-style through the SDK; subagent rows keep their
   // own label (their stored row is not a chat the user opened).
   const openable = row.kind !== 'subagent' && !!row.session_id && typeof host.openSession === 'function'
@@ -1792,10 +1949,12 @@ function AgentRow({ row, labels, now, depth }) {
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
-              fontWeight: inFlight > 0 ? 600 : 400,
+              // Root rows (session / cron) read bold whatever their kind;
+              // subagent rows keep the lighter weight of the tree's second level.
+              fontWeight: depth ? 400 : 600,
               color: inFlight > 0 ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
             },
-            title: row.session_id ? `${label} — ${row.session_id}` : label,
+            title: row.kind === 'subagent' && row.goal ? `${label} — goal: ${row.goal}` : (row.session_id ? `${label} — ${row.session_id}` : label),
             children: label
           }),
           row.kind === 'subagent' || row.kind === 'cron'
@@ -1905,6 +2064,7 @@ function AgentTree({ agents, labels, now }) {
           jsx('span', { className: 'min-w-0 flex-1', children: 'agent' }),
           jsx('span', {
             style: { width: `${MIX_WIDTH}px`, flex: '0 0 auto', textAlign: 'right' },
+            title: 'Share of this row\'s requests per model. Each model lane is assigned one colour from a fixed 8-colour palette by hashing its lane id, so the same model keeps the same colour in every row; segment width is that model\'s share of the row\'s requests.',
             children: 'mix'
           }),
           ...AGENT_COLUMNS.map(col =>
@@ -2169,6 +2329,14 @@ function routedChip(row) {
 // ---------------------------------------------------------------------------
 // Page.
 
+// The snapshot's own reason for an empty page, in the same vocabulary the
+// backend uses (api._empty_reason). Only trusted when there is nothing to show.
+const EMPTY_REASON_TEXT = {
+  no_servers_configured: 'No model servers configured. Add servers in Settings → Plugins → Flightdeck, or turn on demo_mode to see sample data.',
+  servers_unreachable: 'Configured servers are not reachable.',
+  no_traffic: 'No model traffic yet. Rows appear the moment an agent talks to a model.'
+}
+
 function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
   // A declared cloud endpoint is a lane, not a local server: it has no gauge
   // and belongs in the cloud cards, never in the local capacity section.
@@ -2197,13 +2365,18 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
         : 'No local model server declared. Add one under Settings → Plugins → Flightdeck.'
 
   if (!servers.length && !models.length) {
+    // Name the reason the backend gave for the empty page, when it still
+    // matches the board (agents/servers arrived since the snapshot → generic copy).
+    const reason = EMPTY_REASON_TEXT[snapshot && snapshot.empty_reason]
+    const stillEmpty = !servers.length && !(snapshot && (snapshot.agents || []).length)
     return jsx(EmptyState, {
       title: unreachable.length
         ? 'No local servers reachable.'
         : source === 'discovered'
           ? 'No local model servers found.'
           : 'No model traffic in the last 5 minutes.',
-      description: noServersText || 'Declare a model server in Settings → Plugins, or start a session that calls a model.',
+      description: (reason && stillEmpty) ? reason
+        : (noServersText || 'Declare a model server in Settings → Plugins, or start a session that calls a model.'),
       className: 'py-10'
     })
   }
@@ -2394,6 +2567,16 @@ function FlightdeckPage() {
         className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
         children: 'live air-traffic control'
       }),
+      // Seeded-sample-data marker: without it a demo snapshot reads as real
+      // traffic on a machine that has none.
+      snapshot && snapshot.demo
+        ? jsx(Badge, {
+            variant: 'muted',
+            size: 'xs',
+            title: 'Seeded sample data — turn off demo_mode in Settings → Plugins → Flightdeck',
+            children: 'demo data'
+          })
+        : null,
       jsxs('div', {
         className: 'ml-auto flex flex-wrap items-center gap-2 text-[0.6875rem]',
         children: [

@@ -32,8 +32,8 @@ const useRef = initial => ({ current: initial })
 function useQuery({ queryKey }) {
   const kind = queryKey[1]
   let data = null
-  if (kind === 'snapshot') data = fixture
-  else if (kind === 'servers') data = { servers: fixture.servers, totals: fixture.totals, show_chip: true }
+  if (kind === 'snapshot') data = querySnapshot
+  else if (kind === 'servers') data = { servers: querySnapshot.servers, totals: querySnapshot.totals, show_chip: true }
   else if (kind === 'labels') data = labels
   else if (kind === 'quota') data = null
   return { data, isLoading: false, isError: false, isFetching: false, refetch: () => {} }
@@ -51,6 +51,16 @@ const host = {
 const cn = (...args) => args.filter(Boolean).join(' ')
 const profileColor = () => 'var(--ui-accent)'
 const Component = props => (props && props.children != null ? props.children : null)
+// Keep props for components whose attributes the assertions read.
+// Plain functions (the walker calls them with props) that keep every prop on a
+// visitable element; EmptyState surfaces title/description as text.
+const Badge = function Badge(props) {
+  return { type: 'badge', props: { ...(props || {}) } }
+}
+const EmptyState = function EmptyState(props) {
+  const { title, description, ...rest } = props || {}
+  return { type: 'empty-state', props: { ...rest, title, description, children: [title, ' ', description] } }
+}
 // jsx(type, props, key?) builds an element the walker can visit; the SDK
 // components above are plain functions the walker calls with props.
 const jsx = (type, props) => ({ type, props: props || {} })
@@ -63,14 +73,14 @@ const factory = new Function(
   'atom', 'Badge', 'Button', 'Codicon', 'EmptyState', 'ErrorState', 'ScrollArea', 'SegmentedControl',
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
-  'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, drawSwimLane, swimLanes }`
+  'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs', 'window',
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, drawSwimLane, swimLanes, Section }`
 )
 const mod = factory(
-  atom, Component, Component, Component, Component, Component, Component, Component,
+  atom, Badge, Component, Component, EmptyState, Component, Component, Component,
   Component, Component, cn, host, profileColor, useQuery, useValue,
   'palette', 'routes', 'sidebar', 'statusbar',
-  useEffect, useMemo, useRef, useState, jsx, jsxs
+  useEffect, useMemo, useRef, useState, jsx, jsxs, globalThis
 )
 
 // --- tree helpers -------------------------------------------------------------
@@ -117,6 +127,7 @@ function countIn(node, attr) {
 // --- assertions ---------------------------------------------------------------
 
 const results = []
+let querySnapshot = fixture
 function check(name, ok, detail) {
   results.push({ name, ok: !!ok, detail })
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`)
@@ -198,7 +209,7 @@ check('model sub-row renders per-model latency/ttft/errors', timingModelRow != n
 
 // 4. Subagent labels: one line, full text in the tooltip, role prefixed.
 const subagentRow = agentRows.find(item => item.props['data-agent-row'] === '20261107_174026_d25bb8')
-const subagentLabel = subagentRow && elements(subagentRow).find(e => e.props.title && e.props.title.startsWith('leaf · '))
+const subagentLabel = subagentRow && elements(subagentRow).find(e => e.props.title && e.props.title.startsWith('subagent · '))
 check('subagent label is role-prefixed and tooltipped', subagentLabel && subagentLabel.props.title.includes('Execute /Users/openclaw/.hermes/cache/scratch/flightdeck-briefs/I2-health-backend.md'), subagentLabel ? subagentLabel.props.title.slice(0, 60) : 'label missing')
 check('subagent label text is one line', subagentLabel && !textOf(subagentLabel).includes('\n'), subagentLabel ? `${textOf(subagentLabel).length} chars` : 'label missing')
 
@@ -271,15 +282,15 @@ const healthBars = elements(healthCard).filter(item => item.props.style && item.
 const barFills = healthBars.map(item => elements(item).find(e => e.props.style && /%$/.test(String(e.props.style.width)))?.props.style.width)
 check('health line draws inline KV and MTP accept bars', healthBars.length === 2 && barFills.join(',') === '70%,68%',
   `${healthBars.length} bars: ${barFills.join(', ')}`)
-const healthLabels = ['KV', 'prefix hit', 'MTP accept', 'TTFT', 'TPOT', 'mem']
+const healthLabels = ['KV', 'prefix hit', 'MTP accept', 'server TTFT', 'TPOT', 'mem']
 const untooltipped = healthLabels.filter(label =>
   !elements(healthCard).some(item => item.props.title && textOf(item).startsWith(label))
 )
 check('health items carry plain-word tooltips', untooltipped.length === 0,
   untooltipped.length ? `no tooltip: ${untooltipped.join(', ')}` : healthLabels.join(', '))
-const ttftItem = elements(healthCard).find(item => item.props.title && textOf(item).startsWith('TTFT'))
+const ttftItem = elements(healthCard).find(item => item.props.title && textOf(item).startsWith('server TTFT'))
 check('TTFT tooltip says server-side numbers cover all traffic',
-  ttftItem && ttftItem.props.title.includes('ALL traffic') && ttftItem.props.title.includes('not just Hermes'),
+  ttftItem && ttftItem.props.title.includes('ALL traffic') && ttftItem.props.title.includes('not just'),
   ttftItem ? ttftItem.props.title.slice(0, 90) : 'TTFT item missing')
 const kvOnly = JSON.parse(JSON.stringify(healthServer))
 kvOnly.health = { kv_cache_usage: 0.7 }
@@ -400,6 +411,75 @@ check('Routing strip says unavailable with no routing block',
   unavailableStrip && unavailableStrip.props['data-routing-strip'] === 'unavailable' &&
   stripTitle(unavailableStrip).includes('capacity.py'),
   unavailableStrip ? stripTitle(unavailableStrip).slice(0, 90) : 'strip missing')
+
+// 8. Row-carried metadata (state.db): a session row with its own title and no
+//    session.list labels must render that title, its source, and its started day.
+const rowMetaSnapshot = JSON.parse(JSON.stringify(fixture))
+const ROW_META_ID = '20261108_073655_dd0211'
+const rowMetaAgent = rowMetaSnapshot.agents.find(node => node.kind === 'session')
+rowMetaAgent.session_id = ROW_META_ID
+rowMetaAgent.title = 'Flightdeck hackathon'
+rowMetaAgent.source = 'cli'
+rowMetaAgent.started_at = 1793789991.450546
+const rowMetaTree = mod.AgentView({ snapshot: rowMetaSnapshot, labels: {}, now: fixture.generated_at * 1000, windowSeconds: 60 })
+const rowMetaText = textOf(rowMetaTree)
+check('agent row prefers the snapshot row title over the date-id fallback',
+  rowMetaText.includes('Flightdeck hackathon') && !rowMetaText.includes(`session ${ROW_META_ID.slice(0, 8)}`),
+  rowMetaText.includes('Flightdeck hackathon') ? 'row title rendered' : 'row title missing')
+check('agent row renders the snapshot row source badge', rowMetaText.includes('cli'),
+  rowMetaText.includes('cli') ? 'cli badge' : 'source badge missing')
+check('agent row renders the snapshot row started day', rowMetaText.includes('started Nov 4'),
+  rowMetaText.includes('started Nov 4') ? 'started Nov 4' : rowMetaText.slice(0, 120))
+
+// 9. demo badge (page header) + empty_reason copy (By model empty state).
+const demoSnapshot = JSON.parse(JSON.stringify(fixture))
+demoSnapshot.demo = true
+querySnapshot = demoSnapshot
+const demoPageText = textOf(mod.FlightdeckPage({}))
+querySnapshot = fixture
+check('page header shows the demo data badge when snapshot.demo', demoPageText.includes('demo data'),
+  demoPageText.includes('demo data') ? 'demo badge' : 'badge missing')
+const demoBadge = elements(mod.FlightdeckPage({})).find(item => textOf(item).trim() === 'demo data')
+querySnapshot = demoSnapshot
+const demoBadgeNode = elements(mod.FlightdeckPage({})).find(item => item.props.title && textOf(item).trim() === 'demo data')
+querySnapshot = fixture
+check('demo badge tooltips the demo_mode switch',
+  demoBadgeNode && demoBadgeNode.props.title.includes('demo_mode') && demoBadgeNode.props.title.includes('Settings → Plugins → Flightdeck'),
+  demoBadgeNode ? demoBadgeNode.props.title.slice(0, 80) : 'badge tooltip missing')
+const noDemoText = textOf(mod.ModelView({ snapshot: fixture, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+check('no demo badge when snapshot.demo is unset', !noDemoText.includes('demo data'),
+  noDemoText.includes('demo data') ? 'unexpected badge' : 'clean')
+const noServersSnapshot = JSON.parse(JSON.stringify(fixture))
+noServersSnapshot.servers = []
+noServersSnapshot.models = []
+noServersSnapshot.agents = []
+noServersSnapshot.unreachable = []
+noServersSnapshot.idle = []
+noServersSnapshot.servers_source = 'none'
+noServersSnapshot.empty_reason = 'no_servers_configured'
+querySnapshot = noServersSnapshot
+const emptyText = textOf(mod.ModelView({ snapshot: noServersSnapshot, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))
+querySnapshot = fixture
+check('empty state names empty_reason=no_servers_configured',
+  emptyText.includes('No model servers configured. Add servers in Settings → Plugins → Flightdeck, or turn on demo_mode to see sample data.'),
+  emptyText.slice(0, 140))
+
+// 10. Server capacity badge says the free count, not 'spare'.
+const freeServer = JSON.parse(JSON.stringify(fixture.servers[0]))
+freeServer.running = 1
+freeServer.slots = 5
+freeServer.waiting = 0
+freeServer.in_flight = 1
+const freeText = textOf(mod.ServerCard({ server: freeServer, models: fixture.models, labels, now: fixture.generated_at * 1000 }))
+check('capacity badge shows the free count when slots are open',
+  freeText.includes('4 free') && !freeText.includes('spare'), freeText.slice(0, 120))
+
+// 11. Cloud lane left-gutter detail stays short: '<n> req · <m> streamed'.
+const cloudDetail = cloudLanes.find(lane => /\d+ req · \d+ streamed/.test(lane.detail || ''))
+check('cloud lane detail is the short req/streamed form', !!cloudDetail,
+  cloudLanes.map(l => l.detail).join(' | '))
 
 const failed = results.filter(item => !item.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)
