@@ -227,6 +227,24 @@ function agentKey(row) {
   return `${(row && row.profile) || ''}|${(row && row.session_id) || ''}`
 }
 
+// snapshot.agents indexed by session id, walking the WHOLE tree: subagent rows
+// are nested under their parent as `children` (and deeper), so a map of the
+// roots alone leaves nested sessions unresolvable. Shared by the swim-lane
+// legend and the cloud card's holder line — both label a session id that only
+// appears in an agent row, and both must resolve to the same row.
+function agentRowBySession(snapshot) {
+  const rowBySession = new Map()
+  const visitAgentRow = row => {
+    if (!row || typeof row !== 'object') return
+    if (row.session_id && !rowBySession.has(row.session_id)) {
+      rowBySession.set(row.session_id, row)
+    }
+    if (Array.isArray(row.children)) row.children.forEach(visitAgentRow)
+  }
+  ;(Array.isArray(snapshot && snapshot.agents) ? snapshot.agents : []).forEach(visitAgentRow)
+  return rowBySession
+}
+
 function agentColorMap(rows) {
   const colors = new Map()
   let next = 0
@@ -240,6 +258,16 @@ function agentColorMap(rows) {
     }
   }
   return colors
+}
+
+// A request's generation span [first chunk, end]; null when the row never
+// streamed (no first chunk, or a first chunk at/after the end — the same
+// predicate the swim lane hatches with). Reused by the in-flight row's
+// generating-bar start and by the cloud card's tok/s bins.
+function requestGenStart(row) {
+  if (!row || row.first_chunk_at == null) return null
+  if (isWholeResponse(row)) return null
+  return row.first_chunk_at
 }
 
 // A session's resolved metadata from session.list: title, preview, source,
@@ -658,6 +686,51 @@ function ServerHealth({ health }) {
   })
 }
 
+// Same cells as the local card's slot gauge, filled by percentage: a plan
+// window is the same kind of "N of a fixed allowance consumed" reading, so it
+// wears the same face. Colour escalates as the allowance runs out.
+function UsageBar({ percent }) {
+  const cells = []
+  const pct = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0
+  const used = Math.max(0, Math.min(24, Math.round((pct / 100) * 24)))
+  const tone = pct >= 90
+    ? 'bg-(--ui-destructive)'
+    : pct >= 75
+      ? 'bg-(--ui-warning)'
+      : 'bg-(--ui-accent)'
+  for (let i = 0; i < 24; i += 1) {
+    cells.push(
+      jsx(
+        'span',
+        {
+          className: cn(
+            'h-3 w-2 rounded-[1.5px] transition-colors duration-500',
+            i < used
+              ? tone
+              : 'bg-(--ui-bg-tertiary) shadow-[inset_0_0_0_1px_var(--ui-stroke-secondary)]'
+          ),
+          title: i < used ? 'allowance used' : 'allowance left'
+        },
+        `usage-${i}`
+      )
+    )
+  }
+  return jsx('span', { className: 'inline-flex items-center gap-[3px]', children: cells })
+}
+
+// Plan-window reset time in the user's locale: a clock time today/tomorrow,
+// weekday + time once it is more than a day out.
+const RESET_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+function fmtResetTime(resetAtSeconds) {
+  if (resetAtSeconds == null || !Number.isFinite(resetAtSeconds)) return null
+  const date = new Date(resetAtSeconds * 1000)
+  if (!Number.isFinite(date.getTime())) return null
+  const clock = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  const days = (resetAtSeconds - Date.now() / 1000) / 86400
+  return days > 1 ? `${RESET_WEEKDAYS[date.getDay()]} ${clock}` : clock
+}
+
 function SlotBar({ total, running, waiting }) {
   if (total == null) {
     return jsx('span', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'no slot gauge' })
@@ -1002,10 +1075,87 @@ function ServerCard({ server, models, labels, now }) {
   })
 }
 
-function CloudCard({ model, labels, now, windowSeconds }) {
+// Plan usage from the snapshot's `quota` block (the backend fills it; may be
+// null). One row per window — label, the slot-gauge bar filled by used_percent,
+// '42% used · resets 3:10 PM'. A window with a null used_percent still shows
+// its label and reset, never a fake fill. `unavailable_reason` is one honest
+// muted line; a null quota renders nothing at all.
+function PlanUsage({ quota }) {
+  if (!quota || typeof quota !== 'object') return null
+  const windows = Array.isArray(quota.windows)
+    ? quota.windows.filter(w => w && typeof w === 'object')
+    : []
+  if (!windows.length && !quota.unavailable_reason) return null
+  const planText = [
+    quota.plan ? quota.title ? `${quota.plan} · ${quota.title}` : quota.plan : (quota.title || null),
+    quota.source ? `via ${quota.source}` : null,
+    quota.fetched_at != null ? `updated ${fmtAgo(quota.fetched_at, Date.now() / 1000)}` : null
+  ].filter(Boolean).join(' · ')
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      windows.map((window, index) => {
+        const used = Number.isFinite(window.used_percent)
+          ? Math.max(0, Math.min(100, window.used_percent))
+          : null
+        const reset = fmtResetTime(window.reset_at)
+        const text = used == null
+          ? (reset ? `resets ${reset}` : 'no usage reported')
+          : (reset ? `${Math.round(used)}% used · resets ${reset}` : `${Math.round(used)}% used`)
+        return jsxs('div', {
+          className: 'flex items-center gap-2 text-[0.65rem]',
+          children: [
+            jsx('span', {
+              className: 'w-14 shrink-0 truncate text-(--ui-text-tertiary)',
+              children: window.label || `window ${index + 1}`
+            }),
+            used == null
+              ? jsx('span', {
+                  className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+                  children: 'no usage reported'
+                })
+              : jsx(UsageBar, { percent: used }),
+            jsx('span', {
+              className: 'tabular-nums text-(--ui-text-secondary)',
+              children: text
+            }),
+            window.detail
+              ? jsx('span', {
+                  className: 'min-w-0 truncate text-(--ui-text-quaternary)',
+                  children: window.detail
+                })
+              : null
+          ]
+        }, `${window.label || 'window'}-${index}`)
+      }),
+      planText
+        ? jsx('span', {
+            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            children: planText
+          })
+        : null,
+      quota.unavailable_reason
+        ? jsx('span', {
+            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            children: `plan usage unavailable: ${quota.unavailable_reason}`
+          })
+        : null
+    ]
+  })
+}
+
+function CloudCard({ model, labels, now, windowSeconds, snapshot }) {
   const quotaQ = useQuota(model.provider)
-  const quota = quotaLine(quotaQ.data, model.provider)
-  const plan = planLine(quotaQ.data)
+  // The snapshot's own quota block wins; the live session.stats gauge is only
+  // a fallback for a lane the snapshot has no quota for.
+  const quota = model.quota != null ? null : quotaLine(quotaQ.data, model.provider)
+  const plan = model.quota != null ? null : planLine(quotaQ.data)
+  // `now` is ms (useNow); the tok/s series wants seconds.
+  const winEnd = now / 1000
+  const samples = cloudSamplesFromRequests(model.requests || [], winEnd - windowSeconds, winEnd)
+  const bucketValue = Array.isArray(model.requests_buckets)
+    && model.requests_buckets.some(n => Number(n) > 0)
+  const rowBySession = agentRowBySession(snapshot)
   const inFlight = model.in_flight || 0
   const tokens = model.tokens || {}
   const streamed = model.streamed || 0
@@ -1083,6 +1233,7 @@ function CloudCard({ model, labels, now, windowSeconds }) {
           })
         ]
       }),
+      jsx(PlanUsage, { quota: model.quota }),
       quota || plan
         ? jsxs('div', {
             className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
@@ -1096,13 +1247,21 @@ function CloudCard({ model, labels, now, windowSeconds }) {
         className: 'flex items-end gap-3 border-t border-(--ui-stroke-secondary) pt-1.5',
         children: [
           jsxs('div', {
-            className: 'min-w-0 flex-1 flex flex-col gap-0.5',
+            className: 'min-w-0 flex-1 flex items-center gap-2',
             children: [
-              jsx('span', {
-                className: 'text-[0.6rem] text-(--ui-text-quaternary)',
-                children: `requests, last ${fmtDuration(windowSeconds)}`
+              jsx('div', {
+                className: 'min-w-0 flex-1',
+                children: samples.length
+                  ? jsx(Sparkline, { samples })
+                  : (bucketValue ? jsx(RequestSparkline, { buckets: model.requests_buckets }) : null)
               }),
-              jsx(RequestSparkline, { buckets: model.requests_buckets })
+              jsx('span', {
+                className: 'shrink-0 text-[0.6rem] text-(--ui-text-quaternary)',
+                title: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
+                children: samples.length
+                  ? `decode / prefill · ${fmtDuration(windowSeconds)} · Hermes-observed`
+                  : `requests, last ${fmtDuration(windowSeconds)}`
+              })
             ]
           }),
           jsxs('div', {
@@ -1113,7 +1272,7 @@ function CloudCard({ model, labels, now, windowSeconds }) {
               }),
               jsx('span', {
                 children: model.agents && model.agents.length
-                  ? model.agents.map(a => agentLabel(a, labels)).join(' · ')
+                  ? model.agents.map(a => agentLabel(rowBySession.get(a.session_id) || a, labels)).join(' · ')
                   : 'no in-flight request observed'
               })
             ]
@@ -1265,6 +1424,8 @@ function swimWindow(snapshot, windowSeconds, now) {
 // No streamed output: no first chunk at all, or a first token at/after the end
 // (minus a quarter-second of slack). A non-streamed response has nothing honest
 // to show as 'generating', so it draws as the hatched whole-response bar.
+// THIS is the single streamed predicate: the canvas hatches a bar exactly when
+// this is true, and the lane's 'n streamed' count is the rows where it is false.
 function isWholeResponse(request) {
   if (!request) return true
   const first = request.first_chunk_at
@@ -1274,10 +1435,76 @@ function isWholeResponse(request) {
   return first >= end - 0.25
 }
 
-// An agent actually streamed output: a first token at least a quarter second
-// before the end (or a first token on a still-running request).
-function isStreamedRow(request) {
-  return !!request && request.first_chunk_at != null && !isWholeResponse(request)
+// The cloud card's decode/prefill series, derived from Hermes' OWN per-request
+// rows — the provider publishes no server throughput for a cloud lane, so this
+// is the only honest tok/s history a cloud card can show. Each row spreads its
+// completion tokens uniformly over its generating span (first_chunk_at →
+// ended_at, or `winEnd` — which the caller passes as `now` — while in flight; a
+// non-streamed row — no first chunk, or one at/after the end minus a
+// quarter-second of slack — spreads them over the whole span instead) and its
+// prompt tokens uniformly over the prefill span (started_at → first_chunk_at,
+// or the whole span when non-streamed). Buckets are 5 s wide over the rows' own
+// span, so the output has the exact shape the local cards' Sparkline consumes:
+// [bucketStart, decodeTokPerSec, prefillTokPerSec].
+const CLOUD_SAMPLE_SECONDS = 5
+
+function cloudSamplesFromRequests(requests, winStart, winEnd) {
+  const rows = (Array.isArray(requests) ? requests : []).filter(
+    row => row && row.started_at != null
+  )
+  if (!rows.length) return []
+  let lo = winStart
+  let hi = winEnd
+  for (const row of rows) {
+    if (row.started_at < lo) lo = row.started_at
+    const end = row.ended_at != null ? row.ended_at : winEnd
+    if (end > hi) hi = end
+  }
+  const span = Math.max(CLOUD_SAMPLE_SECONDS, hi - lo)
+  const buckets = Math.max(2, Math.ceil(span / CLOUD_SAMPLE_SECONDS))
+  const decode = new Array(buckets).fill(0)
+  const prefill = new Array(buckets).fill(0)
+  // Spread `tokens` uniformly over [from, to] clipped to the window, so every
+  // bucket it touches gets the tokens proportional to the overlap.
+  const spread = (from, to, tokens, into) => {
+    if (!(tokens > 0) || !(to > from)) return
+    const a = Math.max(from, lo)
+    const b = Math.min(to, hi)
+    if (!(b > a)) return
+    const perSecond = tokens / (to - from)
+    let i = Math.max(0, Math.floor((a - lo) / CLOUD_SAMPLE_SECONDS))
+    const last = Math.min(buckets - 1, Math.floor((b - lo) / CLOUD_SAMPLE_SECONDS))
+    for (; i <= last; i += 1) {
+      const bucketStart = lo + i * CLOUD_SAMPLE_SECONDS
+      const overlap = Math.min(b, bucketStart + CLOUD_SAMPLE_SECONDS) - Math.max(a, bucketStart)
+      if (overlap > 0) into[i] += perSecond * overlap
+    }
+  }
+  for (const row of rows) {
+    const start = row.started_at
+    const end = row.ended_at != null ? row.ended_at : winEnd
+    if (!(end > start)) continue
+    const streamed = !isWholeResponse(row)
+    const genStart = streamed ? row.first_chunk_at : start
+    spread(genStart, end, row.completion_tokens, decode)
+    spread(start, streamed ? row.first_chunk_at : end, row.prompt_tokens, prefill)
+  }
+  let maxDecode = 0
+  let maxPrefill = 0
+  for (let i = 0; i < buckets; i += 1) {
+    decode[i] = decode[i] / CLOUD_SAMPLE_SECONDS
+    prefill[i] = prefill[i] / CLOUD_SAMPLE_SECONDS
+    if (decode[i] > maxDecode) maxDecode = decode[i]
+    if (prefill[i] > maxPrefill) maxPrefill = prefill[i]
+  }
+  if (maxDecode <= 0 && maxPrefill <= 0) return []
+  const samples = []
+  for (let i = 0; i < buckets; i += 1) {
+    if (decode[i] > 0 || prefill[i] > 0) {
+      samples.push([lo + i * CLOUD_SAMPLE_SECONDS, decode[i], prefill[i]])
+    }
+  }
+  return samples
 }
 
 // One stacked sub-row per overlapping request: slot 1 at the top, queued
@@ -1335,10 +1562,34 @@ function bucketTicks(buckets, win) {
 function laneWindowCounts(lane) {
   const rows = (lane && lane.requests) || []
   if (rows.length) {
-    return { count: rows.length, streamed: rows.filter(isStreamedRow).length }
+    // The SAME predicate the canvas draws with: a bar is hatched exactly when
+    // isWholeResponse(row) is true, so 'streamed' counts the rows that are not.
+    return { count: rows.length, streamed: rows.filter(row => !isWholeResponse(row)).length }
   }
   const total = Number(lane && lane.total) || 0
   return { count: total, streamed: Number(lane && lane.model && lane.model.streamed) || 0 }
+}
+
+// Which bar phases the chart ACTUALLY draws. The footer legend renders one
+// swatch per phase only when at least one drawn bar uses it — a lane with no
+// queued bar never shows 'queued (beyond slots)', a lane with no streamed bar
+// never shows the waiting/generating pair. Bucket-fallback lanes paint plain
+// columns (none of these phases), so a chart of only bucket lanes shows just
+// the 'colour = agent' sentence.
+function lanePhasePresence(lanes) {
+  const present = { waiting: false, generating: false, whole: false, queued: false }
+  for (const lane of lanes || []) {
+    if (lane.ticks) continue
+    for (const bar of lane.bars || []) {
+      if (lane.slots != null && bar.slot >= lane.slots) { present.queued = true; continue }
+      if (bar.whole) { present.whole = true; continue }
+      if (bar.request && bar.request.first_chunk_at != null && bar.request.first_chunk_at > bar.start) {
+        present.waiting = true
+      }
+      present.generating = true
+    }
+  }
+  return present
 }
 
 // Every lane in the window: local servers with rows or in-flight work, then one
@@ -1368,7 +1619,12 @@ function swimLanes(snapshot, windowSeconds, now) {
       kind: 'local',
       id: `local:${server.base_url || server.name}`,
       label: server.name || 'server',
-      detail: `${server.kind || 'server'} · ${server.running != null ? server.running : '—'}/${server.slots != null ? server.slots : '—'} slots`,
+      // Same left-detail form as a cloud lane: the request/streamed counts from
+      // laneWindowCounts — the same numbers the bars are drawn from. Never the
+      // live running/slots here: that disagreed with the right axis's
+      // 'peak N of S slots' on one lane. Live running/slots is on the server
+      // card, and slots live on this lane's right edge only.
+      detail: `${fmtInt(counts.count)} req · ${fmtInt(counts.streamed)} streamed`,
       server,
       requests,
       bars,
@@ -1737,14 +1993,21 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
     const colors = agentColorMap(lanes.filter(lane => (lane.requests || []).length))
     const entries = [...colors.entries()].slice(0, 8)
     // snapshot.agents rows indexed by session id: the real title lives there,
-    // so the legend never shows a bare date id when a title exists.
+    // so the legend never shows a bare date id when a title exists. Subagent
+    // rows are NESTED under their parent as `children` (and deeper), so walk
+    // the whole tree — a map of the roots alone left subagent lanes falling
+    // back to 'default · session <id>' instead of their 'subagent · <goal>'
+    // label, which is exactly what the By agent rows show for the same row.
     const agentRows = Array.isArray(snapshot && snapshot.agents) ? snapshot.agents : []
     const rowBySession = new Map()
-    for (const row of agentRows) {
-      if (row && row.session_id && !rowBySession.has(row.session_id)) {
+    const visitAgentRow = row => {
+      if (!row || typeof row !== 'object') return
+      if (row.session_id && !rowBySession.has(row.session_id)) {
         rowBySession.set(row.session_id, row)
       }
+      if (Array.isArray(row.children)) row.children.forEach(visitAgentRow)
     }
+    agentRows.forEach(visitAgentRow)
     // Same label builder as the By agent rows, so the legend and the tree never
     // read differently. Two sessions can still share a title (e.g. two
     // untitled 'default' sessions) — disambiguate with the id tail.
@@ -1758,7 +2021,12 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         session_id: session,
         title: agentRow && agentRow.title,
         label: agentRow && agentRow.label,
-        source: agentRow && agentRow.source
+        source: agentRow && agentRow.source,
+        // Subagent rows carry role + goal (agentLabel renders 'subagent · goal'
+        // from these); a lane whose session belongs to a nested child agent must
+        // read like the By agent row for that same agent.
+        role: agentRow && agentRow.role,
+        goal: agentRow && agentRow.goal
       }
       // agentLabel prefers the row's own title; the date id is the last resort.
       const base = agentLabel(row, labels || {}) || (session ? `session ${session.slice(0, 8)}` : profile)
@@ -1836,10 +2104,17 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
           // alpha / hatch / dash styles the canvas paints, so each swatch is a
           // true preview of its bar; which agent is which is said by the
           // 'colour = agent' sentence, not by recolouring the swatches.
+          // Each swatch renders ONLY when at least one drawn bar actually uses
+          // that phase — a chart with no queued bar shows no 'queued (beyond
+          // slots)' swatch, one with no streamed bar shows neither waiting nor
+          // generating, one with no whole-response bar drops the hatch. The
+          // 'colour = agent · rows…' sentence below always stays.
           ...(() => {
             const swatch = 'var(--ui-accent)'
-            return [
-              jsx('span', {
+            const phases = lanePhasePresence(lanes)
+            const items = []
+            if (phases.waiting) {
+              items.push(jsx('span', {
                 className: 'inline-flex items-center gap-1',
                 children: [
                   jsx('span', {
@@ -1847,8 +2122,10 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
                   }),
                   jsx('span', { children: 'waiting for first token' })
                 ]
-              }),
-              jsx('span', {
+              }))
+            }
+            if (phases.generating) {
+              items.push(jsx('span', {
                 className: 'inline-flex items-center gap-1',
                 children: [
                   jsx('span', {
@@ -1856,8 +2133,10 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
                   }),
                   jsx('span', { children: 'generating' })
                 ]
-              }),
-              jsx('span', {
+              }))
+            }
+            if (phases.whole) {
+              items.push(jsx('span', {
                 className: 'inline-flex items-center gap-1',
                 children: [
                   jsx('span', {
@@ -1868,8 +2147,10 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
                   }),
                   jsx('span', { children: 'not streamed (whole response)' })
                 ]
-              }),
-              jsx('span', {
+              }))
+            }
+            if (phases.queued) {
+              items.push(jsx('span', {
                 className: 'inline-flex items-center gap-1',
                 children: [
                   jsx('span', {
@@ -1880,8 +2161,9 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
                   }),
                   jsx('span', { children: 'queued (beyond slots)' })
                 ]
-              })
-            ]
+              }))
+            }
+            return items
           })(),
           jsx('span', {
             className: 'font-medium',
@@ -2730,7 +3012,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
             meta: 'Hermes traffic only — hook rows, no server gauge',
             children: jsx('div', {
               className: 'grid gap-2 xl:grid-cols-2',
-              children: cloud.map(model => jsx(CloudCard, { model, labels, now, windowSeconds }, model.key))
+              children: cloud.map(model => jsx(CloudCard, { model, labels, now, windowSeconds, snapshot }, model.key))
             })
           })
         : null,

@@ -77,7 +77,7 @@ const factory = new Function(
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
   'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, drawSwimLane, swimLanes, Section, unreachableReason }`
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason }`
 )
 const mod = factory(
   atom, Badge, Button, Component, EmptyState, Component, Component, Component,
@@ -438,15 +438,80 @@ walk(page, item => {
   if (item.kind === 'text' && item.text.includes('colour = agent')) legendLineCount += 1
 })
 check('the legend line appears exactly once on the page (footer only)', legendLineCount === 1, `${legendLineCount} copies`)
-check('legend names the honest phases and the agent-colour rule',
+// The live fixture paints no beyond-slots bar, so the honest conditional
+// legend drops that swatch there; seed a 9th request starting after the first
+// four overlap so the drawn lanes contain every phase at least once.
+const phaseAllSnapshot = JSON.parse(JSON.stringify(fixture))
+const phaseServer = phaseAllSnapshot.servers.find(s =>
+  s.name === 'studio-ds4' && Array.isArray(s.requests) && s.requests.length)
+// Make every window row overlap in time (so slots=4 runs out and rows go
+// beyond-slots) and clone the whole-response row four more times: then the
+// drawn lane contains at least one bar of each phase — waiting (TTFT inside
+// the bar), generating, hatched whole, and dashed queued.
+phaseServer.requests = phaseServer.requests
+  .filter(r => r.started_at != null && r.ended_at != null)
+  .map(r => ({ ...r, started_at: 1794094925, ended_at: 1794094940, first_chunk_at: 1794094928 }))
+const phaseWhole = fixture.servers
+  .find(s => s.name === 'studio-ds4').requests
+  .find(r => r.first_chunk_at == null || r.ended_at == null)
+for (let i = 0; i < 4; i += 1) {
+  phaseServer.requests.push({ ...JSON.parse(JSON.stringify(phaseWhole)), session_id: `phase-queued-${i}` })
+}
+// The page renders the swim lane from querySnapshot, so seed the lane there
+// too — otherwise the page below honestly omits the queued swatch and the
+// 'every phase' assertion tests nothing.
+querySnapshot = phaseAllSnapshot
+// Check the swim lane's own phase computation first — the legend renders a
+// swatch only when a DRAWN bar uses that phase, and a seeded lane with no
+// beyond-slots bar would otherwise be an invisible test bug.
+// (The lane's `detail` doubles as fix-1's assertion: local lanes now read
+// '<n> req · <m> streamed' from laneWindowCounts, never live running/slots.)
+const phaseLanes = mod.swimLanes(phaseAllSnapshot, 300, fixture.generated_at * 1000).lanes
+const phaseLane = phaseLanes.find(l => l.label === 'studio-ds4')
+check('local lane detail uses the req/streamed form (fix 1: no live running/slots)',
+  phaseLane && /^\d+ req · \d+ streamed$/.test(phaseLane.detail)
+    && !/slots/.test(phaseLane.detail)
+    && Number(phaseLane.detail.match(/^(\d+)/)[1]) === phaseLane.bars.length
+    && Number(phaseLane.detail.match(/· (\d+) streamed/)[1]) === phaseLane.bars.filter(b => !b.whole).length,
+  phaseLane ? `${phaseLane.detail}, ${phaseLane.bars.length} bars, ${phaseLane.bars.filter(b => b.whole).length} whole` : 'lane missing')
+const phaseSeen = {
+  waiting: phaseLane && phaseLane.bars.some(b => !b.whole && b.request && b.request.first_chunk_at != null && b.request.first_chunk_at > b.start),
+  generating: phaseLane && phaseLane.bars.some(b => !b.whole),
+  whole: phaseLane && phaseLane.bars.some(b => b.whole),
+  queued: phaseLane && phaseLane.slots != null && phaseLane.bars.some(b => b.slot >= phaseLane.slots)
+}
+check('the seeded fixture actually draws every phase (waiting/generating/whole/queued)',
+  phaseSeen.waiting && phaseSeen.generating && phaseSeen.whole && phaseSeen.queued,
+  Object.entries(phaseSeen).map(([k, v]) => `${k}=${v}`).join(' '))
+// The page's swim lane reads its snapshot from the query cache, so the render
+// below has to happen WHILE querySnapshot is the seeded lane — building the
+// text with the fixture restored would honestly omit the queued swatch.
+const phaseAllPage = textOf(mod.FlightdeckPage({}))
+querySnapshot = fixture
+// The legend's no-decode/prefill assertion belongs to the swim lane section:
+// the page legitimately carries 'decode / prefill' on the server cards' own
+// tok/s chart, so a whole-page absence check would assert something false.
+const phaseSwimSection = elements(mod.FlightdeckPage({})).find(item =>
+  textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
+check('legend renders every phase swatch when a drawn bar uses it (and the agent rule)',
+  phaseAllPage.includes('waiting for first token')
+    && phaseAllPage.includes('generating')
+    && phaseAllPage.includes('not streamed (whole response)')
+    && phaseAllPage.includes('queued (beyond slots)')
+    && phaseAllPage.includes('colour = agent')
+    && phaseAllPage.includes('rows = requests running at the same time')
+    && phaseSwimSection && !textOf(phaseSwimSection).includes('prefill')
+    && !textOf(phaseSwimSection).includes('decode'),
+  phaseAllPage.slice(0, 160))
+check('legend omits swatches for phases no drawn bar uses, keeps the agent sentence',
   !!swimSection && textOf(swimSection).includes('waiting for first token')
     && textOf(swimSection).includes('generating')
     && textOf(swimSection).includes('not streamed (whole response)')
-    && textOf(swimSection).includes('queued (beyond slots)')
+    && !textOf(swimSection).includes('queued (beyond slots)')
     && textOf(swimSection).includes('colour = agent')
     && textOf(swimSection).includes('rows = requests running at the same time')
     && !textOf(swimSection).includes('prefill') && !textOf(swimSection).includes('decode'),
-  swimSection ? textOf(swimSection).slice(0, 120) : 'section missing')
+  swimSection ? textOf(swimSection).slice(0, 160) : 'section missing')
 check('swim lane section header keeps the window + ordering meta',
   swimSection && textOf(swimSection).includes('local lanes first, then cloud'),
   swimSection ? textOf(swimSection).slice(0, 90) : 'section missing')
@@ -727,6 +792,55 @@ const noSinceRow = elements(mod.ModelView({ snapshot: noSince, labels,
 check('unreachable row omits the down-age when since is missing',
   noSinceRow && !textOf(noSinceRow).includes('down') && textOf(noSinceRow).includes('URLError: unknown'),
   noSinceRow ? textOf(noSinceRow).slice(0, 80) : 'row missing')
+
+// 13. Cloud card: the tok/s chart comes from Hermes' own request rows, the
+//     snapshot quota block renders under the metrics, and the holder line
+//     resolves agent row titles instead of the raw session id.
+const cloudSnap = JSON.parse(JSON.stringify(fixture))
+const cloudModel = cloudSnap.models.find(model => model.lane === 'cloud')
+cloudModel.requests = [
+  { session_id: '20261107_174026_d25bb8', started_at: fixture.generated_at - 40,
+    first_chunk_at: fixture.generated_at - 38, ended_at: fixture.generated_at - 20,
+    prompt_tokens: 120, completion_tokens: 60, status: 'done' },
+  { session_id: '20261107_174026_d25bb8', started_at: fixture.generated_at - 30,
+    first_chunk_at: fixture.generated_at - 28, ended_at: fixture.generated_at - 10,
+    prompt_tokens: 80, completion_tokens: 40, status: 'done' }
+]
+const cloudCardText = textOf(mod.CloudCard({ model: cloudModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+check('cloud card charts Hermes-observed decode/prefill, not request buckets',
+  cloudCardText.includes('Hermes-observed') && cloudCardText.includes('decode / prefill')
+    && !cloudCardText.includes('requests, last'),
+  cloudCardText.slice(0, 160))
+const quotaModel = { ...cloudModel, quota: {
+  windows: [{ label: '5-hour', used_percent: 42, remaining_percent: 58,
+    reset_at: fixture.generated_at + 7200 }]
+} }
+const quotaText = textOf(mod.CloudCard({ model: quotaModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+check('cloud card renders the snapshot quota windows',
+  quotaText.includes('5-hour') && quotaText.includes('42% used'), quotaText.slice(0, 160))
+const unavailableText = textOf(mod.CloudCard({ model: { ...cloudModel,
+  quota: { unavailable_reason: 'timeout', windows: [] } }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+check('cloud card renders an unavailable quota honestly',
+  unavailableText.includes('plan usage unavailable'), unavailableText.slice(0, 160))
+const noQuotaText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
+check('cloud card renders no quota line when the quota is null',
+  !noQuotaText.includes('5-hour') && !noQuotaText.includes('plan usage unavailable'),
+  noQuotaText.slice(0, 160))
+const holderSnap = JSON.parse(JSON.stringify(fixture))
+const holderModel = holderSnap.models.find(model => model.lane === 'cloud')
+holderSnap.agents[0].children
+  .find(row => row.session_id === '20261107_174026_d25bb8').title = 'Flightdeck hackathon'
+holderModel.agents = [{ profile: 'default', session_id: '20261107_174026_d25bb8',
+  label: '', in_flight: 1 }]
+const holderText = textOf(mod.CloudCard({ model: holderModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: holderSnap }))
+check('cloud card holder line resolves the agent row title, not the session id',
+  holderText.includes('Flightdeck hackathon') && !holderText.includes('session 2026'),
+  holderText.slice(0, 160))
 
 const failed = results.filter(item => !item.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)
