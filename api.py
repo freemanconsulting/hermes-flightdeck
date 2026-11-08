@@ -369,6 +369,30 @@ def _server_health(sample: dict) -> dict | None:
     return health
 
 
+# A healthy server polled in the instant between two decode steps reports the
+# instantaneous gauge as 0 even with work in flight.  Trust the newest non-zero
+# rate from the recent samples for at most this long before the card goes back
+# to showing 0 (2-3 polls).
+_RATE_FALLBACK_SECONDS = 15.0
+
+
+def _recent_rate(past: list[dict], field: str, now: float,
+                 window: float = _RATE_FALLBACK_SECONDS) -> float | None:
+    """Newest non-zero ``field`` among ``past`` samples within ``window`` of ``now``.
+
+    ``past`` is oldest-first.  A sample is usable when its ts is known, no more
+    than ``window`` seconds stale, and it carries a positive rate.
+    """
+    for item in reversed(past):
+        ts = _num(item.get("ts"))
+        if ts is None or ts < now - window:
+            continue
+        value = _num(item.get(field))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
 def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list[dict],
                   sample_rows: list[dict], now: float) -> list[dict]:
     by_url: dict[str, list[dict]] = {}
@@ -412,6 +436,26 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
             if healthy is None and last.get("healthy") is not None:
                 healthy = bool(last.get("healthy"))
 
+        # The card's rate is the last poll's instant gauge: a server polled in
+        # the gap between two decode steps reads 0 with work still in flight
+        # (Aubrey's "decode 0.0 tok/s" with 1 in flight).  While the server is
+        # busy — slots used or Hermes in_flight — fall back to the newest
+        # non-zero rate in the recent samples, and say so in ``rate_source``
+        # so the UI can label the number as smoothed.  An idle server keeps
+        # showing the instant value, zeros included.
+        busy = max(running or 0, waiting or 0, len(held)) > 0
+        decode_source = "instant"
+        prefill_source = "instant"
+        if busy:
+            if not decode_tps:
+                recent = _recent_rate(past, "decode_tps", now)
+                if recent is not None:
+                    decode_tps, decode_source = recent, "recent"
+            if not prefill_tps:
+                recent = _recent_rate(past, "prefill_tps", now)
+                if recent is not None:
+                    prefill_tps, prefill_source = recent, "recent"
+
         held_agents: dict[tuple, dict] = {}
         for row in held:
             key = (row.get("profile") or "", row.get("session_id") or "")
@@ -446,6 +490,7 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
             "slots": slots,
             "decode_tps": decode_tps,
             "prefill_tps": prefill_tps,
+            "rate_source": {"decode": decode_source, "prefill": prefill_source},
             "health": _server_health(sample),
             "in_flight": in_flight_count,
             "unattributed": None if running is None else max(0, running - in_flight_count),

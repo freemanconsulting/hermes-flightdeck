@@ -74,10 +74,12 @@ def test_snapshot_shape_is_pinned(conn):
     assert list(ds4) == [
         "name", "title", "aux", "roles", "base_url", "kind", "healthy", "models", "running",
         "waiting", "slots",
-        "decode_tps", "prefill_tps", "health", "in_flight", "unattributed", "over_attributed",
-        "agents", "requests", "samples", "error", "sampled_at",
+        "decode_tps", "prefill_tps", "rate_source", "health", "in_flight", "unattributed",
+        "over_attributed", "agents", "requests", "samples", "error", "sampled_at",
     ]
     assert ds4["aux"] is None and ds4["roles"] == []
+    # Healthy instant gauges: nothing smoothed.
+    assert ds4["rate_source"] == {"decode": "instant", "prefill": "instant"}
     assert ds4["title"].startswith("Studio DeepSeek")
     assert ds4["base_url"] == DS4
     assert ds4["in_flight"] == 3
@@ -303,6 +305,83 @@ def test_null_is_not_zero(conn):
     status = api.fleet_status(payload)
     assert status["lanes"][0]["verdict"] == "unknown"
     assert status["pick"] is None
+
+
+# --- instant gauge stuck at 0 while busy (Aubrey's "decode 0.0 tok/s") -------
+
+
+def _sample_card(conn, *, decode, prefill, name="probe", base_url=None,
+                 running=1, waiting=0, slots=4, error=None):
+    """One card built from an instant poll; the seeded history rides behind it."""
+    card_sample = {"name": name, "base_url": base_url or GN100, "kind": "tensorfold",
+                   "healthy": True, "models": [], "running": running, "waiting": waiting,
+                   "slots": slots, "decode_tps": decode, "prefill_tps": prefill,
+                   "sampled_at": api._now_iso(NOW), "error": error}
+    return card(snapshot(conn, servers=[card_sample]), name)
+
+
+def test_busy_server_zero_instant_uses_recent_sample(conn):
+    """Decode reads 0 between decode steps but the last polls saw real work."""
+    ds4 = _sample_card(conn, decode=0.0, prefill=0.0, name="ds4", base_url=DS4)
+    assert ds4["in_flight"] == 3
+    assert ds4["decode_tps"] == 42.1   # newest non-zero sample, NOW - 5
+    assert ds4["prefill_tps"] == 3100.0
+    assert ds4["rate_source"] == {"decode": "recent", "prefill": "recent"}
+
+
+def test_busy_server_from_hermes_in_flight_only(conn):
+    """Server reports no slots used; the in-flight Hermes rows still mark it busy."""
+    gn100 = _sample_card(conn, decode=None, prefill=None, running=0, waiting=0, slots=5)
+    assert gn100["in_flight"] == 2
+    assert gn100["decode_tps"] == 18.4
+    assert gn100["prefill_tps"] == 900.0
+    assert gn100["rate_source"] == {"decode": "recent", "prefill": "recent"}
+
+
+def test_idle_server_zero_instant_stays_zero(conn):
+    """In-flight 0 keeps the instant value, zeros and Nones included."""
+    # Fresh DB: the seeded GN100 rows would otherwise mark this card busy.
+    conn.execute("DELETE FROM requests")
+    conn.commit()
+    idle = _sample_card(conn, decode=0.0, prefill=0.0, running=0, waiting=0, slots=4)
+    assert idle["in_flight"] == 0
+    assert idle["decode_tps"] == 0.0
+    assert idle["prefill_tps"] == 0.0
+    assert idle["rate_source"] == {"decode": "instant", "prefill": "instant"}
+
+    idle_none = _sample_card(conn, decode=None, prefill=None, running=0, waiting=0, slots=4)
+    assert idle_none["decode_tps"] is None and idle_none["prefill_tps"] is None
+    assert idle_none["rate_source"] == {"decode": "instant", "prefill": "instant"}
+
+
+def test_busy_server_only_stale_samples_stays_zero(conn):
+    """Nothing non-zero inside ~15 s: the card keeps saying 0, not history."""
+    conn.execute("DELETE FROM server_samples WHERE ts > ?", (NOW - 15.0,))
+    conn.commit()  # only the NOW - 10 / NOW - 10 samples survive, both stale
+    stale = _sample_card(conn, decode=0.0, prefill=None, running=1)
+    assert stale["in_flight"] >= 1
+    assert stale["decode_tps"] == 0.0
+    assert stale["prefill_tps"] is None
+    assert stale["rate_source"] == {"decode": "instant", "prefill": "instant"}
+
+
+def test_busy_server_recent_zero_history_stays_zero(conn):
+    """An idle-for-a-while server: recent samples are all zeros, so 0 stays 0."""
+    conn.execute("UPDATE server_samples SET decode_tps = 0.0, prefill_tps = 0.0")
+    conn.commit()
+    idle = _sample_card(conn, decode=0.0, prefill=0.0, running=1)
+    assert idle["decode_tps"] == 0.0 and idle["prefill_tps"] == 0.0
+    assert idle["rate_source"] == {"decode": "instant", "prefill": "instant"}
+
+
+def test_recent_rate_helper_skips_undated_and_stale_rows():
+    past = [{"ts": NOW - 100, "decode_tps": 5.0}, {"ts": None, "decode_tps": 7.0},
+            {"ts": NOW - 4, "decode_tps": 0.0}, {"ts": NOW - 3, "decode_tps": 12.5}]
+    assert api._recent_rate(past, "decode_tps", NOW) == 12.5
+    assert api._recent_rate(past, "prefill_tps", NOW) is None
+    assert api._recent_rate([], "decode_tps", NOW) is None
+    # Anything older than the window is invisible, newest-first.
+    assert api._recent_rate(past, "decode_tps", NOW, window=2.0) is None
 
 
 def test_unreachable_shows_last_good_sample(conn):
