@@ -93,10 +93,13 @@ def test_snapshot_shape_is_pinned(conn):
         "key", "model", "provider", "provider_aliases", "base_url", "server_name", "kind", "metrics",
         "lane", "in_flight",
         "requests_1m", "requests_5m", "errors_5m", "errors_429_5m", "streamed", "non_streamed",
-        "requests_buckets", "ttft_ms_p50", "ttft_ms_p95", "latency_ms_p50", "latency_ms_p95",
+        "requests_buckets", "requests", "ttft_ms_p50", "ttft_ms_p95", "latency_ms_p50", "latency_ms_p95",
         "decode_tps", "prefill_tps", "rate_kind", "tokens", "slots", "agents", "quota",
     ]
     assert ds4_model["lane"] == "local"
+    # A local model entry carries no rows: the server card already does. The
+    # key exists so the UI can read ``requests`` on any entry uniformly.
+    assert ds4_model["requests"] == []
     assert ds4_model["quota"] is None
     assert ds4_model["agents"][0]["label"] == ""
 
@@ -227,6 +230,49 @@ def test_server_requests_rows_shape_and_selection(conn):
     assert "default|4242|d1" not in ids and "default|4242|d2" not in ids
     assert "default|4242|g1" not in ids
     assert card(snapshot(conn), "GN100")["requests"][0]["id"] == "default|4242|k1"
+
+
+def test_cloud_model_requests_rows(conn):
+    """Cloud model entries carry their own swim-lane rows — no server card does."""
+    # Two overlapping cloud requests: c1 (seeded, in-flight, started NOW-6) and
+    # a finished one started before it and still ending after c1 started.
+    make_example.insert_request(
+        conn, id="default|4242|c3", session_id="s1", api_request_id="c3",
+        model=make_example.CLOUD_MODEL, provider="anthropic",
+        base_url=make_example.ANTHROPIC + "/v1",
+        started_at=NOW - 30, first_chunk_at=NOW - 29.2, ended_at=NOW - 20,
+        status="done", prompt_tokens=4000, cached_tokens=1000, completion_tokens=200,
+    )
+    # A different cloud model: must not leak into claude-opus-5-5's rows.
+    make_example.insert_request(
+        conn, id="default|4242|x1", session_id="s1", api_request_id="x1",
+        model="claude-haiku-9", provider="anthropic",
+        base_url=make_example.ANTHROPIC + "/v1",
+        started_at=NOW - 10, first_chunk_at=NOW - 9.5, ended_at=NOW - 8,
+        status="done",
+    )
+    payload = snapshot(conn)
+    cloud = model(payload, f"anthropic|{make_example.CLOUD_MODEL}")
+    assert cloud["lane"] == "cloud"
+    rows = cloud["requests"]
+    # Same §9.1 row shape as the server cards'.
+    assert list(rows[0]) == [
+        "id", "profile", "session_id", "parent_session_id", "kind", "model", "started_at",
+        "first_chunk_at", "ended_at", "status", "prompt_tokens", "cached_tokens",
+        "completion_tokens",
+    ]
+    # started_at ascending: c3 (NOW-30) then c1 (NOW-6). c2 ended 114 s ago —
+    # outside the 60 s tail, same selection the server cards use.
+    assert [row["id"] for row in rows] == ["default|4242|c3", "default|4242|c1"]
+    assert (rows[0]["started_at"], rows[0]["first_chunk_at"], rows[0]["ended_at"]) == (
+        NOW - 30, NOW - 29.2, NOW - 20)
+    assert (rows[1]["started_at"], rows[1]["first_chunk_at"], rows[1]["ended_at"]) == (
+        NOW - 6, None, None)
+    assert rows[1]["status"] == "in-flight"
+    # No other cloud model's rows leak in.
+    assert all(row["model"] == make_example.CLOUD_MODEL for row in rows)
+    other = model(payload, "anthropic|claude-haiku-9")
+    assert [row["id"] for row in other["requests"]] == ["default|4242|x1"]
 
 
 # --- §8 formulas ------------------------------------------------------------

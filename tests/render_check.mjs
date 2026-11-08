@@ -144,7 +144,8 @@ const studio = localLanes.find(lane => lane.label === 'studio-ds4')
 check('swim lane has ≥1 local lane', localLanes.length >= 1, `${localLanes.length} local: ${localLanes.map(l => l.label).join(', ')}`)
 check('studio-ds4 local lane has ≥6 bars', studio && studio.bars.length >= 6, studio ? `${studio.bars.length} bars` : 'lane missing')
 check('swim lane has ≥1 cloud lane', cloudLanes.length >= 1, `${cloudLanes.length} cloud: ${cloudLanes.map(l => l.label).join(', ')}`)
-check('cloud lane draws 15 s request ticks', cloudLanes.length > 0 && cloudLanes.every(lane => lane.bars.length >= 1), cloudLanes.map(l => `${l.label}: ${l.bars.length} ticks`).join(', '))
+check('cloud lane draws its traffic (per-request bars, or bucket columns as fallback)', cloudLanes.length > 0 && cloudLanes.every(lane => lane.bars.length >= 1), cloudLanes.map(l => `${l.label}: ${l.bars.length} ${l.ticks ? 'buckets' : 'bars'}`).join(', '))
+check('cloud bucket fallback columns scale to the max bucket, not the total', cloudLanes.every(lane => !lane.ticks || lane.concurrency === Math.max(...lane.bars.map(b => b.count))), cloudLanes.filter(l => l.ticks).map(l => `peak ${l.concurrency}`).join(', ') || 'no fallback lane in fixture')
 check('non-streamed requests are whole-response bars', studio && studio.bars.some(bar => bar.whole), studio ? `${studio.bars.filter(b => b.whole).length} whole` : 'lane missing')
 
 // 2. Swim lane draw: bars actually reach the canvas.
@@ -166,6 +167,38 @@ const hits = mod.drawSwimLane(fakeCtx, 900, 190, lanes, win, fakeCtx, labels)
 const localHits = hits.filter(hit => hit.lane && hit.lane.kind === 'local')
 check('swim lane draw paints ≥6 local bars', localHits.length >= 6, `${localHits.length} local bars, ${drawn.fillRect} fillRects`)
 check('swim lane draw labels local and cloud lanes', drawn.fillText.includes('local') && drawn.fillText.includes('cloud'), drawn.fillText.filter(t => t === 'local' || t === 'cloud').join(', '))
+check('swim lane labels carry no tok/s text', !drawn.fillText.some(t => String(t).includes('tok/s')), drawn.fillText.filter(t => String(t).includes('tok/s')).join(', ') || 'no tok/s labels')
+
+// 2b. Cloud lanes built from per-request rows use the SAME encoding as local:
+//     bars stacked by overlap, right label 'peak N'. The backend is adding
+//     model.requests rows to cloud entries; the fixture has none, so clone one.
+const cloudRowsSnapshot = JSON.parse(JSON.stringify(fixture))
+const cloudRowModel = cloudRowsSnapshot.models.find(m => m.lane === 'cloud')
+const crowBase = win.end - 30
+cloudRowModel.requests = [0, 4, 8].map(offset => ({
+  started_at: crowBase + offset,
+  first_chunk_at: crowBase + offset + 1,
+  ended_at: crowBase + offset + 16,
+  profile: 'default',
+  session_id: `cloudrows_${offset}`,
+  status: 'done',
+  model: cloudRowModel.model,
+  prompt_tokens: 100,
+  completion_tokens: 40
+}))
+const cloudRows = mod.swimLanes(cloudRowsSnapshot, 60, fixture.generated_at * 1000)
+const cloudRowLane = cloudRows.lanes.find(lane => lane.kind === 'cloud' && (lane.requests || []).length === 3)
+check('cloud lane with requests builds 3 bars stacked to peak 3',
+  cloudRowLane && cloudRowLane.bars.length === 3 && cloudRowLane.concurrency === 3 && !cloudRowLane.ticks,
+  cloudRowLane ? `${cloudRowLane.bars.length} bars, peak ${cloudRowLane.concurrency}` : 'lane missing')
+const cloudRowDraw = { fillRect: 0, strokeRect: 0, fillText: [] }
+const cloudRowCtx = { ...fakeCtx, fillRect() { cloudRowDraw.fillRect += 1 }, strokeRect() { cloudRowDraw.strokeRect += 1 }, fillText(t) { cloudRowDraw.fillText.push(t) } }
+mod.drawSwimLane(cloudRowCtx, 900, 190, cloudRows.lanes, cloudRows.win, cloudRowCtx, labels)
+check('cloud lane right label reads peak 3', cloudRowDraw.fillText.includes('peak 3'),
+  cloudRowDraw.fillText.filter(t => String(t).startsWith('peak')).join(', '))
+check('local lane right labels carry peak and slots',
+  drawn.fillText.some(t => /^peak \d+$/.test(String(t))) && drawn.fillText.some(t => /^of \d+ slots$/.test(String(t))),
+  drawn.fillText.filter(t => /^peak \d+$/.test(String(t)) || /^of \d+ slots$/.test(String(t))).join(', '))
 
 // 3. By agent: every agent row (profile, session, subagent, cron) has model
 //    sub-rows with the full column set.
@@ -310,7 +343,22 @@ check('server card with no health block renders no health line',
 const page = mod.FlightdeckPage({})
 const pageElements = elements(page)
 const canvas = pageElements.find(item => item.type === 'canvas')
-check('page renders the swim lane canvas', canvas && String(canvas.props['aria-label'] || '').includes('cloud lane'), canvas ? canvas.props['aria-label'].slice(0, 60) : 'canvas missing')
+check('page renders the swim lane canvas', canvas && String(canvas.props['aria-label'] || '').includes('cloud model'), canvas ? canvas.props['aria-label'].slice(0, 60) : 'canvas missing')
+// Legend appears exactly once: the header meta carries no encoding text, the
+// footer carries the only 'dim = prefill'-style line, once on the page.
+const swimSection = pageElements.find(item =>
+  textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
+check('swim lane section header drops the duplicated legend copy',
+  swimSection && !textOf(swimSection).includes('dim = prefill'),
+  swimSection ? textOf(swimSection).slice(0, 80) : 'section missing')
+let legendLineCount = 0
+walk(page, item => {
+  if (item.kind === 'text' && item.text.includes('stacked rows = concurrent requests')) legendLineCount += 1
+})
+check('the legend line appears exactly once on the page (footer only)', legendLineCount === 1, `${legendLineCount} copies`)
+check('swim lane section header keeps the window + ordering meta',
+  swimSection && textOf(swimSection).includes('local lanes first, then cloud'),
+  swimSection ? textOf(swimSection).slice(0, 90) : 'section missing')
 
 // 7. Routing: the placement chip on a routed subagent row and the Routing strip
 //    at the top of By model (CAPACITY.md §9). The fixture carries no routing

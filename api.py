@@ -585,8 +585,10 @@ def _server_name_for(base_url: str | None, server_by_url: dict[str, dict],
 
 
 def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
-                 window_seconds: int = 300) -> list[dict]:
+                 window_seconds: int = 300,
+                 lane_rows: list[dict] | None = None) -> list[dict]:
     server_by_url = {normalize_base_url(card["base_url"]): card for card in server_cards}
+    lane_rows = list(lane_rows) if lane_rows else []
     bucket_seconds = 15
     bucket_count = max(1, int(window_seconds) // bucket_seconds)
     since = now - float(window_seconds)
@@ -700,6 +702,28 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
                 entry = held[key] = {"profile": key[0], "session_id": key[1], "label": "", "in_flight": 0}
             entry["in_flight"] += 1
 
+        # Per-request swim-lane rows. Cloud lanes have no server card to hang
+        # them on, so the model card carries them itself: same selection
+        # (in-flight + ended in the last 60 s), same attribution as
+        # ``requests_buckets`` (the window group's model/provider/base_url —
+        # cloud groups are keyed by normalized base_url, so rows written under
+        # ``https://api.anthropic.com/v1`` match a card opened at any other
+        # path on the same host), same per-card cap as the server cards (50),
+        # oldest first.
+        # Local model entries stay ``[]`` — the keys are pinned uniform so the
+        # UI can read ``requests`` on any entry — and their rows live on the
+        # server card.
+        if lane == "cloud":
+            model_requests = sorted(
+                (row for row in lane_rows
+                 if (row.get("model") or "") == model
+                 and str(row.get("provider") or "") == key_provider
+                 and normalize_base_url(row.get("base_url")) == base_url),
+                key=lambda row: _num(row.get("started_at")) or 0,
+            )[-50:]
+        else:
+            model_requests = []
+
         cards.append({
             "key": f"{server_name}|{model}",
             "model": model,
@@ -718,6 +742,7 @@ def _model_cards(rows: list[dict], server_cards: list[dict], now: float,
             "streamed": streamed,
             "non_streamed": non_streamed,
             "requests_buckets": buckets,
+            "requests": [_request_row(row) for row in model_requests],
             "ttft_ms_p50": _round(_percentile(ttfts, 50), 1),
             "ttft_ms_p95": _round(_percentile(ttfts, 95), 1),
             "latency_ms_p50": _round(_percentile(latencies, 50), 1),
@@ -1119,7 +1144,8 @@ def build_snapshot(window_seconds: int = 300, *, servers: Any = None,
             else:
                 kept.append(card)
         server_cards = kept
-    model_cards = _model_cards(rows, server_cards, now, window_seconds)
+    model_cards = _model_cards(rows, server_cards, now, window_seconds,
+                               lane_rows=_request_rows(conn, now))
     links = _subagent_links(conn)
     routed = _routed_for_links(conn, links)
     agent_nodes = _agent_tree(rows, links,

@@ -227,10 +227,10 @@ function agentKey(row) {
   return `${(row && row.profile) || ''}|${(row && row.session_id) || ''}`
 }
 
-function agentColorMap(servers) {
+function agentColorMap(rows) {
   const colors = new Map()
   let next = 0
-  for (const server of servers || []) {
+  for (const server of rows || []) {
     for (const request of server.requests || []) {
       const key = agentKey(request)
       if (!colors.has(key)) {
@@ -1280,8 +1280,11 @@ function stackBars(requests, win) {
   })
 }
 
-// Cloud model entries carry no per-request rows: their traffic is the 15 s
-// request buckets. One tick per non-empty bucket, height by count.
+// Fallback for a cloud lane whose backend carries no per-request rows: its
+// traffic is the 15 s request buckets, drawn as columns scaled to a concurrency
+// axis whose height is the MAX bucket count (never the total), so a lane that
+// never ran more than one request at a time has full-height columns and a
+// 'peak 1 / 15 s' axis. One tick per non-empty bucket.
 function bucketTicks(buckets, win) {
   const perBucket = Math.max(1, Math.ceil(win.seconds / SWIM_BUCKET_SECONDS))
   const ticks = []
@@ -1300,17 +1303,23 @@ function bucketTicks(buckets, win) {
 
 // Every lane in the window: local servers with rows or in-flight work, then one
 // cloud lane per cloud model with traffic. The whole ecosystem, local first.
+// EVERY lane uses the same encoding: per-request bars stacked by overlap, so
+// the number of rows stacked at any x is the concurrency at that moment. Cloud
+// model entries carry the same per-request rows (model.requests) as servers;
+// only when they're missing but the buckets show traffic does the lane fall
+// back to the 15 s bucket columns.
 function swimLanes(snapshot, windowSeconds, now) {
   const win = swimWindow(snapshot, windowSeconds, now)
   const servers = Array.isArray(snapshot && snapshot.servers) ? snapshot.servers : []
   const models = Array.isArray(snapshot && snapshot.models) ? snapshot.models : []
   const lanes = []
+  const requestRows = rows => (Array.isArray(rows) ? rows : [])
+    .filter(row => row && row.started_at != null && (row.ended_at == null || row.ended_at >= win.start))
+    .sort((a, b) => a.started_at - b.started_at)
+    .slice(0, 40)
   for (const server of servers) {
     if (!server || server.kind === 'cloud') continue
-    const requests = (Array.isArray(server.requests) ? server.requests : [])
-      .filter(row => row && row.started_at != null && (row.ended_at == null || row.ended_at >= win.start))
-      .sort((a, b) => a.started_at - b.started_at)
-      .slice(0, 40)
+    const requests = requestRows(server.requests)
     if (!requests.length && !((server.in_flight || 0) > 0)) continue
     const bars = stackBars(requests, win)
     lanes.push({
@@ -1321,60 +1330,77 @@ function swimLanes(snapshot, windowSeconds, now) {
       server,
       requests,
       bars,
-      samples: Array.isArray(server.samples)
-        ? server.samples.filter(s => Array.isArray(s) && s.length >= 3 && s[0] >= win.start)
-        : [],
-      concurrency: Math.max(1, ...bars.map(bar => bar.slot + 1)),
+      concurrency: Math.max(0, ...bars.map(bar => bar.slot + 1)),
       slots: server.slots != null ? Math.max(1, server.slots) : Math.max(1, ...bars.map(bar => bar.slot + 1))
     })
   }
   for (const model of models) {
     if (!model || model.lane !== 'cloud') continue
     const buckets = Array.isArray(model.requests_buckets) ? model.requests_buckets : []
-    const total = buckets.reduce((sum, n) => sum + (Number(n) || 0), 0) ||
-      (model.requests_1m || 0) || (model.requests_5m || 0)
+    const bucketTotal = buckets.reduce((sum, n) => sum + (Number(n) || 0), 0)
+    const total = bucketTotal || (model.requests_1m || 0) || (model.requests_5m || 0)
     if (!total) continue
+    const requests = requestRows(model.requests)
+    if (requests.length) {
+      // Same encoding as local lanes: per-request bars, stacked rows = concurrency.
+      const bars = stackBars(requests, win)
+      lanes.push({
+        kind: 'cloud',
+        id: `cloud:${model.key || model.provider}`,
+        label: `${model.provider || 'cloud'} / ${model.model || 'model'}`,
+        // Short enough for the 124 px left gutter: the long form truncated.
+        detail: `${fmtInt(model.requests_1m || model.total || total)} req · ${fmtInt(model.streamed)} streamed`,
+        model,
+        requests,
+        bars,
+        concurrency: Math.max(0, ...bars.map(bar => bar.slot + 1)),
+        slots: null,
+        total
+      })
+      continue
+    }
+    if (!bucketTotal) continue
+    // Fallback: no per-request rows from the backend, only buckets.
     lanes.push({
       kind: 'cloud',
       id: `cloud:${model.key || model.provider}`,
       label: `${model.provider || 'cloud'} / ${model.model || 'model'}`,
-      // Short enough for the 124 px left gutter: the long form truncated.
       detail: `${fmtInt(model.requests_1m || model.total || total)} req · ${fmtInt(model.streamed)} streamed`,
       model,
       requests: [],
       bars: bucketTicks(buckets, win),
       ticks: true,
-      samples: [],
-      concurrency: 1,
-      slots: 1,
+      concurrency: Math.max(0, ...buckets.map(n => Number(n) || 0)),
+      slots: null,
       total
     })
   }
   return { win, lanes }
 }
 
-// One lane per server or cloud model with traffic. Local bars are stacked into
-// sub-rows so concurrency is visible: slot 1 at the top, queued requests beyond
-// the server's slots drawn dashed. Dim = prefill (start → first token), bright =
-// decode; a whole response (no first chunk) is one uniform hatched bar. Cloud
-// lanes draw the 15 s request buckets as ticks. The faint throughput trace keeps
-// its own right-side scale (max tok/s).
-// A lane's right-side scale labels, sized to their widest rendering. Measured
-// with the drawing context (the gutter is computed inside the draw, where the
-// ctx exists), so '1 concurrent request' and 'max 50.0 tok/s out' never clip.
+// One lane per server or cloud model with traffic — ONE encoding everywhere:
+// each request is a horizontal bar from start to end, dim = prefill (start →
+// first token), bright = decode, hatched = whole response (no first chunk),
+// dashed outline = queued beyond the server's slot count. Bars are stacked into
+// sub-rows by overlap, so the y-axis IS concurrency: stacked rows at any x =
+// concurrent requests at that moment, and the row height grows to fill the lane
+// (peak 1 draws one thick bar, not a stripe). The right edge labels the axis:
+// bold 'peak N', muted 'of S slots' for local lanes, muted 'n req'. A cloud
+// lane whose backend carries no per-request rows falls back to 15 s bucket
+// columns scaled to the max bucket.
+// A lane's right-side concurrency-axis labels: bold 'peak N' (the max stacked
+// rows in the window = most concurrent requests), muted 'of S slots' for local
+// lanes, muted 'n req' for the request count in the window. A bucket-fallback
+// cloud lane labels the axis 'peak N / 15 s' instead, since its columns are
+// scaled to the max bucket. Measured with the drawing context (the gutter is
+// computed inside the draw, where the ctx exists), so the widest label never
+// clips.
 function laneRightLabels(lane) {
-  if (lane.kind === 'cloud') {
-    return [
-      `${fmtInt(lane.total)} req`,
-      '15s buckets',
-      '0 req'
-    ]
-  }
-  return [
-    `${lane.concurrency} concurrent request${lane.concurrency === 1 ? '' : 's'}`,
-    `max ${fmtRate(lane.maxDecode)} tok/s out`,
-    '0 tok/s'
-  ]
+  if (lane.ticks) return [`peak ${lane.concurrency} / ${SWIM_BUCKET_SECONDS} s`]
+  const labels = [`peak ${lane.concurrency}`]
+  if (lane.kind === 'local' && lane.slots != null) labels.push(`of ${lane.slots} slots`)
+  labels.push(`${lane.requests.length || lane.total || 0} req`)
+  return labels
 }
 
 const RIGHT_GUTTER_MIN = 60
@@ -1389,8 +1415,8 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
 
   const gutter = 124
   // Right gutter: wide enough for the widest right-side scale label of any lane
-  // ('1 concurrent request', 'max 50.0 tok/s out'), measured with the real
-  // font.  A fixed 56 px clipped those labels at the canvas edge.
+  // ('peak 12 of 12 slots'), measured with the real font. A fixed 56 px
+  // clipped those labels at the canvas edge.
   let right = RIGHT_GUTTER_MIN
   if (lanes.length) {
     ctx2.font = '9px sans-serif'
@@ -1418,7 +1444,9 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
   }
 
   const laneH = Math.max(56, (height - top - axisH) / lanes.length)
-  const colors = agentColorMap(lanes.filter(lane => lane.kind === 'local').map(lane => lane.server))
+  // Every lane with per-request rows feeds the palette, so a cloud lane's
+  // agent bars get legend colours just like a local lane's.
+  const colors = agentColorMap(lanes.filter(lane => (lane.requests || []).length))
 
   for (let li = 0; li < lanes.length; li += 1) {
     const lane = lanes[li]
@@ -1433,85 +1461,63 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     ctx2.lineWidth = 1
     ctx2.strokeRect(gutter + 0.5, y + 0.5, plotW - 1, innerH - 1)
 
-    if (lane.kind === 'local') {
-      // Throughput history: decode bright area + line, prefill dim line, faint.
-      const samples = lane.samples
-      let maxDecode = 0
-      let maxPrefill = 0
-      for (const s of samples) {
-        if (s[1] > maxDecode) maxDecode = s[1]
-        if (s[2] > maxPrefill) maxPrefill = s[2]
-      }
-      if (samples.length >= 2) {
-        const baseY = y + innerH - 4
-        const plotH = innerH - 12
-        const decodePath = []
-        const prefillPath = []
-        for (const s of samples) {
-          const x = xOf(s[0])
-          decodePath.push([x, baseY - (maxDecode > 0 ? (s[1] / maxDecode) * plotH : 0)])
-          prefillPath.push([x, baseY - (maxPrefill > 0 ? (s[2] / maxPrefill) * plotH : 0)])
-        }
-        ctx2.save()
-        ctx2.globalAlpha = 0.100
+    // ONE encoding for every lane, local and cloud alike: the stacked bars are
+    // the y-axis (concurrency), so the row height grows to fill the lane —
+    // peak 1 draws one thick bar, peak 8 draws eight thin ones.
+    const peak = Math.max(1, lane.concurrency)
+    const rowGap = 2
+    const rowH = Math.max(3, Math.min(14, (innerH - 8 - rowGap * (peak - 1)) / peak))
+    const barTop = y + 4
+
+    if (lane.ticks) {
+      // Fallback cloud lane: 15 s bucket columns scaled to the MAX bucket, so
+      // the column height reads against the 'peak N / 15 s' axis label.
+      const baseY = y + innerH - 6
+      const plotH = innerH - 22
+      const maxCount = Math.max(1, peak)
+      ctx2.save()
+      ctx2.fillStyle = accent
+      ctx2.globalAlpha = 0.55
+      for (const tick of lane.bars) {
+        const x1 = xOf(tick.start) + 2
+        const x2 = Math.max(x1 + 2, xOf(tick.end) - 2)
+        const tickH = Math.max(2, (tick.count / maxCount) * plotH)
+        ctx2.fillRect(x1, baseY - tickH, Math.max(2, x2 - x1), tickH)
+        ctx2.fillStyle = text
+        ctx2.font = '8px sans-serif'
+        ctx2.fillText(String(tick.count), x1, baseY - tickH - 6)
         ctx2.fillStyle = accent
-        ctx2.beginPath()
-        ctx2.moveTo(decodePath[0][0], baseY)
-        for (const point of decodePath) ctx2.lineTo(point[0], point[1])
-        ctx2.lineTo(decodePath[decodePath.length - 1][0], baseY)
-        ctx2.closePath()
-        ctx2.fill()
-        ctx2.restore()
-
-        ctx2.save()
-        ctx2.globalAlpha = 0.28
-        ctx2.strokeStyle = dim
-        ctx2.lineWidth = 1
-        ctx2.beginPath()
-        prefillPath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
-        ctx2.stroke()
-        ctx2.restore()
-
-        ctx2.save()
-        ctx2.globalAlpha = 0.55
-        ctx2.strokeStyle = accent
-        ctx2.lineWidth = 1
-        ctx2.beginPath()
-        decodePath.forEach((point, i) => (i ? ctx2.lineTo(point[0], point[1]) : ctx2.moveTo(point[0], point[1])))
-        ctx2.stroke()
-        ctx2.restore()
       }
-
-      // Per-request bars, stacked into sub-rows by overlap.
-      const barH = 6
-      const barGap = 2
-      const barTop = y + 14
+      ctx2.restore()
+    } else {
+      // Per-request bars, stacked into sub-rows by overlap: rows stacked at any
+      // x = concurrent requests at that moment.
       lane.bars.forEach(item => {
         const { request, start, end, slot, whole } = item
         const x1 = xOf(start)
         const x2 = Math.max(x1 + 2, xOf(end))
-        const barY = barTop + slot * (barH + barGap)
+        const barY = barTop + slot * (rowH + rowGap)
         const color = colors.get(agentKey(request)) || accent
-        const queued = slot >= lane.slots
+        const queued = lane.slots != null && slot >= lane.slots
         ctx2.save()
         if (queued) {
           ctx2.globalAlpha = 0.55
           ctx2.strokeStyle = color
           ctx2.lineWidth = 1
           ctx2.setLineDash([2, 2])
-          ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, barH - 1)
+          ctx2.strokeRect(x1 + 0.5, barY + 0.5, Math.max(2, x2 - x1) - 1, rowH - 1)
         } else if (whole) {
           // Whole response: no first chunk, so no prefill/decode split. One
           // uniform medium bar with a hatch, so it never reads as decode.
           ctx2.globalAlpha = 0.5
           ctx2.fillStyle = color
-          ctx2.fillRect(x1, barY, Math.max(1, x2 - x1), barH)
+          ctx2.fillRect(x1, barY, Math.max(1, x2 - x1), rowH)
           ctx2.globalAlpha = 0.85
           ctx2.strokeStyle = color
           ctx2.lineWidth = 1
           for (let x = x1; x < x2; x += 4) {
             ctx2.beginPath()
-            ctx2.moveTo(x, barY + barH)
+            ctx2.moveTo(x, barY + rowH)
             ctx2.lineTo(Math.min(x + 3, x2), barY)
             ctx2.stroke()
           }
@@ -1519,31 +1525,23 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
           const split = request.first_chunk_at != null ? xOf(request.first_chunk_at) : x2
           ctx2.globalAlpha = 0.35
           ctx2.fillStyle = color
-          ctx2.fillRect(x1, barY, Math.max(1, split - x1), barH)
+          ctx2.fillRect(x1, barY, Math.max(1, split - x1), rowH)
           ctx2.globalAlpha = 0.9
-          ctx2.fillRect(split, barY, Math.max(1, x2 - split), barH)
+          ctx2.fillRect(split, barY, Math.max(1, x2 - split), rowH)
           if (request.ended_at == null) {
             // In-flight growing edge: a brighter cap that pulses with the clock.
             ctx2.globalAlpha = 0.55 + 0.35 * Math.abs(Math.sin(win.end / 420))
             ctx2.fillStyle = color
-            ctx2.fillRect(x2 - 1.5, barY - 1, 2, barH + 2)
+            ctx2.fillRect(x2 - 1.5, barY - 1, 2, rowH + 2)
           }
         }
         ctx2.restore()
-        hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: barH, request, lane })
+        hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: rowH, request, lane })
       })
 
-      // Slot numbers down the left edge of the plot: the y-axis is the stacked rows.
-      ctx2.fillStyle = dim
-      ctx2.font = '8px sans-serif'
-      for (let slot = 0; slot < Math.min(lane.concurrency, lane.slots + 2); slot += 1) {
-        ctx2.fillText(String(slot + 1), gutter + 3, barTop + slot * (barH + barGap) + barH / 2)
-      }
-
-      // Idle local lane: no in-flight and nothing decoded recently — draw a flat
-      // zero baseline plus a muted 'idle' label instead of leaving the decode/
-      // prefill sparkline area blank.
-      if (!lane.bars.length && !(lane.requestRows || []).length && maxDecode <= 0) {
+      // Idle local lane: no rows at all (only an in-flight count) — a flat zero
+      // baseline plus a muted 'idle' label instead of an empty frame.
+      if (!lane.bars.length && lane.kind === 'local') {
         const flatY = y + innerH - 4
         ctx2.save()
         ctx2.strokeStyle = stroke
@@ -1561,43 +1559,19 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
         ctx2.fillText('idle', gutter + plotW / 2 - 8, y + innerH / 2 + 3)
         ctx2.restore()
       }
+    }
 
-      // Right edge: concurrency and the throughput trace's own scale.
-      ctx2.fillStyle = text
-      ctx2.font = '600 10px sans-serif'
-      ctx2.fillText(rightLabels[0], gutter + plotW + 6, y + 10)
-      ctx2.fillStyle = dim
-      ctx2.font = '9px sans-serif'
-      if (maxDecode > 0) {
-        ctx2.fillText(rightLabels[1], gutter + plotW + 6, y + 22)
-        ctx2.fillText(rightLabels[2], gutter + plotW + 6, y + innerH - 6)
-      }
-    } else {
-      // Cloud lane: one tick per 15 s bucket with traffic, height by count.
-      const baseY = y + innerH - 6
-      const plotH = innerH - 22
-      const maxCount = Math.max(1, ...lane.bars.map(tick => tick.count))
-      ctx2.save()
-      ctx2.fillStyle = accent
-      ctx2.globalAlpha = 0.55
-      for (const tick of lane.bars) {
-        const x1 = xOf(tick.start) + 2
-        const x2 = Math.max(x1 + 2, xOf(tick.end) - 2)
-        const tickH = Math.max(2, (tick.count / maxCount) * plotH)
-        ctx2.fillRect(x1, baseY - tickH, Math.max(2, x2 - x1), tickH)
-        ctx2.fillStyle = text
-        ctx2.font = '8px sans-serif'
-        ctx2.fillText(String(tick.count), x1, baseY - tickH - 6)
-        ctx2.fillStyle = accent
-      }
-      ctx2.restore()
-      ctx2.fillStyle = text
-      ctx2.font = '600 10px sans-serif'
-      ctx2.fillText(rightLabels[0], gutter + plotW + 6, y + 10)
-      ctx2.fillStyle = dim
-      ctx2.font = '9px sans-serif'
-      ctx2.fillText(rightLabels[1], gutter + plotW + 6, y + 22)
-      ctx2.fillText(rightLabels[2], gutter + plotW + 6, y + innerH - 6)
+    // Right edge: the concurrency axis for this lane — bold 'peak N', then
+    // muted 'of S slots' (local only) / bucket-axis / 'n req'.
+    ctx2.fillStyle = text
+    ctx2.font = '600 10px sans-serif'
+    ctx2.fillText(rightLabels[0], gutter + plotW + 6, y + 10)
+    ctx2.fillStyle = dim
+    ctx2.font = '9px sans-serif'
+    for (let li = 1; li < rightLabels.length; li += 1) {
+      ctx2.fillText(
+        rightLabels[li], gutter + plotW + 6, y + 10 + li * 12
+      )
     }
 
     // Lane label in the gutter: local/cloud first, then the lane's own name.
@@ -1675,7 +1649,9 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
   }, [lanes, win, size, labels])
 
   const legend = useMemo(() => {
-    const colors = agentColorMap(lanes.filter(lane => lane.kind === 'local').map(lane => lane.server))
+    // Every lane with per-request rows feeds the palette, so a cloud lane's
+    // agent bars get legend colours just like a local lane's.
+    const colors = agentColorMap(lanes.filter(lane => (lane.requests || []).length))
     const entries = [...colors.entries()].slice(0, 8)
     // Same label builder as the By agent rows, so the legend and the tree never
     // read differently. Two sessions can still share a title (e.g. two
@@ -1728,7 +1704,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
             className: 'block',
             style: { width: '100%', height: '100%' },
             role: 'img',
-            'aria-label': 'Swim-lane timeline: one local lane per server with traffic, then one cloud lane per cloud model with traffic; one stacked bar per request, dim prefill and bright decode, hatched whole response, cloud 15 s request ticks, with concurrency and throughput scale labels'
+            'aria-label': 'Swim-lane timeline: one lane per server or cloud model with traffic, local lanes first; every lane uses the same encoding — one horizontal bar per request (dim prefill, bright decode, hatched whole response, dashed queued), stacked into rows so rows at any moment equal concurrent requests, with the peak concurrency labelled on the right'
           }),
           hover
             ? jsx('div', {
@@ -1752,20 +1728,58 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         className: 'flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5',
         style: { fontSize: '0.55rem', color: 'var(--ui-text-quaternary)' },
         children: [
+          // ONE legend line for the whole chart — the section header carries no
+          // encoding text. Small inline swatches, no second chart type below.
           jsx('span', {
-            className: 'font-medium',
-            children: 'dim = prefill, bright = decode, hatched = whole response (no first chunk)'
+            className: 'inline-flex items-center gap-1',
+            children: [
+              jsx('span', {
+                style: { width: '10px', height: '6px', background: 'currentColor', opacity: 0.35 }
+              }),
+              jsx('span', { children: 'prefill' })
+            ]
           }),
           jsx('span', {
             className: 'inline-flex items-center gap-1',
             children: [
               jsx('span', {
-                className: 'rounded-full',
-                style: { width: '6px', height: '6px', background: 'var(--ui-accent)' }
+                style: { width: '10px', height: '6px', background: 'currentColor', opacity: 0.9 }
               }),
-              jsx('span', { children: 'cloud lane = 15 s request buckets, no per-request rows' })
+              jsx('span', { children: 'decode' })
             ]
           }),
+          jsx('span', {
+            className: 'inline-flex items-center gap-1',
+            children: [
+              jsx('span', {
+                style: {
+                  width: '10px', height: '6px', opacity: 0.6,
+                  background: 'repeating-linear-gradient(135deg, currentColor 0 1px, transparent 1px 3px)'
+                }
+              }),
+              jsx('span', { children: 'whole response' })
+            ]
+          }),
+          jsx('span', {
+            className: 'inline-flex items-center gap-1',
+            children: [
+              jsx('span', {
+                style: {
+                  width: '10px', height: '6px',
+                  border: '1px dashed currentColor', boxSizing: 'border-box'
+                }
+              }),
+              jsx('span', { children: 'queued' })
+            ]
+          }),
+          jsx('span', {
+            className: 'font-medium',
+            children: 'stacked rows = concurrent requests; peak = most at once'
+          }),
+          // The buckets line appears only when a lane actually fell back to it.
+          lanes.some(lane => lane.ticks)
+            ? jsx('span', { children: 'cloud lane = 15 s request buckets, no per-request rows' })
+            : null,
           legend.map(entry =>
             jsxs('span', {
               className: 'inline-flex items-center gap-1',
@@ -2595,7 +2609,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide }) {
       servers.length || cloud.length
         ? jsx(Section, {
             label: 'Swim lane',
-            meta: `last ${fmtDuration(windowSeconds)} · local lanes then cloud lanes · dim = prefill, bright = decode, hatched = whole response · stacked bars = concurrency`,
+            meta: `last ${fmtDuration(windowSeconds)} · local lanes first, then cloud`,
             children: jsx(SwimLane, { snapshot, labels, windowSeconds, now })
           })
         : null,
