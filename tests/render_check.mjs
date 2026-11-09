@@ -476,7 +476,7 @@ check('page renders the swim lane canvas', canvas && String(canvas.props['aria-l
 // Legend appears exactly once: the header meta carries no encoding text, the
 // footer carries the only 'colour = agent'-style line, once on the page.
 const swimSection = pageElements.find(item =>
-  textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
+  item.type === 'section' && textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
 check('swim lane section header drops the duplicated legend copy',
   swimSection && !textOf(swimSection).includes('dim = prefill'),
   swimSection ? textOf(swimSection).slice(0, 80) : 'section missing')
@@ -539,7 +539,7 @@ querySnapshot = fixture
 // the page legitimately carries 'decode / prefill' on the server cards' own
 // tok/s chart, so a whole-page absence check would assert something false.
 const phaseSwimSection = elements(mod.FlightdeckPage({})).find(item =>
-  textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
+  item.type === 'section' && textOf(item).startsWith('Swim lane') && elements(item).some(el => el.type === 'canvas'))
 check('legend renders every phase swatch when a drawn bar uses it (and the agent rule)',
   phaseAllPage.includes('waiting for first token')
     && phaseAllPage.includes('generating')
@@ -564,7 +564,7 @@ check('swim lane section header keeps the window + ordering meta',
   swimSection ? textOf(swimSection).slice(0, 90) : 'section missing')
 
 // 7. Routing: the placement chip on a routed subagent row and the Routing strip
-//    at the top of By model (CAPACITY.md §9). The fixture carries no routing
+//    at the bottom of By model (CAPACITY.md §9). The fixture carries no routing
 //    block or decisions, so this is a copy with both seeded.
 const routingSnapshot = JSON.parse(JSON.stringify(fixture))
 routingSnapshot.routing = {
@@ -612,15 +612,27 @@ function stripTitle(strip) {
 }
 const routingView = mod.ModelView({ snapshot: routingSnapshot, labels,
   now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null })
+const routingViewText = textOf(routingView)
+const orderIdx = {
+  swim: routingViewText.indexOf('Swim lane'),
+  local: routingViewText.indexOf('Local servers'),
+  cloud: routingViewText.indexOf('Cloud lanes'),
+  routing: routingViewText.indexOf('Routing')
+}
+check('By model orders swim lane, local servers, cloud lanes, then routing',
+  orderIdx.swim >= 0 && orderIdx.swim < orderIdx.local &&
+  orderIdx.local < orderIdx.cloud && orderIdx.cloud < orderIdx.routing,
+  `swim ${orderIdx.swim} < local ${orderIdx.local} < cloud ${orderIdx.cloud} < routing ${orderIdx.routing}`)
 const strip = elements(routingView).find(item => item.props['data-routing-strip'] != null)
-check('By model opens with the Routing strip',
+check('By model ends with the Routing strip',
   strip && strip.props['data-routing-strip'] === 'armed',
   strip ? strip.props['data-routing-strip'] : 'strip missing')
 const stripText = textOf(strip || {})
 check('Routing strip shows the armed state',
   stripText.includes('Routing') && stripText.includes('armed'), stripText.slice(0, 80))
-check('Routing strip shows the last 5 decisions, not the 6th',
-  countIn(strip, 'data-decision') === 5 && !stripText.includes('must not render'),
+check('Routing strip shows the last 5 placements, not the 6th',
+  countIn(strip, 'data-decision') === 5 && stripText.includes('last 5 placements') &&
+  !stripText.includes('must not render'),
   `${countIn(strip, 'data-decision')} rows`)
 check('Routing strip shows time, from → to, reason and goal',
   stripText.includes('30s ago') && stripText.includes('ds4 → GN100') &&
@@ -657,6 +669,11 @@ check('Routing strip says off and tooltips the enable instruction',
   stripTitle(offStrip).includes('route_delegation') &&
   stripTitle(offStrip).includes('/delegation flightdeck --now'),
   offStrip ? stripTitle(offStrip).slice(0, 90) : 'strip missing')
+check('Routing off renders one compact line, no placements',
+  offStrip && textOf(offStrip).includes('Capacity routing: off') &&
+  !textOf(offStrip).includes('last 5 placements') &&
+  countIn(offStrip, 'data-decision') === 0,
+  offStrip ? textOf(offStrip).slice(0, 120) : 'strip missing')
 
 const unavailableStrip = elements(mod.ModelView({ snapshot: fixture, labels,
   now: fixture.generated_at * 1000, windowSeconds: 60, onHide: null }))

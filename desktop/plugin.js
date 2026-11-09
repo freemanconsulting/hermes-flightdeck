@@ -3012,9 +3012,20 @@ function decisionTooltip(decision) {
 }
 
 // The last five placements, one line each: time, from → to, reason, goal.
+// Off and unavailable have nothing to place: one muted line, no card chrome.
 function RoutingStrip({ snapshot, now }) {
   const state = routingState(snapshot.routing)
   const decisions = (Array.isArray(snapshot.decisions) ? snapshot.decisions : []).slice(0, 5)
+  if (state.label === 'off' || state.label === 'unavailable') {
+    return jsx('div', {
+      'data-routing-strip': state.label,
+      title: state.title,
+      className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+      children: state.label === 'off'
+        ? 'Capacity routing: off · places subagents on a local server with free slots when enabled'
+        : 'Capacity routing: unavailable · needs a Flightdeck build with capacity.py'
+    })
+  }
   return jsxs('div', {
     'data-routing-strip': state.label,
     className: 'flex flex-col gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5',
@@ -3197,7 +3208,13 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
   return jsxs('div', {
     className: 'flex flex-col gap-4',
     children: [
-      jsx(RoutingStrip, { snapshot, now }),
+      servers.length || cloud.length
+        ? jsx(Section, {
+            label: 'Swim lane',
+            meta: `last ${fmtDuration(windowSeconds)} · local lanes first, then cloud`,
+            children: jsx(SwimLane, { snapshot, labels, windowSeconds, now })
+          })
+        : null,
       jsx(Section, {
         label: 'Local servers',
         meta: servers.length
@@ -3329,13 +3346,6 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
           ]
         })
       }),
-      servers.length || cloud.length
-        ? jsx(Section, {
-            label: 'Swim lane',
-            meta: `last ${fmtDuration(windowSeconds)} · local lanes first, then cloud`,
-            children: jsx(SwimLane, { snapshot, labels, windowSeconds, now })
-          })
-        : null,
       cloud.length
         ? jsx(Section, {
             label: 'Cloud lanes',
@@ -3359,7 +3369,8 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
               children: orphan.map(model => jsx(NoServerCard, { model, labels, now }, model.key))
             })
           })
-        : null
+        : null,
+      jsx(RoutingStrip, { snapshot, now })
     ]
   })
 }
