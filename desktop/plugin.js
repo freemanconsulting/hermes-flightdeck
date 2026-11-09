@@ -1111,10 +1111,89 @@ function RequestSparkline({ buckets }) {
 // ---------------------------------------------------------------------------
 // By model — local server cards first.
 
+// The HELD BY section shared by the local server card and the cloud model
+// card: one row per agent with an in-flight request right now. Agents whose
+// requests all finished in the window are history (swim lane / By agent), not
+// holders. Four rows fit; the rest go into the '+N more' tooltip.
+function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
+  const held = (Array.isArray(agents) ? agents : []).filter(a => (a.requests || a.in_flight || 0) > 0)
+  const shown = held.slice(0, 4)
+  const rest = held.slice(4)
+  const rowLabel = agent => agentLabel((rowBySession && rowBySession.get(agent.session_id)) || agent, labels)
+  return jsxs('div', {
+    className: 'flex flex-col gap-0.5 border-t border-(--ui-stroke-secondary) pt-1.5',
+    children: [
+      jsx('span', {
+        className: 'text-[0.6rem] uppercase tracking-[0.08em] text-(--ui-text-quaternary)',
+        children: 'held by'
+      }),
+      held.length
+        ? shown.map(agent =>
+            jsxs(
+              'div',
+              {
+                className: 'flex items-center gap-2 text-[0.6875rem]',
+                children: [
+                  jsx('span', {
+                    className: 'size-1.5 shrink-0 rounded-full',
+                    style: { background: profileTone(agent.profile) }
+                  }),
+                  jsx('span', {
+                    className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+                    children: rowLabel(agent)
+                  }),
+                  agent.model
+                    ? jsx('span', {
+                        className: 'w-36 shrink-0 truncate text-right font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+                        children: agent.model
+                      })
+                    : null,
+                  jsx('span', {
+                    className: 'w-14 shrink-0 text-right tabular-nums text-(--ui-text-tertiary)',
+                    children: elapsedOf(agent.oldest_started_at, now) || '—'
+                  }),
+                  agent.requests || agent.in_flight
+                    ? jsx(Badge, { variant: 'muted', size: 'xs', children: `${agent.requests || agent.in_flight}` })
+                    : null
+                ]
+              },
+              `${agent.session_id}-${agent.model || ''}`
+            )
+          )
+        : jsx('span', {
+            className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: 'no in-flight request observed'
+          }),
+      rest.length
+        ? jsx('span', {
+            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            title: rest.map(rowLabel).join('\n'),
+            children: `+${rest.length} more`
+          })
+        : null,
+      unattributed > 0
+        ? jsxs('div', {
+            className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: [
+              jsx('span', { className: 'size-1.5 shrink-0 rounded-full bg-(--ui-bg-tertiary)' }),
+              jsx('span', { className: 'min-w-0 truncate', children: 'not observed by Flightdeck' }),
+              jsx('span', { className: 'ml-auto tabular-nums', children: unattributed })
+            ]
+          })
+        : null,
+      over > 0
+        ? jsx('span', {
+            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            children: `${over} row(s) the server does not count (queued or closing)`
+          })
+        : null
+    ]
+  })
+}
+
 function ServerCard({ server, models, labels, now }) {
   const verdict = serverVerdict(server)
   const agents = Array.isArray(server.agents) ? server.agents : []
-  const held = agents.filter(a => (a.requests || a.in_flight || 0) > 0)
   const unattributed = server.unattributed || 0
   const over = server.over_attributed || 0
   const sampled = server.sampled_at ? Date.parse(server.sampled_at) / 1000 : null
@@ -1214,66 +1293,7 @@ function ServerCard({ server, models, labels, now }) {
           })
         ]
       }),
-      jsxs('div', {
-        className: 'flex flex-col gap-0.5 border-t border-(--ui-stroke-secondary) pt-1.5',
-        children: [
-          jsx('span', {
-            className: 'text-[0.6rem] uppercase tracking-[0.08em] text-(--ui-text-quaternary)',
-            children: 'held by'
-          }),
-          held.length
-            ? held.map(agent =>
-                jsxs(
-                  'div',
-                  {
-                    className: 'flex items-center gap-2 text-[0.6875rem]',
-                    children: [
-                      jsx('span', {
-                        className: 'size-1.5 shrink-0 rounded-full',
-                        style: { background: profileTone(agent.profile) }
-                      }),
-                      jsx('span', {
-                        className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
-                        children: agentLabel(agent, labels)
-                      }),
-                      jsx('span', {
-                        className: 'w-36 shrink-0 truncate text-right font-mono text-[0.6rem] text-(--ui-text-quaternary)',
-                        children: agent.model || ''
-                      }),
-                      jsx('span', {
-                        className: 'w-14 shrink-0 text-right tabular-nums text-(--ui-text-tertiary)',
-                        children: elapsedOf(agent.oldest_started_at, now) || '—'
-                      }),
-                      agent.requests
-                        ? jsx(Badge, { variant: 'muted', size: 'xs', children: `${agent.requests}` })
-                        : null
-                    ]
-                  },
-                  `${agent.session_id}-${agent.model}`
-                )
-              )
-            : jsx('span', {
-                className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
-                children: 'no in-flight request observed'
-              }),
-          unattributed > 0
-            ? jsxs('div', {
-                className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
-                children: [
-                  jsx('span', { className: 'size-1.5 shrink-0 rounded-full bg-(--ui-bg-tertiary)' }),
-                  jsx('span', { className: 'min-w-0 truncate', children: 'not observed by Flightdeck' }),
-                  jsx('span', { className: 'ml-auto tabular-nums', children: unattributed })
-                ]
-              })
-            : null,
-          over > 0
-            ? jsx('span', {
-                className: 'text-[0.6rem] text-(--ui-text-quaternary)',
-                children: `${over} row(s) the server does not count (queued or closing)`
-              })
-            : null
-        ]
-      }),
+      jsx(HeldBy, { agents, labels, now, unattributed, over }),
       jsxs('div', {
         className: 'flex items-center gap-2',
         children: [
@@ -1399,6 +1419,24 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
   const bucketValue = Array.isArray(model.requests_buckets)
     && model.requests_buckets.some(n => Number(n) > 0)
   const rowBySession = agentRowBySession(snapshot)
+  // Only agents with a request in flight right now are holders; finished rows
+  // in the window are swim-lane history. The oldest in-flight start comes from
+  // the card's own request rows (cloud agent entries carry no timestamp).
+  const oldestByAgent = new Map()
+  for (const row of model.requests || []) {
+    if (row.status !== 'in-flight' || row.started_at == null) continue
+    const key = `${row.profile || ''}|${row.session_id || ''}`
+    const oldest = oldestByAgent.get(key)
+    if (oldest == null || row.started_at < oldest) oldestByAgent.set(key, row.started_at)
+  }
+  const heldRows = (Array.isArray(model.agents) ? model.agents : [])
+    .filter(agent => (agent.in_flight || agent.requests || 0) > 0)
+    .map(agent => ({
+      ...agent,
+      oldest_started_at: agent.oldest_started_at != null
+        ? agent.oldest_started_at
+        : oldestByAgent.get(`${agent.profile || ''}|${agent.session_id || ''}`)
+    }))
   const inFlight = model.in_flight || 0
   const tokens = model.tokens || {}
   const streamed = model.streamed || 0
@@ -1493,39 +1531,23 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
             ]
           })
         : null,
+      jsx(HeldBy, { agents: heldRows, labels, now, rowBySession }),
       jsxs('div', {
-        className: 'flex items-end gap-3 border-t border-(--ui-stroke-secondary) pt-1.5',
+        className: 'flex items-center gap-2',
         children: [
-          jsxs('div', {
-            className: 'min-w-0 flex-1 flex items-center gap-2',
-            children: [
-              jsx('div', {
-                className: 'min-w-0 flex-1',
-                children: samples.length
-                  ? jsx(Sparkline, { samples })
-                  : (bucketValue ? jsx(RequestSparkline, { buckets: model.requests_buckets }) : null)
-              }),
-              jsx('span', {
-                className: 'shrink-0 text-[0.6rem] text-(--ui-text-quaternary)',
-                title: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
-                children: samples.length
-                  ? `decode / prefill · ${fmtDuration(windowSeconds)} · Hermes-observed`
-                  : `requests, last ${fmtDuration(windowSeconds)}`
-              })
-            ]
+          jsx('div', {
+            className: 'min-w-0 flex-1',
+            children: samples.length
+              ? jsx(Sparkline, { samples })
+              : (bucketValue ? jsx(RequestSparkline, { buckets: model.requests_buckets }) : null)
           }),
-          jsxs('div', {
-            className: 'flex flex-col gap-0.5 text-[0.6rem] text-(--ui-text-quaternary)',
-            children: [
-              jsx('span', {
-                children: `${model.agents ? model.agents.length : 0} agent${model.agents && model.agents.length === 1 ? '' : 's'} holding`
-              }),
-              jsx('span', {
-                children: model.agents && model.agents.length
-                  ? model.agents.map(a => agentLabel(rowBySession.get(a.session_id) || a, labels)).join(' · ')
-                  : 'no in-flight request observed'
-              })
-            ]
+          jsx('span', {
+            className: 'shrink-0 text-right text-[0.6rem] text-(--ui-text-quaternary)',
+            style: { minWidth: '13rem' },
+            title: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
+            children: samples.length
+              ? `decode / prefill · ${fmtDuration(windowSeconds)} · Hermes-observed`
+              : `requests, last ${fmtDuration(windowSeconds)}`
           })
         ]
       })

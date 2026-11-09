@@ -1076,9 +1076,83 @@ holderModel.agents = [{ profile: 'default', session_id: '20261107_174026_d25bb8'
   label: '', in_flight: 1 }]
 const holderText = textOf(mod.CloudCard({ model: holderModel, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: holderSnap }))
-check('cloud card holder line resolves the agent row title, not the session id',
+check('cloud card HELD BY resolves the agent row title, not the session id',
   holderText.includes('Flightdeck hackathon') && !holderText.includes('session 2026'),
   holderText.slice(0, 160))
+
+// HELD BY: cloud cards reuse the local card's section — one row per agent with
+// an in-flight request right now, never the old variable-length holder list.
+const heldSnap = JSON.parse(JSON.stringify(fixture))
+const heldModel = heldSnap.models.find(model => model.lane === 'cloud')
+const heldSessions = [
+  ['20261107_174026_d25bb8', 'Azure SFTP Server'],
+  ['20261104_044650_9024bf', 'Add season and record to team header']
+]
+heldSnap.agents = heldSessions.map(([session_id, title]) => ({ profile: 'default', session_id, title }))
+heldModel.agents = heldSessions.map(([session_id]) =>
+  ({ profile: 'default', session_id, label: '', in_flight: 1 }))
+heldModel.requests = heldSessions.map(([session_id], index) => ({
+  profile: 'default', session_id, model: heldModel.model, status: 'in-flight',
+  started_at: fixture.generated_at - 120 - index * 60, ended_at: null
+}))
+const heldCard = mod.CloudCard({ model: heldModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: heldSnap })
+const heldCardText = textOf(heldCard)
+const heldRows = elements(heldCard).filter(el =>
+  el.props.className === 'flex items-center gap-2 text-[0.6875rem]')
+check('cloud card HELD BY renders one row per in-flight holder with its title',
+  heldCardText.includes('held by') && heldRows.length === 2
+    && heldCardText.includes('Azure SFTP Server')
+    && heldCardText.includes('Add season and record to team header')
+    && !heldCardText.includes('agents holding')
+    && !heldCardText.includes('Azure SFTP Server · Add season'),
+  heldCardText.slice(0, 200))
+
+const fiveSnap = JSON.parse(JSON.stringify(fixture))
+const fiveModel = fiveSnap.models.find(model => model.lane === 'cloud')
+const fiveTitles = ['Azure SFTP Server', 'Add season and record to team header',
+  'Pick up open-threads', 'Flightdeck hackathon', 'Fifth holder']
+fiveSnap.agents = fiveTitles.map((title, index) =>
+  ({ profile: 'default', session_id: `holder-${index}`, title }))
+fiveModel.agents = fiveTitles.map((_, index) =>
+  ({ profile: 'default', session_id: `holder-${index}`, label: '', in_flight: 1 }))
+fiveModel.requests = fiveTitles.map((_, index) => ({
+  profile: 'default', session_id: `holder-${index}`, model: fiveModel.model,
+  status: 'in-flight', started_at: fixture.generated_at - 60 - index * 10, ended_at: null
+}))
+const fiveCard = mod.CloudCard({ model: fiveModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: fiveSnap })
+const fiveRows = elements(fiveCard).filter(el =>
+  el.props.className === 'flex items-center gap-2 text-[0.6875rem]')
+const moreEl = elements(fiveCard).find(el => textOf(el) === '+1 more')
+check('cloud card HELD BY caps at four rows and tooltips the rest',
+  fiveRows.length === 4 && moreEl && moreEl.props.title.includes('Fifth holder')
+    && !textOf(fiveCard).includes('Fifth holder'),
+  `${fiveRows.length} rows, more=${moreEl ? moreEl.props.title : 'missing'}`)
+
+const finishedSnap = JSON.parse(JSON.stringify(fixture))
+const finishedModel = finishedSnap.models.find(model => model.lane === 'cloud')
+finishedSnap.agents = [{ profile: 'default', session_id: 'finished-1', title: 'Finished session' }]
+finishedModel.agents = [{ profile: 'default', session_id: 'finished-1', label: '', in_flight: 0 }]
+finishedModel.requests = [{ profile: 'default', session_id: 'finished-1',
+  model: finishedModel.model, status: 'done', started_at: fixture.generated_at - 60,
+  ended_at: fixture.generated_at - 10 }]
+const finishedCard = mod.CloudCard({ model: finishedModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: finishedSnap })
+const finishedRows = elements(finishedCard).filter(el =>
+  el.props.className === 'flex items-center gap-2 text-[0.6875rem]')
+check('cloud card with only finished requests renders no holders',
+  textOf(finishedCard).includes('no in-flight request observed') && finishedRows.length === 0
+    && !textOf(finishedCard).includes('Finished session'),
+  textOf(finishedCard).slice(0, 160))
+
+const chartContainers = [heldCard, fiveCard].map(card =>
+  elements(card).find(el => el.props.className === 'min-w-0 flex-1'))
+check('cloud cards with different holder counts render the same chart width',
+  chartContainers.every(el => el && el.props.className === chartContainers[0].props.className
+    && JSON.stringify(el.props.style || null) === JSON.stringify(chartContainers[0].props.style || null)),
+  chartContainers.map(el =>
+    el ? `${el.props.className} ${JSON.stringify(el.props.style || null)}` : 'missing').join(' | '))
 
 // 15. Polish: swim-lane tooltip lines, cloud card title, section meta, whole
 //     responses on cloud cards, and the local slots tooltip.
