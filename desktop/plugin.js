@@ -505,8 +505,11 @@ function useProviderUsage() {
 
 // ProviderUsage -> PlanUsage's shape. A provider-wide gauge is `windows`; a
 // multi-entry credential pool leaves it empty and carries `accounts` instead,
-// so the first account with numeric windows stands in (its label becomes the
-// title). No numeric window anywhere means no quota line, never a fake gauge.
+// so the first account with numeric windows stands in. A lone account gets no
+// title: its label is a credential-pool id, not a human name, and a bare line
+// under the gauge reads like a stray token. Several accounts get a titled line
+// only when the label is human; internal ids fall back to 'account N of M'. No
+// numeric window anywhere means no quota line, never a fake gauge.
 function providerUsageToQuota(usage) {
   if (!usage || typeof usage !== 'object') return null
   const toWindows = windows => (Array.isArray(windows) ? windows : [])
@@ -525,10 +528,16 @@ function providerUsageToQuota(usage) {
   let windows = toWindows(usage.windows)
   let title = null
   if (!windows.length && Array.isArray(usage.accounts)) {
-    const account = usage.accounts.find(row => row && Array.isArray(row.windows) && row.windows.length)
-    if (account) {
+    const accounts = usage.accounts.filter(row => row && typeof row === 'object')
+    const index = accounts.findIndex(row => Array.isArray(row.windows) && row.windows.length)
+    if (index >= 0) {
+      const account = accounts[index]
       windows = toWindows(account.windows)
-      title = account.label || null
+      if (accounts.length > 1) {
+        const label = account.label == null ? '' : String(account.label).trim()
+        const internal = !label || /^[a-z0-9]+(-[a-z0-9]+)*-\d+$/i.test(label) || /oauth/i.test(label)
+        title = internal ? `account ${index + 1} of ${accounts.length}` : `account: ${label}`
+      }
     }
   }
   if (!windows.some(window => Number.isFinite(window.used_percent))) return null
@@ -1169,6 +1178,9 @@ function PlanUsage({ quota }) {
     quota.source ? `via ${quota.source}` : null,
     quota.fetched_at != null ? `updated ${fmtAgo(quota.fetched_at, Date.now() / 1000)}` : null
   ].filter(Boolean).join(' · ')
+  // Prefix the muted plan/title line so a title-only quota ('account 1 of 2')
+  // never renders as a bare stray value under the gauge.
+  const planLineText = planText ? `plan usage: ${planText}` : null
   return jsxs('div', {
     className: 'flex flex-col gap-1',
     children: [
@@ -1214,10 +1226,10 @@ function PlanUsage({ quota }) {
           ]
         }, `${window.label || 'window'}-${index}`)
       }),
-      planText
+      planLineText
         ? jsx('span', {
             className: 'text-[0.6rem] text-(--ui-text-quaternary)',
-            children: planText
+            children: planLineText
           })
         : null,
       quota.unavailable_reason
@@ -1824,6 +1836,25 @@ function laneRightLabels(lane) {
 const RIGHT_GUTTER_MIN = 60
 const RIGHT_GUTTER_PAD = 18
 
+// Swim-lane geometry shared by the draw and the container: the plot starts
+// SWIM_LANE_TOP px down and the time axis takes SWIM_LANE_AXIS_H at the bottom.
+// Each lane wants LANE_TARGET_H px, so the container grows with the lane count
+// (no lane is ever drawn past the canvas) and never shrinks below the old fixed
+// 190 px for one or two lanes. SWIM_LANE_MIN_LANE_H is the draw's floor.
+const SWIM_LANE_TOP = 4
+const SWIM_LANE_AXIS_H = 16
+const LANE_TARGET_H = 64
+const SWIM_LANE_MIN_H = 190
+const SWIM_LANE_MIN_LANE_H = 40
+
+function swimLaneHeight(laneCount) {
+  if (!laneCount) return SWIM_LANE_MIN_H
+  return Math.max(
+    SWIM_LANE_MIN_H,
+    SWIM_LANE_TOP + SWIM_LANE_AXIS_H + laneCount * LANE_TARGET_H
+  )
+}
+
 function shadeColor(color, amount) {
   const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(color || '').trim())
   if (!hex) return color
@@ -1858,8 +1889,8 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
       ))
     }
   }
-  const axisH = 16
-  const top = 4
+  const axisH = SWIM_LANE_AXIS_H
+  const top = SWIM_LANE_TOP
   const plotW = Math.max(40, width - gutter - right)
   const xOf = t => gutter + ((Math.max(win.start, Math.min(win.end, t)) - win.start) / win.seconds) * plotW
   const hits = []
@@ -1875,7 +1906,9 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     return hits
   }
 
-  const laneH = Math.max(56, (height - top - axisH) / lanes.length)
+  // Fill the canvas with the lanes: the container was sized for the lane
+  // count, so every lane fits. The floor only guards a stale tiny canvas.
+  const laneH = Math.max(SWIM_LANE_MIN_LANE_H, (height - top - axisH) / lanes.length)
   // Every lane with per-request rows feeds the palette, so a cloud lane's
   // agent bars get legend colours just like a local lane's.
   const colors = agentColorMap(lanes.filter(lane => (lane.requests || []).length))
@@ -2165,7 +2198,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         ref: wrapRef,
         className: 'relative w-full',
         style: {
-          height: '190px',
+          height: `${swimLaneHeight(lanes.length)}px`,
           padding: '4px',
           borderRadius: '8px',
           border: '1px solid var(--ui-stroke-secondary)',

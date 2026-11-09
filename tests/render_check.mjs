@@ -158,14 +158,14 @@ check('non-streamed requests are whole-response bars', studio && studio.bars.som
 globalThis.getComputedStyle = () => ({
   getPropertyValue: name => `var(${name})`
 })
-const drawn = { fillRect: 0, strokeRect: 0, fillText: [] }
+const drawn = { fillRect: 0, strokeRect: 0, fillText: [], fillTextAt: [] }
 const fakeCtx = {
   clearRect() {}, save() {}, restore() {}, setTransform() {}, setLineDash() {},
   beginPath() {}, moveTo() {}, lineTo() {}, closePath() {},
   stroke() {}, fill() {},
   fillRect() { drawn.fillRect += 1 },
   strokeRect() { drawn.strokeRect += 1 },
-  fillText(text) { drawn.fillText.push(text) },
+  fillText(text, x, y) { drawn.fillText.push(text); drawn.fillTextAt.push({ text, x, y }) },
   measureText(text) { return { width: String(text).length * 5.5 } },
   fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', textBaseline: '', textAlign: '', globalAlpha: 1
 }
@@ -174,6 +174,47 @@ const localHits = hits.filter(hit => hit.lane && hit.lane.kind === 'local')
 check('swim lane draw paints ≥6 local bars', localHits.length >= 6, `${localHits.length} local bars, ${drawn.fillRect} fillRects`)
 check('swim lane draw labels local and cloud lanes', drawn.fillText.includes('local') && drawn.fillText.includes('cloud'), drawn.fillText.filter(t => t === 'local' || t === 'cloud').join(', '))
 check('swim lane labels carry no tok/s text', !drawn.fillText.some(t => String(t).includes('tok/s')), drawn.fillText.filter(t => String(t).includes('tok/s')).join(', ') || 'no tok/s labels')
+
+// 2a. The container grows with the lane count so no lane is ever clipped. The
+//     old fixed 190 px held 4 lanes of 56 px only until the 4th was drawn below
+//     the canvas. Build snapshots with an exact lane count (one server each).
+const laneBase = fixture.generated_at
+const laneSnapshotFor = count => ({
+  window: { seconds: 60, since: laneBase },
+  servers: Array.from({ length: count }, (_, i) => ({
+    name: `lane-${i}`, kind: 'tensorfold', base_url: `http://127.0.0.1:${7100 + i}`,
+    slots: 2,
+    requests: [{
+      started_at: laneBase + 10 + i, first_chunk_at: laneBase + 12 + i,
+      ended_at: laneBase + 20 + i, profile: 'default', session_id: `lane${i}`, status: 'done'
+    }]
+  })),
+  models: []
+})
+const swimBoxHeight = node => {
+  const box = elements(node).find(item => item.props.ref && item.props.style && item.props.style.height)
+  return box ? parseFloat(String(box.props.style.height)) : NaN
+}
+const fourLaneSnap = laneSnapshotFor(4)
+const fourLaneRows = mod.swimLanes(fourLaneSnap, 60, (laneBase + 60) * 1000)
+check('four-lane snapshot builds 4 lanes', fourLaneRows.lanes.length === 4, `${fourLaneRows.lanes.length} lanes`)
+const fourBoxH = swimBoxHeight(mod.SwimLane({ snapshot: fourLaneSnap, labels, now: (laneBase + 60) * 1000, windowSeconds: 60 }))
+const fourMinH = 4 + 16 + 4 * 56
+check('four-lane container height covers top + axis + 4*56', fourBoxH >= fourMinH, `${fourBoxH}px >= ${fourMinH}px`)
+const oneBoxH = swimBoxHeight(mod.SwimLane({ snapshot: laneSnapshotFor(1), labels, now: (laneBase + 60) * 1000, windowSeconds: 60 }))
+check('one-lane container keeps the 190px minimum', oneBoxH === 190, `${oneBoxH}px`)
+
+// The 4th lane's label must land inside the canvas the container gives it.
+// The canvas content box is at most the container height minus its 4 px
+// padding (top+bottom) and 1 px border (top+bottom); using that as the bound is
+// safe whether the box is content-box or border-box sized.
+const fourCanvasH = fourBoxH - 8 - 2
+drawn.fillTextAt.length = 0
+mod.drawSwimLane(fakeCtx, 900, fourCanvasH, fourLaneRows.lanes, fourLaneRows.win, fakeCtx, labels)
+const fourthLabel = drawn.fillTextAt.find(item => item.text === 'lane-3')
+check('fourth lane label draws inside the canvas',
+  fourthLabel && fourthLabel.y < fourCanvasH,
+  fourthLabel ? `y=${fourthLabel.y} < ${fourCanvasH}` : 'lane-3 label missing')
 
 // 2b. Cloud lanes built from per-request rows use the SAME encoding as local:
 //     bars stacked by overlap, right label 'peak N'. The backend is adding
@@ -871,11 +912,33 @@ const accountQuota = mod.providerUsageToQuota({ windows: [], accounts: [
   { id: 'a1', label: 'Account 2', windows: [{ label: 'weekly', used_percent: 25,
     resets_at: usageIso, scope: 'model' }] }
 ] })
-check('provider usage falls back to the first account with windows',
-  accountQuota && accountQuota.title === 'Account 2'
+check('provider usage falls back to the first account with windows, untitled when alone',
+  accountQuota && accountQuota.title === null
     && accountQuota.windows[0].detail === 'model-specific cap'
     && accountQuota.windows[0].reset_at === Date.parse(usageIso) / 1000,
   JSON.stringify(accountQuota))
+const singleAccountQuota = mod.providerUsageToQuota({ windows: [], accounts: [
+  { id: 'openai-codex-oauth-1', label: 'openai-codex-oauth-1', windows: [
+    { label: 'Weekly', used_percent: 5, resets_at: usageIso, scope: 'account' }] }
+] })
+const singleAccountText = textOf(mod.PlanUsage({ quota: singleAccountQuota }))
+check('single credential-pool account renders no raw account id',
+  singleAccountQuota && singleAccountQuota.title === null
+    && singleAccountText.includes('Weekly')
+    && !singleAccountText.includes('openai-codex-oauth-1'),
+  singleAccountText.slice(0, 200))
+const poolQuota = mod.providerUsageToQuota({ windows: [], accounts: [
+  { id: 'openai-codex-oauth-1', label: 'openai-codex-oauth-1', windows: [
+    { label: 'Weekly', used_percent: 5, resets_at: usageIso, scope: 'account' }] },
+  { id: 'openai-codex-oauth-2', label: 'openai-codex-oauth-2', windows: [
+    { label: 'Weekly', used_percent: 9, resets_at: usageIso, scope: 'account' }] }
+] })
+const poolText = textOf(mod.PlanUsage({ quota: poolQuota }))
+check('multi-account pool renders a numbered account title, not a raw id',
+  poolQuota && poolQuota.title === 'account 1 of 2'
+    && poolText.includes('account 1 of 2')
+    && !poolText.includes('openai-codex-oauth'),
+  poolText.slice(0, 200))
 check('provider usage with no numeric window returns null',
   mod.providerUsageToQuota({ windows: [{ label: 'x', used_percent: null }] }) === null)
 // Plan usage rows: the label cell must fit the longest window label whole
