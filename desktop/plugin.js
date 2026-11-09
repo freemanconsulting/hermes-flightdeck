@@ -482,13 +482,96 @@ function useQuota(provider) {
 // backend snapshot: catalog rule, plugins may only use public surfaces. The
 // backend fills model.quota in demo mode only. Fail-open: a failed fetch is an
 // empty Map, so a cloud card simply renders no quota line.
-function providerUsageMap(result) {
+//
+// The provider's usage check can fail intermittently (the Claude Code CLI takes
+// longer than its 8 s timeout) and a failed snapshot carries no windows. Keep
+// the last good reading per provider for 15 minutes so the card shows the most
+// recent real numbers, labelled with when they were read; older than that, show
+// nothing rather than a stale number. Persist across plugin reloads.
+const LAST_GOOD_USAGE_KEY = 'flightdeck.lastGoodUsage'
+const LAST_GOOD_USAGE_MAX_AGE_MS = 15 * 60 * 1000
+
+let lastGoodUsage = null
+
+function usageHasNumericWindows(usage) {
+  if (!usage || typeof usage !== 'object') return false
+  const hasNumeric = windows => Array.isArray(windows) && windows.some(window =>
+    window && typeof window === 'object' && Number.isFinite(window.used_percent))
+  if (hasNumeric(usage.windows)) return true
+  if (Array.isArray(usage.accounts)) {
+    return usage.accounts.some(row => row && typeof row === 'object' && hasNumeric(row.windows))
+  }
+  return false
+}
+
+function loadLastGoodUsage() {
+  if (lastGoodUsage) return lastGoodUsage
+  const map = new Map()
+  try {
+    const raw = typeof window !== 'undefined' && window.localStorage
+      ? window.localStorage.getItem(LAST_GOOD_USAGE_KEY)
+      : null
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      const now = Date.now()
+      for (const [slug, entry] of Object.entries(parsed || {})) {
+        if (!entry || !entry.usage || !Number.isFinite(entry.seenAt)) continue
+        if (now - entry.seenAt > LAST_GOOD_USAGE_MAX_AGE_MS) continue
+        map.set(String(slug).toLowerCase(), { usage: entry.usage, seenAt: entry.seenAt })
+      }
+    }
+  } catch {}
+  lastGoodUsage = map
+  return lastGoodUsage
+}
+
+function saveLastGoodUsage(map) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return
+    const payload = {}
+    for (const [slug, entry] of map) payload[slug] = { usage: entry.usage, seenAt: entry.seenAt }
+    window.localStorage.setItem(LAST_GOOD_USAGE_KEY, JSON.stringify(payload))
+  } catch {}
+}
+
+// Merge one model.options response into the usage map. A provider row with
+// numeric windows is a good reading: remember it and show it. A provider that
+// comes back without usable usage falls back to its last good reading (with a
+// stale_since marker) while that reading is under 15 minutes old; a fresh
+// reading clears the marker. `nowMs` is injectable for tests.
+function mergeProviderUsage(result, nowMs = Date.now()) {
+  const good = loadLastGoodUsage()
   const map = new Map()
   const providers = result && Array.isArray(result.providers) ? result.providers : []
+  let changed = false
   for (const provider of providers) {
-    if (!provider || !provider.slug || !provider.usage) continue
-    map.set(String(provider.slug).toLowerCase(), provider.usage)
+    if (!provider || !provider.slug) continue
+    const slug = String(provider.slug).toLowerCase()
+    if (usageHasNumericWindows(provider.usage)) {
+      const previous = good.get(slug)
+      // Same cached response object: keep the original reading time, so the
+      // label ages from the fetch, not from every render.
+      if (!previous || previous.usage !== provider.usage) {
+        good.set(slug, { usage: provider.usage, seenAt: nowMs })
+        changed = true
+      }
+      map.set(slug, provider.usage)
+      continue
+    }
+    const entry = good.get(slug)
+    if (entry && nowMs - entry.seenAt <= LAST_GOOD_USAGE_MAX_AGE_MS) {
+      map.set(slug, { ...entry.usage, stale_since: entry.seenAt })
+    }
   }
+  // A provider row can vanish entirely on a failed fetch; fall back for those
+  // too, so a whole provider doesn't blink out of the card.
+  for (const [slug, entry] of good) {
+    if (map.has(slug)) continue
+    if (nowMs - entry.seenAt <= LAST_GOOD_USAGE_MAX_AGE_MS) {
+      map.set(slug, { ...entry.usage, stale_since: entry.seenAt })
+    }
+  }
+  if (changed) saveLastGoodUsage(good)
   return map
 }
 
@@ -500,7 +583,7 @@ function useProviderUsage() {
     staleTime: 30000,
     retry: 1
   })
-  return providerUsageMap(query && query.data)
+  return mergeProviderUsage(query && query.data)
 }
 
 // ProviderUsage -> PlanUsage's shape. A provider-wide gauge is `windows`; a
@@ -541,7 +624,10 @@ function providerUsageToQuota(usage) {
     }
   }
   if (!windows.some(window => Number.isFinite(window.used_percent))) return null
-  return { title, windows }
+  // A stale reading carries when it was actually read, so PlanUsage can label
+  // its age instead of passing old numbers off as current.
+  const asOf = Number.isFinite(usage.stale_since) ? usage.stale_since / 1000 : null
+  return { title, windows, as_of: asOf }
 }
 
 // The lane's provider may be an alias of the provider row model.options names.
@@ -1226,6 +1312,13 @@ function PlanUsage({ quota }) {
           ]
         }, `${window.label || 'window'}-${index}`)
       }),
+      quota.as_of != null && Number.isFinite(quota.as_of)
+        ? jsx('span', {
+            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            title: "The provider's usage check did not answer on the last refresh; showing the most recent good reading.",
+            children: `as of ${fmtResetTime(quota.as_of)} (last refresh failed)`
+          })
+        : null,
       planLineText
         ? jsx('span', {
             className: 'text-[0.6rem] text-(--ui-text-quaternary)',

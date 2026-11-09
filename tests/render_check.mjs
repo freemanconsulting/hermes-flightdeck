@@ -83,7 +83,7 @@ const factory = new Function(
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
   'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, requestTooltip, modelDisplayName }`
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, mergeProviderUsage, requestTooltip, modelDisplayName }`
 )
 const mod = factory(
   atom, Badge, Button, Component, EmptyState, Component, Component, Component,
@@ -899,15 +899,44 @@ const demoUsageText = textOf(mod.CloudCard({ model: demoUsageModel, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap }))
 check('demo model.quota takes precedence over live provider usage',
   demoUsageText.includes('weekly') && !demoUsageText.includes('5-hour'), demoUsageText.slice(0, 160))
+// 14b. A provider's usage fetch can fail intermittently (the Claude Code CLI
+//      outlasts its 8 s timeout). Keep the last good reading, labelled with its
+//      age; older than 15 min, show nothing; a fresh reading clears the label.
 providerUsageResult = { providers: [
   { slug: 'claude-subscription-directsdk-experimental', name: 'Claude', usage: null }
 ] }
-const noUsageMap = mod.useProviderUsage()
-const noUsageText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
-  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: noUsageMap }))
-check('no usage rendered when model.options returns no usage',
-  !noUsageText.includes('5-hour') && !noUsageText.includes('plan usage unavailable'),
-  noUsageText.slice(0, 160))
+const staleMap = mod.useProviderUsage()
+const staleText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: staleMap }))
+check('a failed refresh keeps the last good usage, labelled stale',
+  staleText.includes('5-hour') && staleText.includes('42% used')
+    && staleText.includes('last refresh failed'),
+  staleText.slice(0, 240))
+const staleQuota = mod.providerUsageToQuota(staleMap.get('claude-subscription-directsdk-experimental'))
+check('stale usage carries as_of in seconds and a tooltip on the age line',
+  staleQuota && staleQuota.as_of != null && staleQuota.as_of > 0
+    && elements(mod.PlanUsage({ quota: staleQuota })).some(el =>
+      el.props.title === "The provider's usage check did not answer on the last refresh; showing the most recent good reading."),
+  staleQuota ? `as_of=${staleQuota.as_of}` : 'no quota')
+const expiredMap = mod.mergeProviderUsage({ providers: [
+  { slug: 'claude-subscription-directsdk-experimental', name: 'Claude', usage: null }
+] }, Date.now() + 16 * 60 * 1000)
+const expiredText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: expiredMap }))
+check('last good usage older than 15 min renders nothing',
+  !expiredText.includes('5-hour') && !expiredText.includes('last refresh failed'),
+  expiredText.slice(0, 160))
+providerUsageResult = { providers: [
+  { slug: 'claude-subscription-directsdk-experimental', name: 'Claude',
+    usage: { windows: [{ label: '5-hour', used_percent: 42, resets_at: usageIso, scope: 'account' }] } }
+] }
+const freshMap = mod.useProviderUsage()
+const freshText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: freshMap }))
+check('a fresh usage reading clears the stale label',
+  freshText.includes('5-hour') && freshText.includes('42% used')
+    && !freshText.includes('last refresh failed'),
+  freshText.slice(0, 160))
 const accountQuota = mod.providerUsageToQuota({ windows: [], accounts: [
   { id: 'a1', label: 'Account 2', windows: [{ label: 'weekly', used_percent: 25,
     resets_at: usageIso, scope: 'model' }] }
