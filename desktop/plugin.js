@@ -630,6 +630,51 @@ function providerUsageToQuota(usage) {
   return { title, windows, as_of: asOf }
 }
 
+// Two cloud cards can report one subscription plan (the API lane and the
+// subscription-direct lane). Their numbers match even though the two sources
+// report the reset a minute apart (6:59 vs 7:00), so a fingerprint rounds the
+// reset to five minutes and the used percent to a whole number. Only
+// account-scope windows count: a model-specific cap is a per-model extra, not
+// the plan itself. Null means no numeric account window — never group on it.
+function planFingerprint(quota) {
+  if (!quota || typeof quota !== 'object' || !Array.isArray(quota.windows)) return null
+  const tokens = quota.windows
+    .filter(window => window && typeof window === 'object')
+    .filter(window => Number.isFinite(window.used_percent))
+    .filter(window => window.detail !== 'model-specific cap')
+    .map(window => {
+      const reset = Number.isFinite(window.reset_at)
+        ? Math.round(window.reset_at / 300) * 300
+        : 'none'
+      return `${Math.round(window.used_percent)}@${reset}`
+    })
+  if (!tokens.length) return null
+  return tokens.sort().join('|')
+}
+
+// The quota a cloud card shows: the snapshot's own block wins; live provider
+// usage is the fallback. Resolved once per card in ModelView so grouping and
+// rendering read the same quota.
+function resolveCloudPlanUsage(model, usageMap) {
+  return model.quota != null
+    ? model.quota
+    : providerUsageToQuota(providerUsageLookup(usageMap, model))
+}
+
+function quotaWindowCount(quota) {
+  if (!quota || typeof quota !== 'object' || !Array.isArray(quota.windows)) return 0
+  return quota.windows.filter(window => window && typeof window === 'object').length
+}
+
+// A short provider label for the shared-plan line: the two Claude lanes get
+// human names, any other provider keeps its slug.
+function providerPlanLabel(provider) {
+  const slug = String(provider || '').trim()
+  if (slug === 'claude-subscription-directsdk-experimental') return 'DirectSDK'
+  if (slug === 'anthropic') return 'API'
+  return slug || 'provider'
+}
+
 // The lane's provider may be an alias of the provider row model.options names.
 function providerUsageLookup(usageMap, model) {
   if (!usageMap || !model) return null
@@ -1335,7 +1380,7 @@ function PlanUsage({ quota }) {
   })
 }
 
-function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap }) {
+function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, planUsage, sharedWith }) {
   const quotaQ = useQuota(model.provider)
   // The snapshot's own quota block wins; the live session.stats gauge is only
   // a fallback for a lane the snapshot has no quota for.
@@ -1343,9 +1388,11 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap }) {
   const plan = model.quota != null ? null : planLine(quotaQ.data)
   // Live subscription usage comes from the public model.options RPC; the
   // backend fills model.quota in demo mode only, so a demo quota wins.
-  const planUsage = model.quota != null
-    ? model.quota
-    : providerUsageToQuota(providerUsageLookup(usageMap, model))
+  // ModelView resolves this once per card and passes it in; a direct call
+  // (tests, other callers) resolves it here.
+  const resolvedPlanUsage = planUsage === undefined
+    ? resolveCloudPlanUsage(model, usageMap)
+    : planUsage
   // `now` is ms (useNow); the tok/s series wants seconds.
   const winEnd = now / 1000
   const samples = cloudSamplesFromRequests(model.requests || [], winEnd - windowSeconds, winEnd)
@@ -1430,7 +1477,13 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap }) {
           })
         ]
       }),
-      jsx(PlanUsage, { quota: planUsage }),
+      sharedWith
+        ? jsx('span', {
+            className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+            title: 'Same subscription as the other card; usage counts once.',
+            children: `shared plan with ${modelDisplayName(sharedWith.model || sharedWith.provider)} (${providerPlanLabel(sharedWith.provider)})`
+          })
+        : jsx(PlanUsage, { quota: resolvedPlanUsage }),
       quota || plan
         ? jsxs('div', {
             className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
@@ -3063,6 +3116,29 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
   const idle = Array.isArray(snapshot.idle) ? snapshot.idle : []
   const source = snapshot.servers_source || 'none'
   const cloud = models.filter(model => model.lane === 'cloud')
+  // Resolve each cloud card's quota once, then group cards that report the same
+  // plan numbers. The card with more windows keeps the full bars (the Fable cap
+  // is an extra window, not a second plan); the rest show one shared-plan line.
+  const cloudCards = cloud.map(model => ({ model, planUsage: resolveCloudPlanUsage(model, usageMap) }))
+  const planGroups = new Map()
+  for (const card of cloudCards) {
+    const fingerprint = planFingerprint(card.planUsage)
+    if (fingerprint == null) continue
+    const group = planGroups.get(fingerprint)
+    if (group) group.push(card)
+    else planGroups.set(fingerprint, [card])
+  }
+  const sharedPlanByKey = new Map()
+  for (const group of planGroups.values()) {
+    if (group.length < 2) continue
+    let primary = group[0]
+    for (const card of group.slice(1)) {
+      if (quotaWindowCount(card.planUsage) > quotaWindowCount(primary.planUsage)) primary = card
+    }
+    for (const card of group) {
+      if (card !== primary) sharedPlanByKey.set(card.model.key, primary.model)
+    }
+  }
   const orphan = models.filter(model => model.lane !== 'cloud' &&
     (model.metrics === 'none' || !model.server_name))
   const queued = servers.reduce((sum, server) => sum + (server.waiting || 0), 0)
@@ -3244,7 +3320,11 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
             meta: "only this machine's Hermes requests; providers don't publish server load",
             children: jsx('div', {
               className: 'grid gap-2 xl:grid-cols-2',
-              children: cloud.map(model => jsx(CloudCard, { model, labels, now, windowSeconds, snapshot, usageMap }, model.key))
+              children: cloudCards.map(card => jsx(CloudCard, {
+                model: card.model, labels, now, windowSeconds, snapshot,
+                planUsage: card.planUsage,
+                sharedWith: sharedPlanByKey.get(card.model.key) || null
+              }, card.model.key))
             })
           })
         : null,

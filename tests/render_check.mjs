@@ -83,7 +83,7 @@ const factory = new Function(
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
   'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, mergeProviderUsage, requestTooltip, modelDisplayName }`
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, mergeProviderUsage, planFingerprint, requestTooltip, modelDisplayName }`
 )
 const mod = factory(
   atom, Badge, Button, Component, EmptyState, Component, Component, Component,
@@ -994,6 +994,80 @@ check('plan usage label cells are nowrap with the full label as tooltip',
     && planLabelSpans.every(item => item.props.style && item.props.style.whiteSpace === 'nowrap'
       && item.props.style.minWidth && !String(item.props.className).includes('truncate')),
   planLabelSpans.map(item => `${item.props.title}@${item.props.style && item.props.style.minWidth}`).join(', '))
+
+// 14c. Two cloud cards on one Claude subscription: the API lane and the
+//      subscription-direct lane report the same plan a minute apart. The card
+//      with more windows keeps the bars; the other shows one shared-plan line.
+//      Different numbers keep both cards' bars. planFingerprint is the gate.
+const sharedPlanT = 1762552800
+const baseCloudModel = JSON.parse(JSON.stringify(fixture.models.find(model => model.lane === 'cloud')))
+const anthropicPlanModel = {
+  ...baseCloudModel, key: 'anthropic|claude-opus-5-5', provider: 'anthropic',
+  model: 'claude-opus-5-5', base_url: 'https://api.anthropic.com',
+  quota: { windows: [{ label: 'Current week', used_percent: 6, reset_at: sharedPlanT }] }
+}
+const directsdkPlanModel = {
+  ...baseCloudModel, key: 'claude-subscription-directsdk-experimental|claude-opus-5-5',
+  provider: 'claude-subscription-directsdk-experimental', model: 'claude-opus-5-5',
+  base_url: 'process://claude-subscription-directsdk-experimental',
+  quota: { windows: [
+    { label: 'Current week', used_percent: 6, reset_at: sharedPlanT + 60 },
+    { label: 'Fable week', used_percent: 0, reset_at: sharedPlanT, detail: 'model-specific cap' }
+  ] }
+}
+const sharedPlanSnap = JSON.parse(JSON.stringify(fixture))
+sharedPlanSnap.models = [anthropicPlanModel, directsdkPlanModel]
+const sharedPlanView = mod.ModelView({ snapshot: sharedPlanSnap, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300 })
+const sharedPlanCards = elements(sharedPlanView).filter(el => el.type === 'article')
+const anthropicCard = sharedPlanCards.find(el => textOf(el).includes('api.anthropic.com'))
+const directsdkCard = sharedPlanCards.find(el => textOf(el).includes('process://claude-subscription-directsdk-experimental'))
+check('same plan: the card with more windows keeps the bars and the Fable cap',
+  directsdkCard && textOf(directsdkCard).includes('Fable week')
+    && textOf(directsdkCard).includes('6% used'),
+  directsdkCard ? textOf(directsdkCard).slice(0, 240) : 'directsdk card missing')
+check('same plan: the other card renders one shared-plan line, not the bars',
+  anthropicCard && textOf(anthropicCard).includes('shared plan with claude-opus-5-5 (DirectSDK)')
+    && !textOf(anthropicCard).includes('6% used') && !textOf(anthropicCard).includes('Fable week'),
+  anthropicCard ? textOf(anthropicCard).slice(0, 240) : 'anthropic card missing')
+check('shared-plan line carries the counts-once tooltip',
+  anthropicCard && elements(anthropicCard).some(el =>
+    el.props.title === 'Same subscription as the other card; usage counts once.'),
+  anthropicCard ? 'tooltip missing' : 'anthropic card missing')
+const differentPlanSnap = JSON.parse(JSON.stringify(sharedPlanSnap))
+differentPlanSnap.models[0].quota.windows[0].used_percent = 7
+const differentPlanView = mod.ModelView({ snapshot: differentPlanSnap, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300 })
+const differentPlanCards = elements(differentPlanView).filter(el => el.type === 'article')
+const differentAnthropic = differentPlanCards.find(el => textOf(el).includes('api.anthropic.com'))
+const differentDirectsdk = differentPlanCards.find(el => textOf(el).includes('process://claude-subscription-directsdk-experimental'))
+check('different plan numbers: both cards keep their own bars',
+  differentAnthropic && differentDirectsdk
+    && textOf(differentAnthropic).includes('7% used') && textOf(differentDirectsdk).includes('6% used')
+    && !textOf(differentAnthropic).includes('shared plan with')
+    && !textOf(differentDirectsdk).includes('shared plan with'),
+  `${differentAnthropic ? textOf(differentAnthropic).slice(0, 80) : 'anthropic missing'} | ${differentDirectsdk ? textOf(differentDirectsdk).slice(0, 80) : 'directsdk missing'}`)
+const sharedFingerprint = mod.planFingerprint(anthropicPlanModel.quota)
+check('plan fingerprint ignores the model cap and rounds the reset to 5 minutes',
+  sharedFingerprint != null && sharedFingerprint === mod.planFingerprint(directsdkPlanModel.quota),
+  `${sharedFingerprint} vs ${mod.planFingerprint(directsdkPlanModel.quota)}`)
+check('plan fingerprint differs when the numbers differ',
+  mod.planFingerprint({ windows: [{ label: 'Current week', used_percent: 7, reset_at: sharedPlanT }] }) !== sharedFingerprint,
+  mod.planFingerprint({ windows: [{ label: 'Current week', used_percent: 7, reset_at: sharedPlanT }] }))
+check('plan fingerprint is null without a numeric account window',
+  mod.planFingerprint(null) === null && mod.planFingerprint({ windows: [] }) === null
+    && mod.planFingerprint({ windows: [{ label: 'Fable week', used_percent: 0,
+      reset_at: sharedPlanT, detail: 'model-specific cap' }] }) === null,
+  'null quota, empty windows, model-only windows')
+check('plan fingerprint sorts windows so display order cannot split a plan',
+  mod.planFingerprint({ windows: [
+    { label: 'Current week', used_percent: 12, reset_at: sharedPlanT + 7200 },
+    { label: 'Current session', used_percent: 5, reset_at: sharedPlanT }
+  ] }) === mod.planFingerprint({ windows: [
+    { label: 'Current session', used_percent: 5, reset_at: sharedPlanT },
+    { label: 'Current week', used_percent: 12, reset_at: sharedPlanT + 7200 }
+  ] }),
+  'reversed window order')
 const holderSnap = JSON.parse(JSON.stringify(fixture))
 const holderModel = holderSnap.models.find(model => model.lane === 'cloud')
 holderSnap.agents[0].children
