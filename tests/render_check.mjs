@@ -30,6 +30,7 @@ const useMemo = fn => fn()
 const useRef = initial => ({ current: initial })
 
 let providerUsageResult = null
+let providerUsageError = false
 
 function useQuery({ queryKey }) {
   const kind = queryKey[1]
@@ -38,8 +39,8 @@ function useQuery({ queryKey }) {
   else if (kind === 'servers') data = { servers: querySnapshot.servers, totals: querySnapshot.totals, show_chip: true }
   else if (kind === 'labels') data = labels
   else if (kind === 'quota') data = null
-  else if (kind === 'provider-usage') data = host.request('model.options', {})
-  return { data, isLoading: false, isError: false, isFetching: false, refetch: () => {} }
+  else if (kind === 'provider-usage') data = providerUsageError ? null : host.request('model.options', {})
+  return { data, isLoading: false, isError: kind === 'provider-usage' && providerUsageError, isFetching: false, refetch: () => {} }
 }
 
 const opened = []
@@ -910,6 +911,75 @@ const usageText = textOf(mod.CloudCard({ model: { ...cloudModel, quota: null }, 
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap }))
 check('cloud card renders live model.options usage when model.quota is null',
   usageText.includes('5-hour') && usageText.includes('42% used'), usageText.slice(0, 160))
+check('ok usage renders bars and no waiting line',
+  usageText.includes('5-hour') && !usageText.includes('waiting for Hermes')
+    && !usageText.includes('could not ask Hermes'), usageText.slice(0, 160))
+
+// 14a. A provider row that exists but has no numeric window yet (all accounts
+//      unknown, or no usage key) must say so instead of rendering nothing.
+providerUsageResult = { providers: [
+  { slug: 'anthropic', name: 'Anthropic', usage: { accounts: [
+    { label: 'ANTHROPIC_TOKEN', windows: [], state: 'unknown' },
+    { label: 'claude_code', windows: [], state: 'unknown' }
+  ] } }
+] }
+const pendingMap = mod.useProviderUsage()
+const pendingModel = { ...cloudModel, provider: 'anthropic', quota: null }
+const pendingText = textOf(mod.CloudCard({ model: pendingModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: pendingMap }))
+check('provider row with accounts all unknown renders the waiting line',
+  pendingText.includes("plan usage: waiting for Hermes to read the provider's limits")
+    && !pendingText.includes('could not ask Hermes'), pendingText.slice(0, 200))
+const pendingLine = elements(mod.CloudCard({ model: pendingModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: pendingMap }))
+  .find(el => el.props.title && String(el.props.title).includes('last checked'))
+check('waiting line carries the model.options diagnostic tooltip',
+  pendingLine && String(pendingLine.props.title).includes('model.options')
+    && String(pendingLine.props.title).includes('hermes usage')
+    && String(pendingLine.props.title).includes('last checked'),
+  pendingLine ? pendingLine.props.title : 'no tooltip')
+
+// 14b. A failed model.options call gets its own line, not a silent blank.
+providerUsageError = true
+const errorMap = mod.useProviderUsage()
+const errorText = textOf(mod.CloudCard({ model: pendingModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: errorMap }))
+check('model.options error renders the could-not-ask line',
+  errorText.includes('plan usage: could not ask Hermes (model.options failed)')
+    && !errorText.includes('waiting for Hermes'), errorText.slice(0, 200))
+providerUsageError = false
+
+// 14c. A provider absent from model.options is one that never reports usage:
+//      the card stays clean, with no plan-usage line at all.
+providerUsageResult = { providers: [
+  { slug: 'other-provider', name: 'Other', usage: { windows: [
+    { label: 'Weekly', used_percent: 5, resets_at: usageIso, scope: 'account' }] } }
+] }
+const absentMap = mod.useProviderUsage()
+const absentText = textOf(mod.CloudCard({ model: pendingModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: absentMap }))
+check('provider absent from model.options renders no plan-usage line',
+  !absentText.includes('plan usage:') && !absentText.includes('waiting for Hermes')
+    && !absentText.includes('could not ask Hermes'), absentText.slice(0, 200))
+
+// 14d. Anthropic's two-account shape: the token account is unknown, the
+//      claude_code account has the real windows; the card shows the latter.
+providerUsageResult = { providers: [
+  { slug: 'anthropic', name: 'Anthropic', usage: { accounts: [
+    { label: 'ANTHROPIC_TOKEN', windows: [], state: 'unknown' },
+    { label: 'claude_code', windows: [
+      { label: 'Current week', used_percent: 12, resets_at: usageIso, scope: 'account' }],
+      state: 'ready' }
+  ] } }
+] }
+const twoAccountMap = mod.useProviderUsage()
+const twoAccountText = textOf(mod.CloudCard({ model: pendingModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap, usageMap: twoAccountMap }))
+check('anthropic two-account shape renders the claude_code Current week',
+  twoAccountText.includes('Current week') && twoAccountText.includes('12% used')
+    && twoAccountText.includes('account: claude_code')
+    && !twoAccountText.includes('ANTHROPIC_TOKEN')
+    && !twoAccountText.includes('waiting for Hermes'), twoAccountText.slice(0, 240))
 const demoUsageModel = { ...cloudModel, quota: { windows: [{ label: 'weekly', used_percent: 10,
   remaining_percent: 90, reset_at: fixture.generated_at + 7200 }] } }
 const demoUsageText = textOf(mod.CloudCard({ model: demoUsageModel, labels,

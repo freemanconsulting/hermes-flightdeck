@@ -539,9 +539,10 @@ function saveLastGoodUsage(map) {
 // comes back without usable usage falls back to its last good reading (with a
 // stale_since marker) while that reading is under 15 minutes old; a fresh
 // reading clears the marker. `nowMs` is injectable for tests.
-function mergeProviderUsage(result, nowMs = Date.now()) {
+function mergeProviderUsage(result, nowMs = Date.now(), failed = false) {
   const good = loadLastGoodUsage()
   const map = new Map()
+  const status = new Map()
   const providers = result && Array.isArray(result.providers) ? result.providers : []
   let changed = false
   for (const provider of providers) {
@@ -556,12 +557,22 @@ function mergeProviderUsage(result, nowMs = Date.now()) {
         changed = true
       }
       map.set(slug, provider.usage)
+      status.set(slug, { status: 'ok', lastCheckedAt: nowMs, rowPresent: true })
       continue
     }
     const entry = good.get(slug)
     if (entry && nowMs - entry.seenAt <= LAST_GOOD_USAGE_MAX_AGE_MS) {
       map.set(slug, { ...entry.usage, stale_since: entry.seenAt })
     }
+    // The row answered, but with no numeric window: Hermes has the provider
+    // and has not read its limits yet. A row with no usage key at all is the
+    // same story when there is no prior reading to fall back on.
+    const hasUsage = provider.usage && typeof provider.usage === 'object'
+    status.set(slug, {
+      status: hasUsage || !entry ? 'pending' : 'absent',
+      lastCheckedAt: nowMs,
+      rowPresent: true
+    })
   }
   // A provider row can vanish entirely on a failed fetch; fall back for those
   // too, so a whole provider doesn't blink out of the card.
@@ -571,6 +582,20 @@ function mergeProviderUsage(result, nowMs = Date.now()) {
       map.set(slug, { ...entry.usage, stale_since: entry.seenAt })
     }
   }
+  // Providers from the last good map that this response dropped: absent, and
+  // no row present, so a provider that never reports usage stays clean.
+  for (const slug of good.keys()) {
+    if (status.has(slug)) continue
+    status.set(slug, { status: 'absent', lastCheckedAt: nowMs, rowPresent: false })
+  }
+  if (failed) {
+    for (const [slug, entry] of status) {
+      status.set(slug, { ...entry, status: 'error', lastCheckedAt: nowMs })
+    }
+  }
+  map.status = status
+  map.lastCheckedAt = nowMs
+  map.error = !!failed
   if (changed) saveLastGoodUsage(good)
   return map
 }
@@ -583,7 +608,7 @@ function useProviderUsage() {
     staleTime: 30000,
     retry: 1
   })
-  return mergeProviderUsage(query && query.data)
+  return mergeProviderUsage(query && query.data, Date.now(), !!(query && query.isError))
 }
 
 // ProviderUsage -> PlanUsage's shape. A provider-wide gauge is `windows`; a
@@ -685,6 +710,43 @@ function providerUsageLookup(usageMap, model) {
     if (usage) return usage
   }
   return null
+}
+
+// The outcome of the latest model.options call for this model's provider:
+// 'ok' (numeric windows), 'pending' (row present, no numeric window yet),
+// 'absent' (row missing or no usage key), 'error' (the call failed), plus when
+// it was checked. `rowPresent` keeps a provider that never reports usage from
+// getting a waiting line.
+function providerUsageState(usageMap, model) {
+  if (!usageMap || !model) return null
+  if (usageMap.error) {
+    return { status: 'error', lastCheckedAt: usageMap.lastCheckedAt, rowPresent: false }
+  }
+  const names = [model.provider, ...(Array.isArray(model.provider_aliases) ? model.provider_aliases : [])]
+  for (const name of names) {
+    if (!name) continue
+    const entry = usageMap.status && usageMap.status.get(String(name).toLowerCase())
+    if (entry) return entry
+  }
+  return { status: 'absent', lastCheckedAt: usageMap.lastCheckedAt, rowPresent: false }
+}
+
+// One muted line for a card with no quota to render, so 'no reading yet' never
+// looks like a bug. Only a provider row that exists in model.options gets the
+// waiting line; a provider that never reports usage stays clean. A failed call
+// always gets its own line.
+function planUsageWaitingLine(state) {
+  if (!state) return null
+  const waiting = state.status === 'pending' || (state.status === 'absent' && state.rowPresent)
+  const failed = state.status === 'error'
+  if (!waiting && !failed) return null
+  const checked = fmtCheckedTime(state.lastCheckedAt)
+  return {
+    text: failed
+      ? 'plan usage: could not ask Hermes (model.options failed)'
+      : "plan usage: waiting for Hermes to read the provider's limits",
+    title: `Flightdeck reads plan limits from Hermes' model.options (the same data as \`hermes usage\`). Hermes refreshes them in the background; last checked ${checked || 'unknown'}.`
+  }
 }
 
 function quotaLine(stats, provider) {
@@ -938,6 +1000,14 @@ function fmtResetTime(resetAtSeconds) {
   const clock = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
   const days = (resetAtSeconds - Date.now() / 1000) / 86400
   return days > 1 ? `${RESET_WEEKDAYS[date.getDay()]} ${clock}` : clock
+}
+
+// When the provider usage check last ran, as a plain clock time for a tooltip.
+function fmtCheckedTime(ms) {
+  if (!Number.isFinite(ms)) return null
+  const date = new Date(ms)
+  if (!Number.isFinite(date.getTime())) return null
+  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 }
 
 function SlotBar({ total, running, waiting }) {
@@ -1312,9 +1382,19 @@ function ServerCard({ server, models, labels, now }) {
 // null). One row per window — label, the slot-gauge bar filled by used_percent,
 // '42% used · resets 3:10 PM'. A window with a null used_percent still shows
 // its label and reset, never a fake fill. `unavailable_reason` is one honest
-// muted line; a null quota renders nothing at all.
-function PlanUsage({ quota }) {
-  if (!quota || typeof quota !== 'object') return null
+// muted line; a null quota renders nothing at all unless the live usage check
+// has a pending/absent/error state, which gets one muted waiting line.
+function PlanUsage({ quota, state }) {
+  if (!quota || typeof quota !== 'object') {
+    const waiting = planUsageWaitingLine(state)
+    return waiting
+      ? jsx('span', {
+          className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+          title: waiting.title,
+          children: waiting.text
+        })
+      : null
+  }
   const windows = Array.isArray(quota.windows)
     ? quota.windows.filter(w => w && typeof w === 'object')
     : []
@@ -1413,6 +1493,7 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
   const resolvedPlanUsage = planUsage === undefined
     ? resolveCloudPlanUsage(model, usageMap)
     : planUsage
+  const planUsageState = providerUsageState(usageMap, model)
   // `now` is ms (useNow); the tok/s series wants seconds.
   const winEnd = now / 1000
   const samples = cloudSamplesFromRequests(model.requests || [], winEnd - windowSeconds, winEnd)
@@ -1521,7 +1602,7 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
             title: 'Same subscription as the other card; usage counts once.',
             children: `shared plan with ${modelDisplayName(sharedWith.model || sharedWith.provider)} (${providerPlanLabel(sharedWith.provider)})`
           })
-        : jsx(PlanUsage, { quota: resolvedPlanUsage }),
+        : jsx(PlanUsage, { quota: resolvedPlanUsage, state: planUsageState }),
       quota || plan
         ? jsxs('div', {
             className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
@@ -3354,7 +3435,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
               className: 'grid gap-2 xl:grid-cols-2',
               children: cloudCards.map(card => jsx(CloudCard, {
                 model: card.model, labels, now, windowSeconds, snapshot,
-                planUsage: card.planUsage,
+                planUsage: card.planUsage, usageMap,
                 sharedWith: sharedPlanByKey.get(card.model.key) || null
               }, card.model.key))
             })
