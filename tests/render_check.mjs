@@ -878,6 +878,30 @@ check('provider usage falls back to the first account with windows',
   JSON.stringify(accountQuota))
 check('provider usage with no numeric window returns null',
   mod.providerUsageToQuota({ windows: [{ label: 'x', used_percent: null }] }) === null)
+// Plan usage rows: the label cell must fit the longest window label whole
+// ('Current session'/'Current week' used to truncate to 'Current …'), and a
+// model-scoped window reads '· model cap' instead of 'model-specific cap'.
+const planQuota = mod.providerUsageToQuota({ windows: [
+  { label: 'Current session', used_percent: 5, resets_at: usageIso, scope: 'account' },
+  { label: 'Current week', used_percent: 12, resets_at: usageIso, scope: 'account' },
+  { label: 'Fable week', used_percent: 0, resets_at: usageIso, scope: 'model' }
+] })
+const planNode = mod.PlanUsage({ quota: planQuota })
+const planText = textOf(planNode)
+check('plan usage rows render full window labels and one model cap suffix',
+  planText.includes('Current session') && planText.includes('Current week')
+    && planText.includes('Fable week') && planText.includes('model cap')
+    && (planText.match(/model cap/g) || []).length === 1
+    && !planText.includes('model-specific cap'),
+  planText.slice(0, 200))
+const planLabelSpans = elements(planNode).filter(item =>
+  item.props.title === 'Current session' || item.props.title === 'Current week'
+    || item.props.title === 'Fable week')
+check('plan usage label cells are nowrap with the full label as tooltip',
+  planLabelSpans.length === 3
+    && planLabelSpans.every(item => item.props.style && item.props.style.whiteSpace === 'nowrap'
+      && item.props.style.minWidth && !String(item.props.className).includes('truncate')),
+  planLabelSpans.map(item => `${item.props.title}@${item.props.style && item.props.style.minWidth}`).join(', '))
 const holderSnap = JSON.parse(JSON.stringify(fixture))
 const holderModel = holderSnap.models.find(model => model.lane === 'cloud')
 holderSnap.agents[0].children

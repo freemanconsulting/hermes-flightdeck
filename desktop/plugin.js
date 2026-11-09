@@ -1159,6 +1159,11 @@ function PlanUsage({ quota }) {
     ? quota.windows.filter(w => w && typeof w === 'object')
     : []
   if (!windows.length && !quota.unavailable_reason) return null
+  const labelTexts = windows.map((window, index) => window.label || `window ${index + 1}`)
+  const longestLabel = labelTexts.reduce((longest, label) => label.length > longest.length ? label : longest, '')
+  // Fit the longest window label ('Current session', 'Fable week') without
+  // truncating: ~0.62rem per character at this size, floor 9.5rem, cap 14rem.
+  const labelWidth = `${Math.min(14, Math.max(9.5, longestLabel.length * 0.62))}rem`
   const planText = [
     quota.plan ? quota.title ? `${quota.plan} · ${quota.title}` : quota.plan : (quota.title || null),
     quota.source ? `via ${quota.source}` : null,
@@ -1179,8 +1184,10 @@ function PlanUsage({ quota }) {
           className: 'flex items-center gap-2 text-[0.65rem]',
           children: [
             jsx('span', {
-              className: 'w-14 shrink-0 truncate text-(--ui-text-tertiary)',
-              children: window.label || `window ${index + 1}`
+              className: 'shrink-0 text-(--ui-text-tertiary)',
+              style: { minWidth: labelWidth, whiteSpace: 'nowrap' },
+              title: labelTexts[index],
+              children: labelTexts[index]
             }),
             used == null
               ? jsx('span', {
@@ -1192,12 +1199,18 @@ function PlanUsage({ quota }) {
               className: 'tabular-nums text-(--ui-text-secondary)',
               children: text
             }),
-            window.detail
+            window.detail === 'model-specific cap'
               ? jsx('span', {
                   className: 'min-w-0 truncate text-(--ui-text-quaternary)',
-                  children: window.detail
+                  title: 'Weekly limit for this model family only; the account limit is the Current week row.',
+                  children: '· model cap'
                 })
-              : null
+              : window.detail
+                ? jsx('span', {
+                    className: 'min-w-0 truncate text-(--ui-text-quaternary)',
+                    children: window.detail
+                  })
+                : null
           ]
         }, `${window.label || 'window'}-${index}`)
       }),
