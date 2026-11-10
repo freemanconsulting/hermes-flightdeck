@@ -176,6 +176,34 @@ check('swim lane draw paints ≥6 local bars', localHits.length >= 6, `${localHi
 check('swim lane draw labels local and cloud lanes', drawn.fillText.includes('local') && drawn.fillText.includes('cloud'), drawn.fillText.filter(t => t === 'local' || t === 'cloud').join(', '))
 check('swim lane labels carry no tok/s text', !drawn.fillText.some(t => String(t).includes('tok/s')), drawn.fillText.filter(t => String(t).includes('tok/s')).join(', ') || 'no tok/s labels')
 
+// 2-chips. Name chips are solid pills: a roundRect with radius h/2 filled with
+//     the theme surface at 0.92 alpha, a 1 px border, the label in 600 12px —
+//     so the label reads on any bar colour — and no two chips overlap.
+{
+  const ops = []
+  const chipCtx = {
+    ...fakeCtx,
+    roundRect(x, y, w, h, r) { ops.push({ op: 'roundRect', x, y, w, h, r }) },
+    arc() {},
+    fill() { ops.push({ op: 'fill', fillStyle: chipCtx.fillStyle, alpha: chipCtx.globalAlpha }) },
+    stroke() { ops.push({ op: 'stroke', lineWidth: chipCtx.lineWidth }) },
+    fillText(text) { ops.push({ op: 'text', text, font: chipCtx.font }) }
+  }
+  const chipHits = mod.drawSwimLane(chipCtx, 900, 190, lanes, win, chipCtx, labels).filter(hit => hit.chip)
+  const pills = ops.flatMap((op, i) =>
+    op.op === 'roundRect' && ops[i + 1] && ops[i + 1].op === 'fill' && ops[i + 1].alpha === 0.92 ? [{ ...op, fill: ops[i + 1] }] : [])
+  const chipTexts = ops.filter(op => op.op === 'text' && op.font.startsWith('600 12px'))
+  const pillOk = pills.length === chipHits.length && pills.every(p =>
+    p.r === p.h / 2 && p.fill.fillStyle === 'var(--ui-bg-elevated)')
+  const strokeOk = ops.filter(op => op.op === 'stroke' && op.lineWidth === 1).length >= chipHits.length
+  const overlap = chipHits.some((a, i) => chipHits.some((b, j) =>
+    i < j && a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h))
+  check('swim-lane chips are solid pills: surface fill at 0.92, 1 px border, 600 12px label, no overlap',
+    chipHits.length > 0 && pillOk && strokeOk && chipTexts.length === chipHits.length && !overlap,
+    `${chipHits.length} chips, ${pills.length} pills (r=h/2, ${pills.map(p => p.fill.fillStyle).join(', ')}), ` +
+      `labels ${chipTexts.map(t => t.text).join(' | ')}${overlap ? ' — OVERLAP' : ''}`)
+}
+
 // 2a. The container grows with the lane count so no lane is ever clipped. The
 //     old fixed 190 px held 4 lanes of 56 px only until the 4th was drawn below
 //     the canvas. Build snapshots with an exact lane count (one server each).
@@ -1484,6 +1512,23 @@ function partA() {
     blocks.length === rowsA.length && blockWidths.every(ws => ws.length === 3 && ws[0] === W.flight && ws[1] === W.req && ws[2] === W.tokens)
       && W.flight + W.req + W.tokens + 24 <= 260 && blocks.every(block => block.props.style.flex === '0 0 auto'),
     `${blocks.length} blocks for ${rowsA.length} rows · ${W.flight}+${W.req}+${W.tokens}`)
+  // Subagent rows are subordinate: a 2 px left rule in the parent's accent,
+  // the lighter wash, a 500-weight name (parents 600); parents carry no rule.
+  // The parent link is tooltip-only ('subagent of …' on the card facts).
+  const subRows = rowsA.filter(row => row.props['data-agent-depth'] === '1')
+  const topRows = rowsA.filter(row => row.props['data-agent-depth'] === '0')
+  const nameWeight = row => {
+    const name = elements(row).find(el => el.props.style && el.props.style.fontWeight != null &&
+      /rem$/.test(String(el.props.style.fontSize || '')))
+    return name ? name.props.style.fontWeight : null
+  }
+  const parentCaption = A.agentCardFacts(parent.children[0], {}, NOW_MS, parent).parentOf
+  check('By agent: subagent rows carry the 2 px accent left rule; parents do not; parent link is tooltip-only',
+    subRows.length > 0 && subRows.every(row => /^2px solid \S/.test(row.props.style.borderLeft || '') &&
+      row.props.style.background && nameWeight(row) === 500) &&
+      topRows.length > 0 && topRows.every(row => !row.props.style.borderLeft && nameWeight(row) === 600) &&
+      /^subagent of \S/.test(parentCaption || '') && !/subagent of/.test(byAgentText),
+    `${subRows.length} subagent rows (${subRows[0] ? subRows[0].props.style.borderLeft : 'none'}), ${topRows.length} parents · card: ${parentCaption}`)
   const card = A.agentCardFacts(parent.children[3], {}, NOW_MS)
   check('By agent card carries the full goal, kind and per-model lines',
     card.full && card.full.includes('I2-health-backend.md') && card.meta.startsWith('subagent') && card.models.length > 0,

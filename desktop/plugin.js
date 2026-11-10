@@ -344,6 +344,9 @@ const TONE_LOCAL = 'var(--ui-green, #1f8a65)'
 const TONE_CLOUD = 'hsl(214 82% 56%)'
 const TONE_QUEUED = 'var(--ui-red, #cf2d56)'
 const TONE_AMBER = 'hsl(36 92% 50%)'
+// The prefill line/dot of a throughput sparkline: a graphic, not text, so the
+// tertiary tint (≥3:1 on both themes) keeps it a step behind the decode line.
+const PREFILL_TONE = 'var(--ui-text-tertiary)'
 
 // A compact agent label for chips, the legend, HELD BY rows and the By agent
 // name: a session's title, a cron's job, a subagent's goal — cut to its first
@@ -427,7 +430,7 @@ function kickerStyle(extra) {
     fontWeight: 600,
     letterSpacing: '0.08em',
     textTransform: 'uppercase',
-    color: 'var(--ui-text-quaternary)',
+    color: 'var(--ui-text-secondary)',
     ...extra
   }
 }
@@ -464,7 +467,7 @@ function BigStat({ value, label, tone, title, size, col, align, width }) {
           fontSize: '0.6rem',
           lineHeight: 1.3,
           whiteSpace: 'nowrap',
-          color: 'var(--ui-text-quaternary)'
+          color: 'var(--ui-text-secondary)'
         },
         children: label
       })
@@ -908,11 +911,11 @@ function Section({ label, meta, children }) {
         className: 'flex items-baseline gap-2 px-0.5',
         children: [
           jsx('h2', {
-            className: 'text-[0.65rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)',
+            className: 'text-[0.65rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-secondary)',
             children: label
           }),
           meta
-            ? jsx('span', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: meta })
+            ? jsx('span', { className: 'text-[0.65rem] text-(--ui-text-secondary)', children: meta })
             : null
         ]
       }),
@@ -927,7 +930,7 @@ function Stat({ label, value, tone }) {
     children: [
       tone ? jsx('span', { className: cn('size-1.5 self-center rounded-full', tone) }) : null,
       jsx('span', { className: 'tabular-nums font-semibold text-(--ui-text-primary)', children: value }),
-      jsx('span', { className: 'text-(--ui-text-quaternary)', children: label })
+      jsx('span', { className: 'text-(--ui-text-secondary)', children: label })
     ]
   })
 }
@@ -937,7 +940,7 @@ function Metric({ label, value, accent, title }) {
     className: 'inline-flex items-baseline gap-1',
     title: title || undefined,
     children: [
-      jsx('span', { className: 'text-(--ui-text-quaternary)', children: label }),
+      jsx('span', { className: 'text-(--ui-text-secondary)', children: label }),
       jsx('span', {
         className: cn('tabular-nums font-medium', accent ? 'text-(--ui-accent)' : 'text-(--ui-text-primary)'),
         children: value
@@ -1032,11 +1035,11 @@ function RingGauge({ id, fraction, label, sub, title, tone }) {
         style: { display: 'flex', flexDirection: 'column', minWidth: 0, lineHeight: 1.25 },
         children: [
           jsx('span', {
-            style: { fontSize: '0.7rem', fontWeight: 500, whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
+            style: { fontSize: '0.7rem', fontWeight: 500, whiteSpace: 'nowrap', color: 'var(--ui-text-primary)' },
             children: label
           }),
           jsx('span', {
-            style: { fontSize: '0.6rem', whiteSpace: 'nowrap', color: 'var(--ui-text-tertiary)' },
+            style: { fontSize: '0.6rem', whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
             children: sub
           })
         ]
@@ -1094,7 +1097,7 @@ function StatLine({ kicker, kickerTitle, items, data }) {
       ...items.map(item => jsx('span', {
         'data-stat': item.id,
         title: item.title || undefined,
-        style: { whiteSpace: 'nowrap', color: 'var(--ui-text-tertiary)' },
+        style: { whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
         children: item.parts.map((part, index) => jsx('span', {
           style: index % 2
             ? { fontWeight: 600, fontVariantNumeric: 'tabular-nums', color: item.tone || 'var(--ui-text-primary)' }
@@ -1197,7 +1200,7 @@ function fmtCheckedTime(ms) {
 
 function SlotBar({ total, running, waiting }) {
   if (total == null) {
-    return jsx('span', { className: 'text-[0.65rem] text-(--ui-text-quaternary)', children: 'no slot gauge' })
+    return jsx('span', { className: 'text-[0.65rem] text-(--ui-text-secondary)', children: 'no slot gauge' })
   }
   const cells = []
   const slots = Math.max(0, Math.min(Math.round(total), 24))
@@ -1237,6 +1240,14 @@ function SlotBar({ total, running, waiting }) {
 
 // Throughput sparkline, full card width. `caption` (left) names what the
 // chart is; the legend and the decode max sit on the right of the same row.
+// Strokes are screen pixels (non-scaling): 2 px decode over 1.5 px prefill,
+// with an 0.18 area fill under decode so the shape reads at a glance.
+const SPARK_VIEW_H = 30
+const SPARK_PLOT_H = 36
+const SPARK_DECODE_W = 2
+const SPARK_PREFILL_W = 1.5
+const SPARK_FILL_ALPHA = 0.18
+
 function Sparkline({ samples, caption, captionTitle, span, tone }) {
   const series = useMemo(() => {
     if (!Array.isArray(samples) || samples.length < 2) return null
@@ -1251,21 +1262,25 @@ function Sparkline({ samples, caption, captionTitle, span, tone }) {
     if (maxDecode <= 0 && maxPrefill <= 0) return null
     const decode = []
     const prefill = []
+    // Plot box SPARK_VIEW_H tall; the lines keep ~2 units of headroom so a
+    // 2 px stroke at the max never clips at the top edge.
+    const base = SPARK_VIEW_H - 1
+    const rise = SPARK_VIEW_H - 4
     for (let i = 0; i < rows.length; i += 1) {
       const x = (i / (rows.length - 1)) * 100
-      decode.push(`${x.toFixed(2)},${(25 - (rows[i][1] / (maxDecode || 1)) * 22).toFixed(2)}`)
-      prefill.push(`${x.toFixed(2)},${(25 - (rows[i][2] / (maxPrefill || 1)) * 22).toFixed(2)}`)
+      decode.push(`${x.toFixed(2)},${(base - (rows[i][1] / (maxDecode || 1)) * rise).toFixed(2)}`)
+      prefill.push(`${x.toFixed(2)},${(base - (rows[i][2] / (maxPrefill || 1)) * rise).toFixed(2)}`)
     }
     return {
       decode: decode.join(' '), prefill: prefill.join(' '),
-      area: `0,26 ${decode.join(' ')} 100,26`, maxDecode, maxPrefill
+      area: `0,${SPARK_VIEW_H} ${decode.join(' ')} 100,${SPARK_VIEW_H}`, maxDecode, maxPrefill
     }
   }, [samples])
 
   if (!series) return null
   const line = tone || 'var(--ui-accent)'
   const dot = color => jsx('span', {
-    style: { width: '5px', height: '5px', borderRadius: '999px', background: color, flex: '0 0 auto' }
+    style: { width: '6px', height: '6px', borderRadius: '999px', background: color, flex: '0 0 auto' }
   })
   return jsxs('div', {
     'data-sparkline': 'throughput',
@@ -1274,7 +1289,7 @@ function Sparkline({ samples, caption, captionTitle, span, tone }) {
       jsxs('div', {
         style: {
           display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0,
-          fontSize: '0.6rem', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary)'
+          fontSize: '0.6rem', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary)'
         },
         children: [
           jsx('span', {
@@ -1284,7 +1299,7 @@ function Sparkline({ samples, caption, captionTitle, span, tone }) {
           }),
           jsxs('span', {
             style: { display: 'inline-flex', alignItems: 'center', gap: '4px', flex: '0 0 auto' },
-            children: [dot(line), 'decode', dot('var(--ui-text-quaternary)'), 'prefill']
+            children: [dot(line), 'decode', dot(PREFILL_TONE), 'prefill']
           }),
           jsx('span', {
             style: { flex: '0 0 auto', whiteSpace: 'nowrap' },
@@ -1293,32 +1308,37 @@ function Sparkline({ samples, caption, captionTitle, span, tone }) {
         ]
       }),
       jsxs('svg', {
-        viewBox: '0 0 100 26',
+        viewBox: `0 0 100 ${SPARK_VIEW_H}`,
         preserveAspectRatio: 'none',
-        style: { display: 'block', width: '100%', height: '28px' },
+        style: { display: 'block', width: '100%', height: `${SPARK_PLOT_H}px` },
         'aria-hidden': 'true',
         children: [
           jsx('line', {
-            x1: 0, y1: 25.5, x2: 100, y2: 25.5,
-            stroke: 'var(--ui-stroke-secondary)', strokeWidth: 0.5,
+            x1: 0, y1: SPARK_VIEW_H - 0.5, x2: 100, y2: SPARK_VIEW_H - 0.5,
+            stroke: 'var(--ui-stroke-secondary)', strokeWidth: 1,
             vectorEffect: 'non-scaling-stroke'
           }),
-          jsx('polygon', { points: series.area, fill: line, opacity: 0.1 }),
+          jsx('polygon', { 'data-spark-area': '', points: series.area, fill: line, opacity: SPARK_FILL_ALPHA }),
+          // Prefill under decode, so the decode line always reads on top.
           jsx('polyline', {
+            'data-spark-line': 'prefill',
+            points: series.prefill,
+            fill: 'none',
+            stroke: PREFILL_TONE,
+            strokeWidth: SPARK_PREFILL_W,
+            vectorEffect: 'non-scaling-stroke',
+            strokeLinejoin: 'round',
+            strokeLinecap: 'round'
+          }),
+          jsx('polyline', {
+            'data-spark-line': 'decode',
             points: series.decode,
             fill: 'none',
             stroke: line,
-            strokeWidth: 1.4,
+            strokeWidth: SPARK_DECODE_W,
             vectorEffect: 'non-scaling-stroke',
-            strokeLinejoin: 'round'
-          }),
-          jsx('polyline', {
-            points: series.prefill,
-            fill: 'none',
-            stroke: 'var(--ui-text-quaternary)',
-            strokeWidth: 1,
-            vectorEffect: 'non-scaling-stroke',
-            strokeLinejoin: 'round'
+            strokeLinejoin: 'round',
+            strokeLinecap: 'round'
           })
         ]
       })
@@ -1353,7 +1373,7 @@ function RequestSparkline({ buckets, caption, captionTitle, tone }) {
       jsxs('div', {
         style: {
           display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0,
-          fontSize: '0.6rem', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary)'
+          fontSize: '0.6rem', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary)'
         },
         children: [
           jsx('span', {
@@ -1367,7 +1387,7 @@ function RequestSparkline({ buckets, caption, captionTitle, tone }) {
       jsxs('svg', {
         viewBox: '0 0 100 20',
         preserveAspectRatio: 'none',
-        style: { display: 'block', width: '100%', height: '22px' },
+        style: { display: 'block', width: '100%', height: `${SPARK_PLOT_H}px` },
         'aria-hidden': 'true',
         children: [
           jsx('line', {
@@ -1378,7 +1398,7 @@ function RequestSparkline({ buckets, caption, captionTitle, tone }) {
           series.bars.map(bar =>
             jsx('rect', {
               x: bar.x, y: 20 - bar.height, width: bar.width, height: bar.height,
-              fill: tone || 'var(--ui-accent)', opacity: bar.count > 0 ? 0.7 : 0
+              fill: tone || 'var(--ui-accent)', opacity: bar.count > 0 ? 0.8 : 0
             }, `bucket-${bar.x}`)
           )
         ]
@@ -1435,7 +1455,7 @@ function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
                         title: agent.model,
                         style: {
                           flex: '0 1 auto', maxWidth: '9rem', overflow: 'hidden', textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)'
+                          whiteSpace: 'nowrap', fontSize: '0.6rem', color: 'var(--ui-text-secondary)'
                         },
                         children: laneModelShort(agent.model)
                       })
@@ -1444,7 +1464,7 @@ function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
                     title: 'how long its oldest in-flight request has been open',
                     style: {
                       flex: '0 0 auto', minWidth: '3rem', textAlign: 'right', fontVariantNumeric: 'tabular-nums',
-                      color: 'var(--ui-text-tertiary)'
+                      color: 'var(--ui-text-secondary)'
                     },
                     children: elapsedOf(agent.oldest_started_at, now) || '—'
                   }),
@@ -1457,19 +1477,19 @@ function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
             )
           })
         : jsx('span', {
-            style: { fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)' },
+            style: { fontSize: '0.6875rem', color: 'var(--ui-text-secondary)' },
             children: 'no in-flight request observed'
           }),
       rest.length
         ? jsx('span', {
-            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
             title: rest.map(agent => fullAgentText(rowOf(agent), labels)).join('\n'),
             children: `+${rest.length} more`
           })
         : null,
       unattributed > 0
         ? jsxs('div', {
-            className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+            className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-secondary)',
             title: 'The server counts these as running, but no Hermes row on this machine matches them.',
             children: [
               jsx('span', {
@@ -1482,7 +1502,7 @@ function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
         : null,
       over > 0
         ? jsx('span', {
-            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
             title: 'Hermes has these requests open, but the server does not count them as running yet (queued at the client, or closing).',
             children: `${plural(over, 'row')} the server does not count (queued or closing)`
           })
@@ -1560,7 +1580,7 @@ function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300
     children: [
       jsx('span', { style: { fontWeight: 600, color: 'var(--ui-text-primary)' }, children: server.name }),
       modelShort
-        ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: ` · ${modelShort}` })
+        ? jsx('span', { style: { color: 'var(--ui-text-secondary)' }, children: ` · ${modelShort}` })
         : null
     ]
   })
@@ -1593,12 +1613,12 @@ function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300
           jsx('span', {
             style: {
               marginLeft: 'auto', flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)'
+              whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)'
             },
             children: `idle · no Hermes requests in ${span}`
           }),
           jsx(Badge, { variant: verdict.variant, size: 'xs', children: verdict.label }),
-          jsx(Codicon, { name: 'chevron-down', size: 12, className: 'shrink-0 text-(--ui-text-quaternary)' })
+          jsx(Codicon, { name: 'chevron-down', size: 12, className: 'shrink-0 text-(--ui-text-secondary)' })
         ]
       })
     })
@@ -1671,7 +1691,7 @@ function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300
           jsx(Badge, { variant: verdict.variant, size: 'xs', children: verdict.label }),
           jsx('span', {
             title: server.error ? 'the last probe failed' : 'when Flightdeck last read this server',
-            style: { marginLeft: 'auto', flex: '0 0 auto', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            style: { marginLeft: 'auto', flex: '0 0 auto', fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
             children: server.error ? 'unreachable' : sampled != null ? `live · ${fmtAgo(sampled, now)}` : 'live'
           }),
           quiet
@@ -1681,7 +1701,7 @@ function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300
                 'aria-label': `Fold ${server.name} to one line`,
                 title: 'Fold to one line',
                 onClick: () => setExpanded(false),
-                style: { ...BUTTON_RESET, display: 'inline-flex', flex: '0 0 auto', color: 'var(--ui-text-quaternary)' },
+                style: { ...BUTTON_RESET, display: 'inline-flex', flex: '0 0 auto', color: 'var(--ui-text-secondary)' },
                 children: jsx(Codicon, { name: 'chevron-up', size: 12 })
               })
             : null
@@ -1707,7 +1727,7 @@ function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300
                   }),
                   jsx('span', {
                     title: 'Requests the server can run at once; more than this wait in its queue.',
-                    style: { fontSize: '0.65rem', color: 'var(--ui-text-tertiary)' },
+                    style: { fontSize: '0.65rem', color: 'var(--ui-text-secondary)' },
                     children: 'slots'
                   }),
                   server.waiting > 0
@@ -1744,7 +1764,7 @@ function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300
           span: '5m',
           tone: TONE_LOCAL
         }) || jsx('span', {
-          style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+          style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
           children: `decode / prefill · no throughput in the last 5m`
         })
       })
@@ -1764,7 +1784,7 @@ function PlanUsage({ quota, state, tone }) {
     const waiting = planUsageWaitingLine(state)
     return waiting
       ? jsx('span', {
-          style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+          style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
           title: waiting.title,
           children: waiting.text
         })
@@ -1796,7 +1816,7 @@ function PlanUsage({ quota, state, tone }) {
                     title: planText,
                     style: {
                       minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      fontSize: '0.6rem', color: 'var(--ui-text-quaternary)'
+                      fontSize: '0.6rem', color: 'var(--ui-text-secondary)'
                     },
                     children: `· ${planText}`
                   })
@@ -1825,12 +1845,12 @@ function PlanUsage({ quota, state, tone }) {
                 modelCap
                   ? jsx('span', {
                       title: 'Weekly limit for this model family only; the account limit is the Current week row.',
-                      style: { flex: '0 0 auto', whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)' },
+                      style: { flex: '0 0 auto', whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
                       children: '· model cap'
                     })
                   : window.detail
                     ? jsx('span', {
-                        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)' },
+                        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
                         children: window.detail
                       })
                     : null,
@@ -1838,7 +1858,7 @@ function PlanUsage({ quota, state, tone }) {
                   'data-plan-text': '',
                   style: {
                     marginLeft: 'auto', flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-tertiary)'
+                    whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary)'
                   },
                   children: used == null
                     ? [reset ? `no usage reported · resets ${reset}` : 'no usage reported']
@@ -1858,14 +1878,14 @@ function PlanUsage({ quota, state, tone }) {
       }),
       quota.as_of != null && Number.isFinite(quota.as_of)
         ? jsx('span', {
-            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
             title: "The provider's usage check did not answer on the last refresh; showing the most recent good reading.",
             children: `as of ${fmtResetTime(quota.as_of)} (last refresh failed)`
           })
         : null,
       quota.unavailable_reason
         ? jsx('span', {
-            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
             children: `plan usage unavailable: ${quota.unavailable_reason}`
           })
         : null
@@ -1991,7 +2011,7 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
             tone: inFlight > 0 ? 'good' : 'muted',
             className: cn('size-2 shrink-0', inFlight > 0 && 'animate-pulse')
           }),
-          jsx(Codicon, { name: 'cloud', size: 12, className: 'shrink-0 text-(--ui-text-tertiary)' }),
+          jsx(Codicon, { name: 'cloud', size: 12, className: 'shrink-0 text-(--ui-text-secondary)' }),
           jsx('span', {
             title: fullLabel,
             style: {
@@ -2005,7 +2025,7 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
             title: headerTitle,
             style: {
               flex: '0 0 auto', whiteSpace: 'nowrap', fontSize: '0.6rem', fontWeight: 500,
-              padding: '1px 6px', borderRadius: '999px', color: 'var(--ui-text-tertiary)',
+              padding: '1px 6px', borderRadius: '999px', color: 'var(--ui-text-secondary)',
               boxShadow: 'inset 0 0 0 1px var(--ui-stroke-secondary)'
             },
             children: providerLabel
@@ -2038,14 +2058,14 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
       jsx(StatLine, { data: 'cloud-detail', items: detailItems }),
       sharedWith
         ? jsx('span', {
-            style: { fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' },
+            style: { fontSize: '0.65rem', color: 'var(--ui-text-secondary)' },
             title: 'Same subscription as the other card; usage counts once.',
             children: `shared plan with ${modelDisplayName(sharedWith.model || sharedWith.provider)} (${providerPlanLabel(sharedWith.provider)})`
           })
         : jsx(PlanUsage, { quota: resolvedPlanUsage, state: planUsageState, tone: TONE_CLOUD }),
       quota || plan
         ? jsxs('div', {
-            className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
+            className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-secondary)',
             children: [
               quota ? jsx('span', { className: 'tabular-nums', children: quota }) : null,
               plan ? jsx('span', { className: 'tabular-nums', children: plan }) : null
@@ -2058,7 +2078,7 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
         style: { minWidth: 0, marginTop: 'auto' },
         children: chart || jsx('span', {
           title: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
-          style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+          style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
           children: `decode / prefill · ${span} · Hermes-observed · no streamed output yet`
         })
       })
@@ -2090,7 +2110,7 @@ function NoServerCard({ model, labels, now }) {
           }),
           jsx(Badge, { variant: 'outline', size: 'xs', children: 'no server metrics' }),
           jsx('span', {
-            className: 'ml-auto truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+            className: 'ml-auto truncate font-mono text-[0.6rem] text-(--ui-text-secondary)',
             children: model.base_url
           })
         ]
@@ -2139,7 +2159,7 @@ function NoServerCard({ model, labels, now }) {
         ]
       }),
       jsxs('div', {
-        className: 'flex items-center gap-2 text-[0.65rem] text-(--ui-text-quaternary)',
+        className: 'flex items-center gap-2 text-[0.65rem] text-(--ui-text-secondary)',
         children: [
           jsx('span', {
             children: 'base_url matches no declared server; numbers are Hermes hook rows only'
@@ -2297,7 +2317,7 @@ function RequestCard({ facts, color, text, left, top }) {
           }),
           jsx('span', {
             style: {
-              fontSize: '0.65rem', color: 'var(--ui-text-tertiary)',
+              fontSize: '0.65rem', color: 'var(--ui-text-secondary)',
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
             },
             children: facts.modelLine
@@ -2317,7 +2337,7 @@ function RequestCard({ facts, color, text, left, top }) {
       facts.full
         ? jsx('span', {
             style: {
-              fontSize: '0.65rem', lineHeight: 1.35, color: 'var(--ui-text-tertiary)',
+              fontSize: '0.65rem', lineHeight: 1.35, color: 'var(--ui-text-secondary)',
               display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
               borderTop: '1px solid var(--ui-stroke-secondary)', paddingTop: '6px'
             },
@@ -2676,30 +2696,54 @@ function swimLaneHeight(lanesOrCount) {
   return Math.max(SWIM_LANE_MIN_H, SWIM_LANE_TOP + SWIM_LANE_AXIS_H + want)
 }
 
-// One name chip on the canvas: rounded, opaque elevated surface, agent-colour
-// rule on the left, primary text. Falls back to plain rects on a context with
-// no roundRect.
+// One name chip on the canvas: a pill on the theme surface at CHIP_BG_ALPHA
+// (so the label reads on any bar colour), a 1 px agent-colour border, an
+// agent-colour dot, then the label in 12 px semibold primary text. Falls back
+// to plain rects on a context with no roundRect.
+const CHIP_FONT_PX = 12
+const CHIP_BG_ALPHA = 0.92
+const CHIP_PAD_L = 7
+const CHIP_DOT = 6
+const CHIP_DOT_GAP = 5
+const CHIP_PAD_R = 8
+// Everything in a chip that is not label text: the width is this plus the
+// measured label.
+const CHIP_CHROME_W = CHIP_PAD_L + CHIP_DOT + CHIP_DOT_GAP + CHIP_PAD_R
+
 function drawChip(ctx2, x, y, w, h, color, text, theme) {
+  const r = h / 2
   ctx2.save()
-  ctx2.globalAlpha = 1
+  ctx2.globalAlpha = CHIP_BG_ALPHA
   ctx2.fillStyle = theme.surface
+  ctx2.beginPath()
+  if (typeof ctx2.roundRect === 'function') {
+    ctx2.roundRect(x, y, w, h, r)
+    ctx2.fill()
+  } else {
+    ctx2.fillRect(x, y, w, h)
+  }
+  ctx2.globalAlpha = 1
   ctx2.strokeStyle = color
   ctx2.lineWidth = 1
   if (typeof ctx2.roundRect === 'function') {
     ctx2.beginPath()
-    ctx2.roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 4)
-    ctx2.fill()
+    ctx2.roundRect(x + 0.5, y + 0.5, w - 1, h - 1, r - 0.5)
     ctx2.stroke()
   } else {
-    ctx2.fillRect(x, y, w, h)
     ctx2.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1)
   }
   ctx2.fillStyle = color
-  ctx2.fillRect(x + 3, y + 3, 2, h - 6)
+  if (typeof ctx2.arc === 'function') {
+    ctx2.beginPath()
+    ctx2.arc(x + CHIP_PAD_L + CHIP_DOT / 2, y + h / 2, CHIP_DOT / 2, 0, Math.PI * 2)
+    ctx2.fill()
+  } else {
+    ctx2.fillRect(x + CHIP_PAD_L, y + h / 2 - CHIP_DOT / 2, CHIP_DOT, CHIP_DOT)
+  }
   ctx2.fillStyle = theme.text
   ctx2.font = theme.chipFont
   ctx2.textBaseline = 'middle'
-  ctx2.fillText(text, x + 8, y + h / 2 + 0.5)
+  ctx2.fillText(text, x + CHIP_PAD_L + CHIP_DOT + CHIP_DOT_GAP, y + h / 2 + 0.5)
   ctx2.restore()
 }
 
@@ -2720,15 +2764,19 @@ function shadeColor(color, amount) {
 function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySession) {
   const style = getComputedStyle(canvas)
   const accent = style.getPropertyValue('--ui-accent').trim() || 'currentColor'
-  const dim = style.getPropertyValue('--ui-text-quaternary').trim() || 'currentColor'
+  // Canvas text: lane names and the peak label in the primary text colour,
+  // everything else (lane detail, axis, 'of N slots', idle) in the secondary
+  // text colour — never the tertiary/quaternary tints, which fall under 4.5:1
+  // on the light theme.
+  const dim = style.getPropertyValue('--ui-text-secondary').trim() || 'currentColor'
   const stroke = style.getPropertyValue('--ui-stroke-secondary').trim() || 'currentColor'
-  const text = style.getPropertyValue('--ui-text-tertiary').trim() || 'currentColor'
+  const text = style.getPropertyValue('--ui-text-primary').trim() || 'currentColor'
   const localTone = style.getPropertyValue('--ui-green').trim() || '#1f8a65'
   const family = style.fontFamily || 'sans-serif'
   const theme = {
     surface: style.getPropertyValue('--ui-bg-elevated').trim() || style.getPropertyValue('--ui-bg-editor').trim() || '#ffffff',
     text: style.getPropertyValue('--ui-text-primary').trim() || 'currentColor',
-    chipFont: `600 10px ${family}`
+    chipFont: `600 ${CHIP_FONT_PX}px ${family}`
   }
   const placed = []
   const chipHits = []
@@ -2757,7 +2805,7 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
   ctx2.textAlign = 'left'
 
   if (!lanes.length) {
-    ctx2.fillStyle = text
+    ctx2.fillStyle = dim
     ctx2.font = '11px sans-serif'
     ctx2.fillText('no local or cloud traffic in this window', gutter, height / 2)
     return hits
@@ -2812,7 +2860,7 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
         const x2 = Math.max(x1 + 2, xOf(tick.end) - 2)
         const tickH = Math.max(2, (tick.count / maxCount) * plotH)
         ctx2.fillRect(x1, baseY - tickH, Math.max(2, x2 - x1), tickH)
-        ctx2.fillStyle = text
+        ctx2.fillStyle = dim
         ctx2.font = '8px sans-serif'
         ctx2.fillText(String(tick.count), x1, baseY - tickH - 6)
         ctx2.fillStyle = accent
@@ -2886,7 +2934,9 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
       // extend left over the row's own history); a finished bar gets a chip
       // only when the whole chip fits inside it. Chips never overlap.
       if (rowH >= 9) {
-        const chipH = Math.min(15, Math.max(11, Math.round(rowH + 1)))
+        // 12 px text needs an 18 px pill; on thin stacked rows the pill may
+        // overhang its bar into the row gaps, never another chip.
+        const chipH = rowH >= 12 ? 18 : 16
         const named = new Set()
         const candidates = hits.slice(laneHitStart)
           .map(hit => ({ hit, live: hit.request.ended_at == null }))
@@ -2898,13 +2948,13 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
           if (!live && hit.w < 48) break
           const row = (rowBySession && rowBySession.get(hit.request.session_id)) ||
             { kind: hit.request.kind, profile: hit.request.profile, session_id: hit.request.session_id }
-          const room = live ? Math.min(170, Math.max(64, plotW * 0.4)) : hit.w - 6
-          const chipText = truncateText(ctx2, shortAgentLabel(row, labels || {}), room - 12)
+          const room = live ? Math.min(210, Math.max(80, plotW * 0.4)) : hit.w - 6
+          const chipText = truncateText(ctx2, shortAgentLabel(row, labels || {}), room - CHIP_CHROME_W)
           // A stub like 'Depl…' names nothing: a cut label needs a few real
           // characters (more on a finished bar, which is optional anyway).
           const cut = chipText.endsWith('…')
           if (chipText.length < 3 || (cut && chipText.length < (live ? 6 : 10))) continue
-          const w = Math.ceil(ctx2.measureText(chipText).width) + 12
+          const w = Math.ceil(ctx2.measureText(chipText).width) + CHIP_CHROME_W
           if (w > room + 1) continue
           const x = Math.max(gutter + 2, hit.x + hit.w - 3 - w)
           const chipY = Math.round(Math.max(y + 1, Math.min(y + innerH - chipH - 1, hit.y + hit.h / 2 - chipH / 2)))
@@ -2935,7 +2985,6 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
         ctx2.save()
         ctx2.fillStyle = dim
         ctx2.font = '9px sans-serif'
-        ctx2.globalAlpha = 0.85
         ctx2.fillText('idle', gutter + plotW / 2 - 8, y + innerH / 2 + 3)
         ctx2.restore()
       }
@@ -3176,7 +3225,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
       }),
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5',
-        style: { fontSize: '0.55rem', color: 'var(--ui-text-quaternary)' },
+        style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' },
         children: [
           // ONE legend line for the whole chart — the section header carries no
           // encoding text. Swatches are drawn in ONE neutral colour (the UI
@@ -3313,6 +3362,15 @@ const AGENT_STAT_W = { flight: 72, req: 60, tokens: 92 }
 const AGENT_STAT_GAP = 12
 const AGENT_CHILD_LIMIT = 4
 const AGENT_CARD_W = 340
+// Subagent rows sit SUBAGENT_INDENT px in from the parent card's edge behind a
+// 2 px rule in the parent's accent colour, on a lighter wash than the card.
+// The container's right margin plus the row's right padding equals a parent
+// row's right padding, so the number columns stay on the parent's right edge.
+const SUBAGENT_INDENT = 20
+const SUBAGENT_RULE_W = 2
+const SUBAGENT_GUTTER_R = 6
+const AGENT_ROW_PAD_R = 10
+const SUBAGENT_BG = 'color-mix(in srgb, var(--ui-bg-editor) 62%, transparent)'
 
 function cachedPctOf(node) {
   return node && node.tokens_in ? Math.round(((node.cached_tokens || 0) / node.tokens_in) * 100) : null
@@ -3369,7 +3427,7 @@ function ModelChip({ model }) {
         children: modelChipName(model)
       }),
       jsx('span', {
-        style: { flex: '0 0 auto', color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums' },
+        style: { flex: '0 0 auto', color: 'var(--ui-text-secondary)', fontVariantNumeric: 'tabular-nums' },
         children: `· ${fmtInt(model.requests)} req${inFlight ? ` · ${inFlight} live` : ''}`
       })
     ]
@@ -3394,7 +3452,7 @@ function AgentNumbers({ node, inFlight, elapsed, compact }) {
           String(inFlight),
           elapsed
             ? jsx('span', {
-                style: { fontSize: '0.65rem', fontWeight: 500, marginLeft: '4px', color: 'var(--ui-text-tertiary)' },
+                style: { fontSize: '0.65rem', fontWeight: 500, marginLeft: '4px', color: 'var(--ui-text-secondary)' },
                 children: elapsed
               })
             : null
@@ -3411,7 +3469,7 @@ function AgentNumbers({ node, inFlight, elapsed, compact }) {
         width: AGENT_STAT_W.flight,
         size,
         value: flightValue,
-        tone: inFlight > 0 ? TONE_LOCAL : 'var(--ui-text-quaternary)',
+        tone: inFlight > 0 ? TONE_LOCAL : 'var(--ui-text-secondary)',
         label: inFlight > 0 && elapsed ? 'in flight · oldest' : 'in flight'
       }),
       jsx(BigStat, {
@@ -3478,7 +3536,7 @@ function SecondaryLine({ parts }) {
       whiteSpace: 'nowrap',
       fontSize: '0.65rem',
       lineHeight: 1.35,
-      color: 'var(--ui-text-tertiary)'
+      color: 'var(--ui-text-secondary)'
     },
     children
   })
@@ -3498,7 +3556,7 @@ function agentOpener(row) {
   }
 }
 
-function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
+function AgentRow({ row, labels, now, depth, childCount, onHover, hovered, accent }) {
   const inFlight = row.in_flight || 0
   const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
   const models = Array.isArray(row.models) ? row.models : []
@@ -3517,7 +3575,15 @@ function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
   return jsx('div', {
     'data-agent-row': row.session_id || row.profile || 'agent',
     'data-agent-kind': kind,
-    style: { minWidth: 0 },
+    'data-agent-depth': depth ? '1' : '0',
+    style: depth
+      ? {
+          minWidth: 0,
+          borderLeft: `${SUBAGENT_RULE_W}px solid ${accent || 'var(--ui-accent)'}`,
+          borderRadius: '0 6px 6px 0',
+          background: SUBAGENT_BG
+        }
+      : { minWidth: 0 },
     children: jsxs('div', {
       onClick: open,
       onKeyDown: open
@@ -3537,8 +3603,10 @@ function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
         alignItems: 'flex-start',
         gap: `${AGENT_STAT_GAP}px`,
         minWidth: 0,
-        padding: depth ? '5px 10px 5px 10px' : '9px 10px 8px 10px',
-        borderRadius: '6px',
+        padding: depth
+          ? `5px ${AGENT_ROW_PAD_R - SUBAGENT_GUTTER_R}px 5px 10px`
+          : `9px ${AGENT_ROW_PAD_R}px 8px 10px`,
+        borderRadius: depth ? '0 6px 6px 0' : '6px',
         cursor: open ? 'pointer' : 'default',
         background: hovered ? 'var(--ui-row-hover-background)' : 'transparent'
       },
@@ -3556,7 +3624,7 @@ function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
                     height: depth ? '6px' : '8px',
                     borderRadius: '999px',
                     flex: '0 0 auto',
-                    background: inFlight > 0 ? TONE_LOCAL : 'var(--ui-text-quaternary)',
+                    background: inFlight > 0 ? TONE_LOCAL : 'var(--ui-text-tertiary)',
                     boxShadow: inFlight > 0 ? `0 0 0 3px color-mix(in srgb, ${TONE_LOCAL} 22%, transparent)` : 'none'
                   }
                 }),
@@ -3569,8 +3637,9 @@ function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
-                    fontSize: depth ? '0.8rem' : '0.875rem',
-                    fontWeight: depth ? 550 : 650,
+                    // Subagents: 0.95 of the parent's size, one weight step down.
+                    fontSize: depth ? `${(0.875 * 0.95).toFixed(4)}rem` : '0.875rem',
+                    fontWeight: depth ? 500 : 600,
                     color: inFlight > 0 || !depth ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
                   },
                   children: short
@@ -3600,7 +3669,7 @@ function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
 
 // The hover card: everything the row leaves out — the full goal / title, the
 // session id, every number, and one line per model.
-function agentCardFacts(row, labels, now) {
+function agentCardFacts(row, labels, now, parent) {
   const short = shortAgentLabel(row, labels)
   const full = fullAgentText(row, labels)
   const kind = agentKindOf(row)
@@ -3610,6 +3679,8 @@ function agentCardFacts(row, labels, now) {
   const cached = cachedPctOf(row)
   return {
     name: short,
+    // The parent link lives only here, in the hover card — never inline.
+    parentOf: parent ? `subagent of ${shortAgentLabel(parent, labels)}` : null,
     full: full !== short ? full : null,
     meta: [kind, source, row.session_id, activity].filter(Boolean).join(' · '),
     stats: [
@@ -3672,9 +3743,19 @@ function AgentCard({ facts, left, top, above, width }) {
             },
             children: facts.name
           }),
+          facts.parentOf
+            ? jsx('span', {
+                'data-agent-card-parent': 'true',
+                style: {
+                  fontSize: '0.625rem', fontWeight: 500, color: 'var(--ui-text-secondary)',
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+                },
+                children: facts.parentOf
+              })
+            : null,
           jsx('span', {
             style: {
-              fontSize: '0.625rem', color: 'var(--ui-text-tertiary)',
+              fontSize: '0.625rem', color: 'var(--ui-text-secondary)',
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
             },
             children: facts.meta
@@ -3718,7 +3799,7 @@ function AgentCard({ facts, left, top, above, width }) {
                     children: model.name
                   }),
                   jsx('span', {
-                    style: { flex: '0 0 auto', color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' },
+                    style: { flex: '0 0 auto', color: 'var(--ui-text-secondary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' },
                     children: model.line
                   })
                 ]
@@ -3727,7 +3808,7 @@ function AgentCard({ facts, left, top, above, width }) {
           })
         : null,
       facts.hint
-        ? jsx('span', { style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' }, children: facts.hint })
+        ? jsx('span', { style: { fontSize: '0.6rem', color: 'var(--ui-text-secondary)' }, children: facts.hint })
         : null
     ]
   })
@@ -3845,10 +3926,17 @@ function AgentTree({ agents, labels, now }) {
     return nextSet
   })
 
+  // child row → its parent row, for the hover card's 'subagent of …' caption.
+  const parentByChild = new Map()
+  for (const [, entries] of groups) {
+    for (const { root, children } of entries) {
+      for (const child of children) parentByChild.set(child, root)
+    }
+  }
   const cardW = hover ? Math.min(AGENT_CARD_W, Math.max(200, hover.width - 8)) : AGENT_CARD_W
   const card = hover
     ? jsx(AgentCard, {
-        facts: agentCardFacts(hover.row, labels, now),
+        facts: agentCardFacts(hover.row, labels, now, parentByChild.get(hover.row) || null),
         left: Math.max(0, Math.min(hover.x - 40, hover.width - cardW)),
         top: hover.top,
         above: hover.above,
@@ -3875,6 +3963,9 @@ function AgentTree({ agents, labels, now }) {
                 const shown = open ? children : children.slice(0, AGENT_CHILD_LIMIT)
                 const hidden = children.length - shown.length
                 const live = (root.in_flight || 0) > 0 || children.some(child => (child.in_flight || 0) > 0)
+                // The parent's accent: its profile colour, the same tone as the
+                // profile marker above the card.
+                const accent = profileTone(root.profile)
                 return jsxs(
                   'div',
                   {
@@ -3887,7 +3978,7 @@ function AgentTree({ agents, labels, now }) {
                       border: '1px solid var(--ui-stroke-secondary)',
                       boxShadow: live ? `inset 3px 0 0 ${TONE_LOCAL}` : 'none',
                       background: 'var(--ui-bg-quinary, transparent)',
-                      paddingBottom: children.length ? '6px' : 0
+                      paddingBottom: children.length ? '8px' : 0
                     },
                     children: [
                       jsx(AgentRow, {
@@ -3904,12 +3995,10 @@ function AgentTree({ agents, labels, now }) {
                             style: {
                               display: 'flex',
                               flexDirection: 'column',
-                              gap: '1px',
+                              gap: '3px',
                               minWidth: 0,
-                              marginLeft: '14px',
-                              marginRight: '0',
-                              paddingLeft: '4px',
-                              borderLeft: '2px solid var(--ui-stroke-secondary)'
+                              marginLeft: `${SUBAGENT_INDENT}px`,
+                              marginRight: `${SUBAGENT_GUTTER_R}px`
                             },
                             children: [
                               ...shown.map(child =>
@@ -3918,6 +4007,7 @@ function AgentTree({ agents, labels, now }) {
                                   labels,
                                   now,
                                   depth: true,
+                                  accent,
                                   onHover,
                                   hovered: !!hover && hover.row === child
                                 }, `${id}-${child.session_id}`)
@@ -3929,14 +4019,14 @@ function AgentTree({ agents, labels, now }) {
                                     onClick: () => toggle(id),
                                     style: {
                                       alignSelf: 'flex-start',
-                                      margin: '2px 0 0 10px',
+                                      margin: '2px 0 0 0',
                                       padding: '1px 8px',
                                       borderRadius: '999px',
                                       border: '1px solid var(--ui-stroke-secondary)',
                                       background: 'transparent',
                                       cursor: 'pointer',
                                       fontSize: '0.65rem',
-                                      color: 'var(--ui-text-tertiary)'
+                                      color: 'var(--ui-text-secondary)'
                                     },
                                     children: hidden > 0 ? `+${hidden} more` : 'show fewer'
                                   })
@@ -4023,7 +4113,7 @@ function RoutingStrip({ snapshot, now }) {
     return jsx('div', {
       'data-routing-strip': state.label,
       title: state.title,
-      className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+      className: 'text-[0.625rem] text-(--ui-text-secondary)',
       children: state.label === 'off'
         ? 'Capacity routing: off · places subagents on a local server with free slots when enabled'
         : 'Capacity routing: unavailable · needs a Flightdeck build with capacity.py'
@@ -4038,12 +4128,12 @@ function RoutingStrip({ snapshot, now }) {
         title: state.title,
         children: [
           jsx('span', {
-            className: 'text-[0.65rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)',
+            className: 'text-[0.65rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-secondary)',
             children: 'Routing'
           }),
           jsx(Badge, { variant: state.tone, size: 'xs', title: state.title, children: state.label }),
           jsx('span', {
-            className: 'min-w-0 flex-1 truncate text-[0.625rem] text-(--ui-text-quaternary)',
+            className: 'min-w-0 flex-1 truncate text-[0.625rem] text-(--ui-text-secondary)',
             children: decisions.length
               ? `last ${decisions.length} placement${decisions.length === 1 ? '' : 's'}`
               : 'no placements in the retention window'
@@ -4059,7 +4149,7 @@ function RoutingStrip({ snapshot, now }) {
               title: decisionTooltip(decision),
               children: [
                 jsx('span', {
-                  className: 'shrink-0 tabular-nums text-(--ui-text-quaternary)',
+                  className: 'shrink-0 tabular-nums text-(--ui-text-secondary)',
                   children: fmtAgo(decision.decided_at, now)
                 }),
                 jsx('span', {
@@ -4071,7 +4161,7 @@ function RoutingStrip({ snapshot, now }) {
                   children: decision.reason || '—'
                 }),
                 jsx('span', {
-                  className: 'min-w-0 flex-1 truncate text-(--ui-text-quaternary)',
+                  className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
                   children: goalSnippet(decision.goal)
                 })
               ]
@@ -4258,13 +4348,13 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
                   ]
                 })
               : jsx('div', {
-                  className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-quaternary)',
+                  className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-secondary)',
                   children: noServersText
                 }),
             visibleUnreachable.length
               ? jsxs('details', {
                   'data-unreachable-group': visibleUnreachable.length,
-                  className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)',
                   children: [
                     jsx('summary', {
                       className: 'cursor-pointer select-none',
@@ -4300,7 +4390,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
                                   }),
                                   hostPort
                                     ? jsx('span', {
-                                        className: 'ml-2 font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+                                        className: 'ml-2 font-mono text-[0.6rem] text-(--ui-text-secondary)',
                                         children: hostPort
                                       })
                                     : null,
@@ -4310,7 +4400,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
                                   }),
                                   down
                                     ? jsx('span', {
-                                        className: 'ml-2 tabular-nums text-(--ui-text-tertiary)',
+                                        className: 'ml-2 tabular-nums text-(--ui-text-secondary)',
                                         children: down
                                       })
                                     : null
@@ -4336,7 +4426,7 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
               : null,
             idle.length
               ? jsxs('details', {
-                  className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)',
                   children: [
                     jsx('summary', {
                       className: 'cursor-pointer select-none',
@@ -4464,7 +4554,7 @@ function FlightdeckPage() {
         children: 'Flightdeck'
       }),
       jsx('span', {
-        className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+        className: 'text-[0.6875rem] text-(--ui-text-secondary)',
         children: 'live air-traffic control'
       }),
       // Seeded-sample-data marker: without it a demo snapshot reads as real
@@ -4521,7 +4611,7 @@ function FlightdeckPage() {
   })
 
   const subheader = jsxs('div', {
-    className: 'flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-1 text-[0.65rem] text-(--ui-text-quaternary)',
+    className: 'flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-1 text-[0.65rem] text-(--ui-text-secondary)',
     children: [
       jsx('span', {
         children: snapshot ? `as of ${fmtAgo(snapshot.generated_at, now)}` : 'waiting for the backend'
