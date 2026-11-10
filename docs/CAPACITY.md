@@ -127,6 +127,12 @@ is returned untouched and **no decision row is written** (no routing decision wa
 | 6 | That server is in `routing_servers` (empty = every local server) | the user's eligible list |
 | 7 | The requested lane has a fresh, healthy sample with a slot gauge | no gauge or stale sample = no decision (§5) |
 
+Cards marked `aux` (auxiliary-only discovery, e.g. the skills-hub task server) and cards whose known
+`context_tokens` is below `MIN_ROUTING_CONTEXT = 64000` (Hermes' `MINIMUM_CONTEXT_LENGTH`,
+`agent/model_metadata.py:277`) are never routing targets: `eligible_lanes` drops them from the
+candidate set, and `decide` records an explicit `skip` instead of moving onto them. An unknown
+context stays eligible — we never exclude on a number we don't have.
+
 The requested route is `{k: v for k, v in config.items() if k != "service_tier"}` — exactly what the
 `default` backend returns (`plugins/delegation/default/__init__.py:32-33`). `inner_backend` is not read
 at route time; it is an arm-time gate (§2.4).

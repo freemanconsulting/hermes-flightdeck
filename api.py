@@ -114,7 +114,7 @@ def _sample_dict(sample: Any) -> dict[str, Any]:
     if isinstance(sample, dict):
         return dict(sample)
     fields = (
-        "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
+        "name", "title", "base_url", "kind", "healthy", "models", "context_tokens", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "prompt_tokens_total", "cached_tokens_total",
         "generation_tokens_total", "sampled_at", "error",
         "kv_cache_usage", "kv_cache_usage_mean", "prefix_cache_hit_rate", "spec_accept_rate",
@@ -487,6 +487,7 @@ def _server_cards(samples: list[dict], request_rows: list[dict], in_flight: list
             "kind": sample.get("kind") or "unknown",
             "healthy": None if healthy is None else bool(healthy),
             "models": list(sample.get("models") or []),
+            "context_tokens": _int_or_none(sample.get("context_tokens")),
             "running": running,
             "waiting": waiting,
             "slots": slots,

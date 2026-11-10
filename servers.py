@@ -43,7 +43,9 @@ PROBE_PATHS = ("/health", "/metrics", "/api/ps", "/v1/models")
 
 # Extra endpoints fetched only after the kind is known.
 KIND_EXTRAS = {
-    "llamacpp": ("/slots",),
+    # /props is a freebie GET on the same server /slots already needs; it
+    # carries n_ctx, the live context window routing needs for eligibility.
+    "llamacpp": ("/slots", "/props"),
     "sglang": ("/get_server_info",),
     "ollama": ("/api/version",),
 }
@@ -60,6 +62,7 @@ class Snapshot:
     kind: str = "unknown"
     healthy: bool | None = None
     models: list[str] = field(default_factory=list)
+    context_tokens: int | None = None  # live context window (llama.cpp /props n_ctx)
     running: int | None = None
     waiting: int | None = None
     slots: int | None = None
@@ -606,10 +609,18 @@ def _normalize_llamacpp(responses: dict[str, Any], snap: Snapshot) -> None:
     # llama.cpp keeps prompt caches per slot but never counts cached tokens.
 
     snap.models = _models_from_v1(responses.get("/v1/models"))
-    if not snap.models:
-        props = _json(responses.get("/props"))
-        if isinstance(props, dict) and isinstance(props.get("model_path"), str):
+    props = _json(responses.get("/props"))
+    if isinstance(props, dict):
+        if not snap.models and isinstance(props.get("model_path"), str):
             snap.models = [props["model_path"]]
+        # The live context window: top-level n_ctx, or the generation
+        # default the server would start a slot with.
+        n_ctx = props.get("n_ctx")
+        if n_ctx is None:
+            gen = props.get("default_generation_settings")
+            if isinstance(gen, dict):
+                n_ctx = gen.get("n_ctx")
+        snap.context_tokens = _int(n_ctx)
     if "/health" in responses:
         health = _json(responses["/health"])
         if isinstance(health, dict) and health.get("status") == "ok":

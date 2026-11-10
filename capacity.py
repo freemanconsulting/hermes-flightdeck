@@ -342,7 +342,14 @@ def route_for_lane(lane: Mapping[str, Any], requested: Mapping[str, Any],
         model = entry_models[0]
     if not model:
         return None
-    provider = entry.get("provider") or lane.get("key")
+    provider = entry.get("provider")
+    if not provider:
+        # Without a real provider entry this card is not a routable delegation
+        # target. The old fallback to lane['key'] handed a child an auxiliary
+        # task name (e.g. 'skills_hub') as its provider, which cannot serve
+        # chat completions. None keeps the lane inside the existing no_model
+        # exclusion instead of routing to it.
+        return None
     base_url = entry.get("base_url") or lane.get("base_url")
     return {"provider": provider, "model": model, "base_url": base_url,
             "extra_body": entry.get("extra_body")}
@@ -374,12 +381,29 @@ def _lanes_json(servers: Any, samples: Any, settings: Mapping[str, Any],
                 state: _Ledger, batch_id: int, now: float) -> list[dict]:
     config_module = _load_sibling("config", __package__)
     lanes = []
-    for lane in config_module.eligible_lanes(servers, settings):
+    # The audit line shows *why* a card isn't a routing target: eligible_lanes
+    # hides auxiliary/tiny-context cards, so surface the reason explicitly.
+    visible = {id(lane) for lane in config_module.eligible_lanes(servers, settings)}
+    for lane in servers or []:
+        if not isinstance(lane, dict):
+            continue
         name = str(lane.get("name") or lane.get("base_url") or "")
+        excluded = None
+        if id(lane) not in visible:
+            if lane.get("aux"):
+                excluded = "auxiliary only"
+            else:
+                context = lane.get("context_tokens")
+                if isinstance(context, (int, float)) and not isinstance(context, bool) \
+                        and int(context) < config_module.MIN_ROUTING_CONTEXT:
+                    excluded = f"context {int(context)} < {config_module.MIN_ROUTING_CONTEXT}"
+            if excluded is None:
+                continue  # hidden/cloud/non-private — not this check's business
         sample = _sample_for(lane, samples)
         if sample is None:
             lanes.append({"name": name, "slots": None, "running": None, "waiting": None,
-                          "queue": None, "free": None, "stale": True})
+                          "queue": None, "free": None, "stale": True,
+                          **({"excluded": excluded} if excluded else {})})
             continue
         fresh, _age = _fresh(sample, settings["routing_staleness_seconds"], now)
         lanes.append({
@@ -391,6 +415,7 @@ def _lanes_json(servers: Any, samples: Any, settings: Mapping[str, Any],
             "free": _free(name, sample, state, batch_id, settings["routing_ledger_seconds"],
                           settings["reserve_slots"]),
             "stale": not fresh,
+            **({"excluded": excluded} if excluded else {}),
         })
     return lanes
 
@@ -445,6 +470,16 @@ def decide(task: Mapping[str, Any], config: Any, *, samples: Any, servers: Any,
             requested_provider=requested.get("provider"), requested_model=requested.get("model"),
             chosen_lane=None, chosen_provider=None, chosen_model=None,
             reason=reason, stale=stale, lanes=lanes)
+
+    # An auxiliary-only card is a task dashboard, not a delegation target; a
+    # tiny-context card can't host a subagent. Keep the requested route and
+    # record why, rather than treating either as a routable lane.
+    if lane.get("aux"):
+        return skip(f"auxiliary only: {req_name}")
+    req_context = lane.get("context_tokens")
+    if isinstance(req_context, (int, float)) and not isinstance(req_context, bool) \
+            and int(req_context) < config_module.MIN_ROUTING_CONTEXT:
+        return skip(f"context {int(req_context)} < {config_module.MIN_ROUTING_CONTEXT}: {req_name}")
 
     if sample is None:
         return skip(f"no sample for {req_name}")

@@ -547,6 +547,13 @@ def load(ctx: Any = None, conn: Any = None, *, now: Optional[float] = None) -> d
     }
 
 
+#: Hermes refuses to run a model whose context window is below this
+#: (``MINIMUM_CONTEXT_LENGTH = 64_000``, hermes-agent/agent/model_metadata.py).
+#: A server below it can serve a dashboard lane but can never host a delegated
+#: subagent — its context is too small for a real task.
+MIN_ROUTING_CONTEXT = 64000
+
+
 def delegation_section(config: Optional[dict] = None) -> dict:
     """The ``delegation`` config section, read-only; {} when absent."""
     data = config if isinstance(config, dict) else _read_config()
@@ -647,7 +654,12 @@ def provider_routes(config: Optional[dict] = None) -> dict[str, dict]:
 
 
 def eligible_lanes(servers: list[dict], settings: dict) -> list[dict]:
-    """Local server cards routing may use: not cloud, private URL, not hidden, in routing_servers."""
+    """Local server cards routing may use: not cloud, private URL, not hidden, in routing_servers.
+
+    Also never an auxiliary-only discovery card and never a server whose known
+    context is below MIN_ROUTING_CONTEXT — both can render on the page but can
+    never host a delegated subagent.
+    """
     routing = _normalize_hidden(settings.get("routing_servers") if isinstance(settings, dict) else None)
     hidden = _normalize_hidden(settings.get("hidden_servers") if isinstance(settings, dict) else None)
     lanes: list[dict] = []
@@ -655,6 +667,18 @@ def eligible_lanes(servers: list[dict], settings: dict) -> list[dict]:
         if not isinstance(server, dict):
             continue
         if str(server.get("kind") or "").lower() == "cloud":
+            continue
+        # Auxiliary-only discovery cards (config.py _union_servers) are
+        # dashboards over a task endpoint, not delegation routes; routing to
+        # one would hand a child an aux *task name* as its provider.
+        if server.get("aux"):
+            continue
+        # A server whose known context is below Hermes' floor cannot host a
+        # subagent no matter how many slots it has. Unknown context stays
+        # eligible — we never exclude on a number we don't have.
+        context = server.get("context_tokens")
+        if isinstance(context, (int, float)) and not isinstance(context, bool) \
+                and int(context) < MIN_ROUTING_CONTEXT:
             continue
         if not _private_url(server.get("base_url")):
             continue

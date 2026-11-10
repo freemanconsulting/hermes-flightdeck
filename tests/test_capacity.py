@@ -324,3 +324,194 @@ def test_decision_lanes_carry_sampled_slots():
         {"name": "GN100", "slots": 5.0, "running": 1.0, "waiting": 0.0, "queue": 0.0,
          "free": 4, "stale": False},
     ]
+
+
+# ─── auxiliary / tiny-context exclusion (routing-target guards) ────────────
+
+AUX_URL = "http://127.0.0.1:8770"
+SMALL_URL = "http://127.0.0.1:18123/v1"
+
+
+def aux_routes():
+    """The live skills_hub shape: an aux-only server whose provider_routes
+    entry carries provider=None (model listed via discovered_models)."""
+    entry = routes()["http://127.0.0.1:18010"]
+    return {
+        **routes(),
+        "http://127.0.0.1:8770": {
+            "provider": None, "base_url": AUX_URL, "default_model": None,
+            "models": ["skills_hub"], "extra_body": None,
+            "profiles": [], "aux": True,
+        },
+        **{k: v for k, v in entry.items() if False},
+    }
+
+
+def aux_servers():
+    return [
+        {"name": "ds4", "base_url": DS4_URL, "kind": "tensorfold", "models": ["ds4"]},
+        {"name": "GN100", "base_url": GN100_URL, "kind": "tensorfold",
+         "models": ["qwen38-flash-next-tf-fp4"]},
+        {"name": "skills_hub", "title": "Skills Hub", "base_url": AUX_URL,
+         "kind": "unknown", "models": ["skills_hub"], "aux": True,
+         "roles": ["aux"], "discovered_models": ["skills_hub"]},
+    ]
+
+
+def test_aux_server_with_most_free_slots_is_never_chosen():
+    """The live bug: skills_hub (aux, provider=None) had the most free slots
+    and swallowed every spill; route_for_lane dressed it up as provider
+    'skills_hub'."""
+    capacity.reset_state()
+    route, decision = capacity.decide(
+        {"index": 0, "goal": "metrics adapters"}, delegation(),
+        samples={
+            "http://127.0.0.1:18010": sample("ds4", DS4_URL, 4, 4),
+            "http://127.0.0.1:18009": sample("GN100", GN100_URL, 5, 4),
+            "http://127.0.0.1:8770": sample("skills_hub", AUX_URL, 8, 0),
+        },
+        servers=aux_servers(), provider_routes=aux_routes(),
+        settings=settings(), now=NOW)
+    assert decision["action"] == "move"
+    assert decision["chosen_lane"] == "GN100"
+    assert route["provider"] == "gb10-qwen"
+    assert route["provider"] != "skills_hub"
+
+
+def test_route_for_lane_never_returns_aux_task_name_as_provider():
+    # The aux card has no provider_routes entry at all: the old code minted
+    # provider = lane['key'] = the auxiliary task name, which cannot serve
+    # chat completions.
+    card = {"name": "skills_hub", "key": "skills_hub", "base_url": AUX_URL,
+            "kind": "unknown", "model": "skills_hub", "aux": True}
+    assert capacity.route_for_lane(card, {}, routes()) is None
+
+
+def test_tiny_context_server_is_never_chosen():
+    """A 32k-context card has the most free slots but can't host a subagent
+    (Hermes refuses models under MINIMUM_CONTEXT_LENGTH = 64_000)."""
+    servers_ = servers() + [
+        {"name": "qwen3.5-9b", "base_url": SMALL_URL, "kind": "llamacpp",
+         "models": ["qwen3.5-9b"], "context_tokens": 32768},
+    ]
+    routes_ = {**routes(),
+               "http://127.0.0.1:18123": {
+                   "provider": "qwen3.5-9b", "base_url": SMALL_URL,
+                   "default_model": "qwen3.5-9b", "models": ["qwen3.5-9b"],
+                   "extra_body": None, "profiles": [], "aux": False}}
+    capacity.reset_state()
+    route, decision = capacity.decide(
+        {"index": 0, "goal": "metrics adapters"}, delegation(),
+        samples={
+            "http://127.0.0.1:18010": sample("ds4", DS4_URL, 4, 4),
+            "http://127.0.0.1:18009": sample("GN100", GN100_URL, 5, 4),
+            "http://127.0.0.1:18123": sample("qwen3.5-9b", SMALL_URL, 6, 0),
+        },
+        servers=servers_, provider_routes=routes_, settings=settings(), now=NOW)
+    assert decision["action"] == "move"
+    assert decision["chosen_lane"] == "GN100"
+    assert route["provider"] == "gb10-qwen"
+
+
+def test_real_provider_server_is_still_chosen():
+    """Regression guard for the guards: with everything eligible, the spill
+    still lands on the healthy real-provider card."""
+    servers_ = servers() + [
+        {"name": "GB200", "base_url": GN200_URL, "kind": "tensorfold",
+         "models": ["ds4-flash"], "context_tokens": 262144},
+    ]
+    routes_ = {**routes(),
+               "http://127.0.0.1:18011": {
+                   "provider": "gb200-ds4", "base_url": GN200_URL,
+                   "default_model": "ds4-flash", "models": ["ds4-flash"],
+                   "extra_body": None, "profiles": ["default"], "aux": False}}
+    capacity.reset_state()
+    route, decision = capacity.decide(
+        {"index": 0, "goal": "metrics adapters"}, delegation(),
+        samples={
+            "http://127.0.0.1:18010": sample("ds4", DS4_URL, 4, 4),
+            "http://127.0.0.1:18009": sample("GN100", GN100_URL, 5, 4),
+            "http://127.0.0.1:18011": sample("GB200", GN200_URL, 4, 0),
+        },
+        servers=servers_, provider_routes=routes_, settings=settings(), now=NOW)
+    assert decision["action"] == "move"
+    assert decision["chosen_lane"] == "GB200"
+    assert route["provider"] == "gb200-ds4"
+    assert route["model"] == "ds4-flash"
+
+
+def test_requested_aux_lane_skips_with_reason():
+    capacity.reset_state()
+    route, decision = capacity.decide(
+        {"index": 0, "goal": "metrics adapters"},
+        delegation(provider="skills_hub", model="skills_hub",
+                   base_url=AUX_URL, api_mode=None),
+        samples={
+            "http://127.0.0.1:18010": sample("ds4", DS4_URL, 4, 4),
+            "http://127.0.0.1:18009": sample("GN100", GN100_URL, 5, 1),
+            "http://127.0.0.1:8770": sample("skills_hub", AUX_URL, 8, 0),
+        },
+        servers=aux_servers(), provider_routes=aux_routes(),
+        settings=settings(), now=NOW)
+    assert route == {k: v for k, v in delegation(provider="skills_hub",
+                                                 model="skills_hub",
+                                                 base_url=AUX_URL,
+                                                 api_mode=None).items()}
+    assert decision["action"] == "skip"
+    assert decision["chosen_lane"] is None
+    assert decision["reason"].startswith("auxiliary only")
+
+
+def test_requested_tiny_context_lane_skips_with_reason():
+    servers_ = servers() + [
+        {"name": "qwen3.5-9b", "base_url": SMALL_URL, "kind": "llamacpp",
+         "models": ["qwen3.5-9b"], "context_tokens": 32768},
+    ]
+    routes_ = {**routes(),
+               "http://127.0.0.1:18123": {
+                   "provider": "qwen3.5-9b", "base_url": SMALL_URL,
+                   "default_model": "qwen3.5-9b", "models": ["qwen3.5-9b"],
+                   "extra_body": None, "profiles": [], "aux": False}}
+    capacity.reset_state()
+    route, decision = capacity.decide(
+        {"index": 0, "goal": "metrics adapters"},
+        {k: v for k, v in delegation().items()
+         if k not in ("provider", "model", "base_url")}
+        | {"provider": "qwen3.5-9b", "model": "qwen3.5-9b", "base_url": SMALL_URL},
+        samples={
+            "http://127.0.0.1:18010": sample("ds4", DS4_URL, 4, 4),
+            "http://127.0.0.1:18009": sample("GN100", GN100_URL, 5, 1),
+            "http://127.0.0.1:18123": sample("qwen3.5-9b", SMALL_URL, 6, 0),
+        },
+        servers=servers_, provider_routes=routes_, settings=settings(), now=NOW)
+    assert decision["action"] == "skip"
+    assert decision["chosen_lane"] is None
+    assert decision["reason"] == "context 32768 < 64000: qwen3.5-9b"
+
+
+def test_lanes_json_carries_exclusion_reason():
+    servers_ = aux_servers() + [
+        {"name": "qwen3.5-9b", "base_url": SMALL_URL, "kind": "llamacpp",
+         "models": ["qwen3.5-9b"], "context_tokens": 32768},
+    ]
+    capacity.reset_state()
+    _route, decision = capacity.decide(
+        {"index": 0, "goal": "metrics adapters"}, delegation(),
+        samples={
+            "http://127.0.0.1:18010": sample("ds4", DS4_URL, 4, 4),
+            "http://127.0.0.1:18009": sample("GN100", GN100_URL, 5, 4),
+            "http://127.0.0.1:8770": sample("skills_hub", AUX_URL, 8, 0),
+            "http://127.0.0.1:18123": sample("qwen3.5-9b", SMALL_URL, 6, 0),
+        },
+        servers=servers_, provider_routes={
+            **aux_routes(),
+            "http://127.0.0.1:18123": {
+                "provider": "qwen3.5-9b", "base_url": SMALL_URL,
+                "default_model": "qwen3.5-9b", "models": ["qwen3.5-9b"],
+                "extra_body": None, "profiles": [], "aux": False}},
+        settings=settings(), now=NOW)
+    by_name = {lane["name"]: lane for lane in decision["lanes"]}
+    assert by_name["skills_hub"]["excluded"] == "auxiliary only"
+    assert by_name["qwen3.5-9b"]["excluded"] == "context 32768 < 64000"
+    assert "excluded" not in by_name["GN100"]
+    assert "excluded" not in by_name["ds4"]

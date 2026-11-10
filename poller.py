@@ -81,7 +81,7 @@ def _sample_dict(snap: Any) -> dict[str, Any]:
     if isinstance(snap, dict):
         return dict(snap)
     fields = (
-        "name", "title", "base_url", "kind", "healthy", "models", "running", "waiting", "slots",
+        "name", "title", "base_url", "kind", "healthy", "models", "context_tokens", "running", "waiting", "slots",
         "decode_tps", "prefill_tps", "prompt_tokens_total", "cached_tokens_total",
         "generation_tokens_total", "sampled_at", "error",
         "kv_cache_usage", "kv_cache_usage_mean", "prefix_cache_hit_rate", "spec_accept_rate",

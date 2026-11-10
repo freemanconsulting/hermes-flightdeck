@@ -79,12 +79,14 @@ def test_snapshot_shape_is_pinned(conn):
 
     ds4 = card(payload, "ds4")
     assert list(ds4) == [
-        "name", "title", "aux", "roles", "base_url", "kind", "healthy", "models", "running",
+        "name", "title", "aux", "roles", "base_url", "kind", "healthy", "models",
+        "context_tokens", "running",
         "waiting", "slots",
         "decode_tps", "prefill_tps", "rate_source", "health", "in_flight", "unattributed",
         "over_attributed", "agents", "requests", "samples", "error", "sampled_at",
     ]
     assert ds4["aux"] is None and ds4["roles"] == []
+    assert ds4["context_tokens"] is None  # no llama.cpp /props on a vLLM card
     # Healthy instant gauges: nothing smoothed.
     assert ds4["rate_source"] == {"decode": "instant", "prefill": "instant"}
     assert ds4["title"].startswith("Studio DeepSeek")
