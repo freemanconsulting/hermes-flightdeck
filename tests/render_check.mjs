@@ -299,8 +299,11 @@ const legendTitleLane = mod.SwimLane({
   snapshot: legendTitleSnapshot, labels, now: fixture.generated_at * 1000, windowSeconds: 60
 })
 const legendTitleText = textOf(legendTitleLane)
+// UI v2: legend entries use shortAgentLabel; the profile prefix only appears
+// when the chart mixes profiles (this fixture has one).
 check('legend agent entry shows the snapshot agent title, not the date id',
-  legendTitleText.includes(`${legendTitleProfile} · Flightdeck hackathon`)
+  legendTitleText.includes('Flightdeck hackathon')
+    && !legendTitleText.includes(`${legendTitleProfile} · Flightdeck hackathon`)
     && !legendTitleText.includes(`session ${legendTitleSession.slice(0, 8)}`),
   legendTitleText.slice(-140))
 
@@ -330,54 +333,54 @@ check('local lane right labels carry peak and slots',
   drawn.fillText.some(t => /^peak \d+$/.test(String(t))) && drawn.fillText.some(t => /^of \d+ slots$/.test(String(t))),
   drawn.fillText.filter(t => /^peak \d+$/.test(String(t)) || /^of \d+ slots$/.test(String(t))).join(', '))
 
-// 3. By agent: every agent row (profile, session, subagent, cron) has model
-//    sub-rows with the full column set.
+// 3. By agent (UI v2 cards): every agent row (profile, session, subagent, cron)
+//    carries model chips and the three big number columns; secondary stats
+//    (latency/TTFT p50, errors) render only when known — never as an empty
+//    cell or a '—' placeholder.
 const agentTree = mod.AgentView({ snapshot: fixture, labels, now: fixture.generated_at * 1000, windowSeconds: 60 })
 const agentRows = elements(agentTree).filter(item => item.props['data-agent-row'] != null)
 const agentRowNames = agentRows.map(item => item.props['data-agent-row'])
 check('By agent renders every agent row', agentRows.length >= 3, agentRowNames.join(', '))
 const rowsWithoutModels = agentRows.filter(item => countIn(item, 'data-model-row') === 0)
-check('every agent row has ≥1 model sub-row', agentRows.length > 0 && rowsWithoutModels.length === 0, rowsWithoutModels.length ? rowsWithoutModels.map(r => r.props['data-agent-row']).join(', ') : `${agentRows.length} rows`)
+check('every agent row has ≥1 model chip', agentRows.length > 0 && rowsWithoutModels.length === 0, rowsWithoutModels.length ? rowsWithoutModels.map(r => r.props['data-agent-row']).join(', ') : `${agentRows.length} rows`)
 const modelRows = elements(agentTree).filter(item => item.props['data-model-row'] != null)
-check('model sub-rows carry the model label', modelRows.length > 0 && modelRows.every(item => textOf(item).includes('·') || textOf(item).includes('/')), modelRows.map(item => textOf(item).slice(0, 40)).join(' | '))
+check('model chips carry the model name and a request count', modelRows.length > 0 && modelRows.every(item => /· \d+ req/.test(textOf(item))), modelRows.map(item => textOf(item).slice(0, 40)).join(' | '))
 
-const COLUMNS = ['flight', 'req', 'tokens', 'lat', 'ttft', 'err']
+const BIG_COLUMNS = ['flight', 'req', 'tokens']
 function missingColumns(item) {
   const cols = new Set(elements(item).filter(e => e.props['data-col'] != null).map(e => e.props['data-col']))
-  return COLUMNS.filter(col => !cols.has(col))
+  return BIG_COLUMNS.filter(col => !cols.has(col))
 }
 const rowsMissingColumns = agentRows.filter(item => missingColumns(item).length > 0)
-check('every agent row has all 6 columns', agentRows.length > 0 && rowsMissingColumns.length === 0, rowsMissingColumns.length ? rowsMissingColumns.map(r => `${r.props['data-agent-row']}: ${missingColumns(r).join('/')}`).join(', ') : 'flight req tokens lat ttft err')
-const modelRowsMissingColumns = modelRows.filter(item => missingColumns(item).length > 0)
-check('every model sub-row has all 6 columns', modelRows.length > 0 && modelRowsMissingColumns.length === 0, modelRowsMissingColumns.length ? modelRowsMissingColumns.map(r => `${r.props['data-model-row']}: ${missingColumns(r).join('/')}`).join(', ') : 'flight req tokens lat ttft err')
-const emptyColumns = [...agentRows, ...modelRows].filter(item =>
+check('every agent row has the in-flight / requests / tokens numbers', agentRows.length > 0 && rowsMissingColumns.length === 0, rowsMissingColumns.length ? rowsMissingColumns.map(r => `${r.props['data-agent-row']}: ${missingColumns(r).join('/')}`).join(', ') : 'flight req tokens')
+const emptyColumns = agentRows.filter(item =>
   elements(item).some(e => e.props['data-col'] != null && textOf(e).trim() === '')
 )
-check('no column renders empty', agentRows.length + modelRows.length > 0 && emptyColumns.length === 0, `${emptyColumns.length} rows with empty columns`)
+check('no column renders empty', agentRows.length > 0 && emptyColumns.length === 0, `${emptyColumns.length} rows with empty columns`)
+const dashSecondary = agentRows.filter(item =>
+  elements(item).some(e => ['lat', 'ttft', 'err'].includes(e.props['data-col']) && /—/.test(textOf(e))))
+check('secondary stats render only when known (no — placeholders)', dashSecondary.length === 0,
+  `${dashSecondary.length} rows with a — secondary stat`)
 
-// 3b. Model sub-row timing columns: the captured fixture predates the
-//     per-model latency/ttft/errors fields, so inject them into a cloned node
-//     and require the sub-row to render the values, not the "—" fallback.
+// 3b. Per-model latency/ttft/errors moved from sub-row columns into the hover
+//     card's per-model lines: inject them into a cloned node and require the
+//     card facts to carry the values, not the '—' fallback.
 const timingFixture = structuredClone(fixture)
 const timingAgent = timingFixture.agents.find(node => (node.models || []).length > 0)
 timingAgent.models[0] = { ...timingAgent.models[0], latency_ms_p50: 1234.0, ttft_ms_p50: 56.0, errors_5m: 2 }
-const timingTree = mod.AgentView({ snapshot: timingFixture, labels, now: fixture.generated_at * 1000, windowSeconds: 60 })
-const timingModelRow = elements(timingTree)
-  .filter(item => item.props['data-model-row'] != null)
-  .find(item => textOf(item).includes(timingAgent.models[0].label))
-const colText = col => {
-  const span = timingModelRow && elements(timingModelRow).find(e => e.props['data-col'] === col)
-  return span ? textOf(span).trim() : null
-}
-check('model sub-row renders per-model latency/ttft/errors', timingModelRow != null
-  && colText('lat') === '1.2s' && colText('ttft') === '56ms' && colText('err') === '2',
-  timingModelRow ? `lat=${colText('lat')} ttft=${colText('ttft')} err=${colText('err')}` : 'sub-row missing')
+const timingFacts = partA().agentCardFacts(timingAgent, labels, fixture.generated_at * 1000)
+const timingLine = timingFacts.models[0] ? timingFacts.models[0].line : ''
+check('agent card renders per-model latency/ttft/errors',
+  timingLine.includes('p50 1.2s') && timingLine.includes('TTFT 56ms') && timingLine.includes('2 errors'),
+  timingLine || 'card model line missing')
 
-// 4. Subagent labels: one line, full text in the tooltip, role prefixed.
+// 4. Subagent labels: the row shows the short label on one line; the full
+//    role-prefixed goal rides on the row (data-agent-full / aria-label) for the
+//    hover card, never inline.
 const subagentRow = agentRows.find(item => item.props['data-agent-row'] === '20261107_174026_d25bb8')
-const subagentLabel = subagentRow && elements(subagentRow).find(e => e.props.title && e.props.title.startsWith('subagent · '))
-check('subagent label is role-prefixed and tooltipped', subagentLabel && subagentLabel.props.title.includes('Execute /Users/openclaw/.hermes/cache/scratch/flightdeck-briefs/I2-health-backend.md'), subagentLabel ? subagentLabel.props.title.slice(0, 60) : 'label missing')
-check('subagent label text is one line', subagentLabel && !textOf(subagentLabel).includes('\n'), subagentLabel ? `${textOf(subagentLabel).length} chars` : 'label missing')
+const subagentLabel = subagentRow && elements(subagentRow).find(e => e.props['data-agent-full'] != null)
+check('subagent label is role-prefixed and carries the full goal for the card', subagentLabel && subagentLabel.props['data-agent-full'].startsWith('subagent · ') && subagentLabel.props['data-agent-full'].includes('Execute /Users/openclaw/.hermes/cache/scratch/flightdeck-briefs/I2-health-backend.md'), subagentLabel ? subagentLabel.props['data-agent-full'].slice(0, 60) : 'label missing')
+check('subagent label text is one short line', subagentLabel && !textOf(subagentLabel).includes('\n') && textOf(subagentLabel).length <= 30 && !textOf(subagentLabel).includes('/Users/'), subagentLabel ? `${textOf(subagentLabel)} (${textOf(subagentLabel).length} chars)` : 'label missing')
 
 // 4b. Session labels: the real title replaces the date id, the source badge and
 //     started/active line render, the full id is tooltipped, and the row opens
@@ -395,14 +398,18 @@ const titledLabels = {
 }
 const titledTree = mod.AgentView({ snapshot: titledSnapshot, labels: titledLabels, now: fixture.generated_at * 1000, windowSeconds: 60 })
 const titledText = textOf(titledTree)
+// UI v2: the row shows the SHORT label (first four words); the full title is
+// the row's data-agent-full for the hover card.
+const titledName = elements(titledTree).find(item => item.props['data-agent-full'] === 'Redefine Gerard role and responsibilities')
 check('session row shows the real title, not the date id',
-  titledText.includes('Redefine Gerard role and responsibilities') && !titledText.includes('session 20261104'),
-  titledText.includes('Redefine Gerard role and responsibilities') ? 'title rendered' : 'title missing')
+  titledText.includes('Redefine Gerard role') && !!titledName && !titledText.includes('session 20261104'),
+  titledName ? `short '${textOf(titledName)}', full in data-agent-full` : 'title missing')
 check('session row shows the source badge', titledText.includes('desktop'), titledText.includes('desktop') ? 'desktop badge' : 'badge missing')
 check('session row shows started and last activity',
   titledText.includes('started Nov 4') && titledText.includes('active 2m ago'), titledText.slice(0, 120))
-const idTooltip = elements(titledTree).find(item => item.props.title === SESSION_ID)
-check('session row tooltips the full id', !!idTooltip, idTooltip ? idTooltip.props.title : 'no full-id tooltip')
+// UI v2: the full id rides in the hover card's meta line, not a native title.
+const idCard = partA().agentCardFacts(titledSnapshot.agents[0], titledLabels, fixture.generated_at * 1000)
+check('session row tooltips the full id', idCard.meta.includes(SESSION_ID), idCard.meta)
 const clickable = elements(titledTree).find(item => typeof item.props.onClick === 'function' && item.props['data-agent-row'] == null)
 check('session row is clickable to open the conversation', !!clickable, clickable ? 'onClick present' : 'no onClick')
 if (clickable) clickable.props.onClick()
@@ -437,35 +444,42 @@ healthServer.health = {
 }
 const healthCard = mod.ServerCard({ server: healthServer, models: fixture.models, labels, now: fixture.generated_at * 1000 })
 const healthText = textOf(healthCard)
+// UI v2: KV cache / prefix hit / MTP accept are ring gauges in the hero row;
+// TTFT, time per token, memory and preemptions are one compact 'server' line.
 const healthPieces = [
-  'KV', '70%', 'prefix hit 93%', 'MTP accept', '68%',
-  'TTFT p50 0.82s / p95 8.2s', 'TPOT 19 ms', 'mem 98.8 GB'
+  'KV cache', '70%', 'Prefix hit', '93%', 'MTP accept', '68%',
+  'TTFT p50 820ms · p95 8.2s', 'time per token 19.0 ms', 'memory 98.8 GB', 'preemptions 0'
 ]
 const missingHealth = healthPieces.filter(piece => !healthText.includes(piece))
 check('server health line renders every reported field', missingHealth.length === 0,
   missingHealth.length ? `missing: ${missingHealth.join(', ')}` : healthText.slice(0, 120))
-const healthBars = elements(healthCard).filter(item => item.props.style && item.props.style.width === '30px')
-const barFills = healthBars.map(item => elements(item).find(e => e.props.style && /%$/.test(String(e.props.style.width)))?.props.style.width)
-check('health line draws inline KV and MTP accept bars', healthBars.length === 2 && barFills.join(',') === '70%,68%',
-  `${healthBars.length} bars: ${barFills.join(', ')}`)
-const healthLabels = ['KV', 'prefix hit', 'MTP accept', 'server TTFT', 'TPOT', 'mem']
-const untooltipped = healthLabels.filter(label =>
-  !elements(healthCard).some(item => item.props.title && textOf(item).startsWith(label))
-)
+const healthRings = elements(healthCard).filter(item => item.props['data-ring'] != null)
+const ringArcs = healthRings.map(item => elements(item).find(e => e.props['data-ring-arc'] != null)?.props['data-ring-arc'])
+check('health hero row draws KV, prefix and MTP ring gauges',
+  healthRings.map(item => item.props['data-ring']).join(',') === 'kv,prefix,mtp' && ringArcs.join(',') === '70,93,68',
+  `${healthRings.length} rings: ${ringArcs.join(', ')}`)
+const healthTips = [
+  ...healthRings.map(item => [item.props['data-ring'], item.props.title]),
+  ...elements(healthCard).filter(item => item.props['data-stat'] != null && item.props.title)
+    .map(item => [item.props['data-stat'], item.props.title])
+]
+const untooltipped = ['kv', 'prefix', 'mtp', 'ttft', 'tpot', 'mem', 'preempt']
+  .filter(id => !healthTips.some(([key, title]) => key === id && title && title.includes('ALL traffic')))
 check('health items carry plain-word tooltips', untooltipped.length === 0,
-  untooltipped.length ? `no tooltip: ${untooltipped.join(', ')}` : healthLabels.join(', '))
-const ttftItem = elements(healthCard).find(item => item.props.title && textOf(item).startsWith('server TTFT'))
+  untooltipped.length ? `no tooltip: ${untooltipped.join(', ')}` : 'kv, prefix, mtp, ttft, tpot, mem, preempt')
+const serverLine = elements(healthCard).find(item => item.props['data-stat-line'] === 'server')
+const ttftItem = serverLine && elements(serverLine).find(item => item.props['data-stat'] === 'ttft')
 check('TTFT tooltip says server-side numbers cover all traffic',
   ttftItem && ttftItem.props.title.includes('ALL traffic') && ttftItem.props.title.includes('not just'),
   ttftItem ? ttftItem.props.title.slice(0, 90) : 'TTFT item missing')
 const kvOnly = JSON.parse(JSON.stringify(healthServer))
 kvOnly.health = { kv_cache_usage: 0.7 }
 const kvOnlyText = textOf(mod.ServerCard({ server: kvOnly, models: fixture.models, labels, now: fixture.generated_at * 1000 }))
-check('health line omits missing fields', kvOnlyText.includes('KV') && !kvOnlyText.includes('prefix hit') && !kvOnlyText.includes('mem'),
+check('health line omits missing fields', kvOnlyText.includes('KV cache') && !kvOnlyText.includes('Prefix hit') && !kvOnlyText.includes('memory'),
   kvOnlyText.slice(0, 80))
 const noHealthText = textOf(mod.ServerCard({ server: fixture.servers.find(s => s.name === 'studio-ds4'), models: fixture.models, labels, now: fixture.generated_at * 1000 }))
 check('server card with no health block renders no health line',
-  !noHealthText.includes('prefix hit') && !noHealthText.includes('TPOT') && !noHealthText.includes('mem '),
+  !noHealthText.includes('Prefix hit') && !noHealthText.includes('time per token') && !noHealthText.includes('memory '),
   'studio-ds4 has no health block')
 
 // 6. The whole page renders without undefined components and shows the swim
@@ -502,8 +516,12 @@ phaseServer.requests = phaseServer.requests
 const phaseWhole = fixture.servers
   .find(s => s.name === 'studio-ds4').requests
   .find(r => r.first_chunk_at == null || r.ended_at == null)
+// UI v2: 'not streamed' (hatched) is a verdict on a FINISHED row only — an
+// in-flight row with no first chunk is still waiting. The seeded whole rows are
+// finished with no first chunk.
 for (let i = 0; i < 4; i += 1) {
-  phaseServer.requests.push({ ...JSON.parse(JSON.stringify(phaseWhole)), session_id: `phase-queued-${i}` })
+  const seeded = JSON.parse(JSON.stringify(phaseWhole))
+  phaseServer.requests.push({ ...seeded, first_chunk_at: null, ended_at: seeded.started_at + 6, status: 'done', session_id: `phase-queued-${i}` })
 }
 // The page renders the swim lane from querySnapshot, so seed the lane there
 // too — otherwise the page below honestly omits the queued swatch and the
@@ -1107,8 +1125,9 @@ sharedPlanSnap.models = [anthropicPlanModel, directsdkPlanModel]
 const sharedPlanView = mod.ModelView({ snapshot: sharedPlanSnap, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300 })
 const sharedPlanCards = elements(sharedPlanView).filter(el => el.type === 'article')
-const anthropicCard = sharedPlanCards.find(el => textOf(el).includes('api.anthropic.com'))
-const directsdkCard = sharedPlanCards.find(el => textOf(el).includes('process://claude-subscription-directsdk-experimental'))
+// UI v2: the base URL rides in the header tooltip; find cards by their key.
+const anthropicCard = sharedPlanCards.find(el => el.props['data-cloud-card'] === 'anthropic|claude-opus-5-5')
+const directsdkCard = sharedPlanCards.find(el => el.props['data-cloud-card'] === 'claude-subscription-directsdk-experimental|claude-opus-5-5')
 check('same plan: the card with more windows keeps the bars and the Fable cap',
   directsdkCard && textOf(directsdkCard).includes('Fable week')
     && textOf(directsdkCard).includes('6% used'),
@@ -1126,8 +1145,8 @@ differentPlanSnap.models[0].quota.windows[0].used_percent = 7
 const differentPlanView = mod.ModelView({ snapshot: differentPlanSnap, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300 })
 const differentPlanCards = elements(differentPlanView).filter(el => el.type === 'article')
-const differentAnthropic = differentPlanCards.find(el => textOf(el).includes('api.anthropic.com'))
-const differentDirectsdk = differentPlanCards.find(el => textOf(el).includes('process://claude-subscription-directsdk-experimental'))
+const differentAnthropic = differentPlanCards.find(el => el.props['data-cloud-card'] === 'anthropic|claude-opus-5-5')
+const differentDirectsdk = differentPlanCards.find(el => el.props['data-cloud-card'] === 'claude-subscription-directsdk-experimental|claude-opus-5-5')
 check('different plan numbers: both cards keep their own bars',
   differentAnthropic && differentDirectsdk
     && textOf(differentAnthropic).includes('7% used') && textOf(differentDirectsdk).includes('6% used')
@@ -1163,9 +1182,14 @@ holderModel.agents = [{ profile: 'default', session_id: '20261107_174026_d25bb8'
   label: '', in_flight: 1 }]
 const holderText = textOf(mod.CloudCard({ model: holderModel, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: holderSnap }))
+// UI v2: the row shows shortAgentLabel (a subagent's short goal); the row
+// title, resolved from the snapshot row, rides in the row tooltip.
+const holderRow = elements(mod.CloudCard({ model: holderModel, labels,
+  now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: holderSnap }))
+  .find(el => el.props['data-held-row'] === '20261107_174026_d25bb8')
 check('cloud card HELD BY resolves the agent row title, not the session id',
-  holderText.includes('Flightdeck hackathon') && !holderText.includes('session 2026'),
-  holderText.slice(0, 160))
+  holderRow && String(holderRow.props.title).includes('Flightdeck hackathon') && !holderText.includes('session 2026'),
+  holderRow ? `${textOf(holderRow)} | ${String(holderRow.props.title).slice(0, 80)}` : holderText.slice(0, 160))
 
 // HELD BY: cloud cards reuse the local card's section — one row per agent with
 // an in-flight request right now, never the old variable-length holder list.
@@ -1190,7 +1214,8 @@ const heldRows = elements(heldCard).filter(el =>
 check('cloud card HELD BY renders one row per in-flight holder with its title',
   heldCardText.includes('held by') && heldRows.length === 2
     && heldCardText.includes('Azure SFTP Server')
-    && heldCardText.includes('Add season and record to team header')
+    && heldCardText.includes('Add season and record')
+    && heldRows.some(el => String(el.props.title).includes('Add season and record to team header'))
     && !heldCardText.includes('agents holding')
     && !heldCardText.includes('Azure SFTP Server · Add season'),
   heldCardText.slice(0, 200))
@@ -1233,8 +1258,9 @@ check('cloud card with only finished requests renders no holders',
     && !textOf(finishedCard).includes('Finished session'),
   textOf(finishedCard).slice(0, 160))
 
+// UI v2: the chart is the full-width card footer ([data-card-chart]).
 const chartContainers = [heldCard, fiveCard].map(card =>
-  elements(card).find(el => el.props.className === 'min-w-0 flex-1'))
+  elements(card).find(el => el.props['data-card-chart'] === 'cloud'))
 check('cloud cards with different holder counts render the same chart width',
   chartContainers.every(el => el && el.props.className === chartContainers[0].props.className
     && JSON.stringify(el.props.style || null) === JSON.stringify(chartContainers[0].props.style || null)),
@@ -1290,14 +1316,345 @@ const wholeCloudText = textOf(mod.CloudCard({ model: wholeCloudModel, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
 const wholeCloudMetrics = elements(mod.CloudCard({ model: wholeCloudModel, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
-check('cloud card shows not streamed for TTFT and decode when every request is whole',
-  wholeCloudMetrics.some(el => textOf(el) === 'TTFT p50not streamed')
-    && wholeCloudMetrics.some(el => textOf(el) === 'decodenot streamed'),
+// UI v2: TTFT is a BigStat (value over label); a whole-response lane shows no
+// decode rate at all rather than a second 'not streamed'.
+check('cloud card shows not streamed for TTFT and no decode rate when every request is whole',
+  wholeCloudMetrics.some(el => el.props['data-col'] === 'ttft' && textOf(el) === 'not streamedTTFT p50')
+    && !wholeCloudMetrics.some(el => el.props['data-stat'] === 'decode'),
   wholeCloudText.slice(0, 160))
 const slotsEl = elements(page).find(el =>
   el.props.title === 'Requests the server can run at once; more than this wait in its queue.')
 check('local card slots label carries the queue tooltip',
   slotsEl && textOf(slotsEl) === 'slots', slotsEl ? textOf(slotsEl) : 'slots label missing')
+
+// --- UI v2 part A ---------------------------------------------------------------
+// shortAgentLabel, the swim-lane tooltip card facts and the By agent card rows.
+// A second factory exposes the helpers this block needs without touching the
+// shared return list above (a function declaration, so it hoists for the By
+// agent checks earlier in the file).
+function partA() {
+  if (partA.cached) return partA.cached
+  const factoryA = new Function(
+    'atom', 'Badge', 'Button', 'Codicon', 'EmptyState', 'ErrorState', 'ScrollArea', 'SegmentedControl',
+    'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
+    'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
+    'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
+    `${body}\nreturn { shortAgentLabel, fullAgentText, requestCardFacts, requestTooltip, agentCardFacts, AgentView, swimLanes, AGENT_STAT_W, AGENT_CHILD_LIMIT }`
+  )
+  partA.cached = factoryA(
+    atom, Badge, Button, Component, EmptyState, Component, Component, Component,
+    Component, Component, cn, host, profileColor, useQuery, useValue,
+    'palette', 'routes', 'sidebar', 'statusbar',
+    useEffect, useMemo, useRef, useState, jsx, jsxs, globalThis
+  )
+  return partA.cached
+}
+{
+  const A = partA()
+  const NOW_MS = fixture.generated_at * 1000
+
+  // A1. shortAgentLabel: session title, subagent goal clause (≤30 chars), cron.
+  const sessionShort = A.shortAgentLabel({ kind: 'session', session_id: 's-1', title: 'Flightdeck hackathon' }, {})
+  check('shortAgentLabel keeps a short session title as-is', sessionShort === 'Flightdeck hackathon', sessionShort)
+  const longShort = A.shortAgentLabel({ kind: 'session', session_id: 's-2', title: 'Redefine Gerard role and responsibilities for the next quarter' }, {})
+  check('shortAgentLabel cuts a long session title to its first words (≤30 chars)',
+    longShort.length <= 30 && longShort.startsWith('Redefine Gerard') && !longShort.includes('quarter'), longShort)
+  const goals = [
+    "Write a 400-word explanation of why GPU inference servers batch requests and what a 'slot' is. No tools needed; answer directly.",
+    'In about 200 words, explain the difference between time-to-first-token and decode throughput for LLM serving.',
+    'Read-only research: work out exactly how credentials and model connections must be set up for a second install',
+    'Execute /Users/openclaw/.hermes/cache/scratch/flightdeck-briefs/I2-health-backend.md end to end and report back'
+  ]
+  const goalShorts = goals.map(goal => A.shortAgentLabel({ kind: 'subagent', session_id: 'g', goal, title: `Subagent: ${goal.slice(0, 40)}…` }, {}))
+  check('shortAgentLabel gives a subagent its goal clause, ≤30 chars, no lead verb or path',
+    goalShorts.every(text => text.length > 0 && text.length <= 30 && !/^(write|in about)\b/i.test(text) && !text.includes('/Users/')),
+    goalShorts.join(' | '))
+  check('shortAgentLabel stops a subagent goal at its first clause',
+    goalShorts[2] === 'Read-only research', goalShorts[2])
+  const cronShorts = [
+    A.shortAgentLabel({ kind: 'cron', session_id: 'c1', cron_job: 'nightly-digest' }, {}),
+    A.shortAgentLabel({ kind: 'cron', session_id: 'c2', title: 'Check automated weekly emails for weekend games' }, {}),
+    A.shortAgentLabel({ kind: 'cron', session_id: 'c3' }, {})
+  ]
+  check('shortAgentLabel names a cron run by its job, then its title, then "cron run"',
+    cronShorts[0] === 'nightly-digest' && cronShorts[1].startsWith('Check automated weekly') && cronShorts[1].length <= 30 && cronShorts[2] === 'cron run',
+    cronShorts.join(' | '))
+  const echoFull = A.fullAgentText({ kind: 'subagent', session_id: 'g', goal: goals[1], title: `Subagent: ${goals[1].slice(0, 40)}…` }, {})
+  check('subagent full text prints the goal once (title that echoes it is dropped)',
+    echoFull === `subagent · ${goals[1]}`, echoFull.slice(0, 80))
+
+  // A2. Tooltip card facts: in-flight waiting, streamed, not-streamed.
+  const lane = { label: 'studio-ds4', kind: 'local' }
+  const nowS = Date.now() / 1000
+  const snapA = { agents: [] }
+  const waiting = A.requestCardFacts({ session_id: 'w', profile: 'default', model: 'ds4', started_at: nowS - 7.2, first_chunk_at: null, ended_at: null, status: 'in-flight' }, {}, snapA, lane)
+  check('tooltip card: in-flight request with no first chunk reads waiting so far, generating —',
+    waiting.waitedLabel === 'waiting so far' && /^7\.\ds$/.test(waiting.waited) && waiting.generating === '—'
+      && waiting.status === 'running' && !JSON.stringify(waiting).includes('not streamed'),
+    `${waiting.waited} ${waiting.waitedLabel} / ${waiting.generating} ${waiting.generatingLabel} / ${waiting.status}`)
+  const waitingText = A.requestTooltip({ session_id: 'w', profile: 'default', model: 'ds4', started_at: nowS - 7.2, first_chunk_at: null, ended_at: null, status: 'in-flight' }, {}, snapA, lane)
+  check('text tooltip: in-flight request with no first chunk says waiting, never not streamed',
+    waitingText.includes('waiting for first token') && !waitingText.includes('not streamed'), waitingText.split('\n').slice(-1)[0])
+  const streamed = A.requestCardFacts({ session_id: 's', profile: 'default', model: 'ds4', started_at: 100, first_chunk_at: 101.5, ended_at: 105.5, prompt_tokens: 2000, cached_tokens: 1000, completion_tokens: 400, status: 'done' }, {}, snapA, lane)
+  check('tooltip card: streamed request shows waited, generating span and tok/s',
+    streamed.waitedLabel === 'waited for 1st token' && streamed.waited === '1.5s' && streamed.generating === '4.0s'
+      && streamed.generatingLabel === 'generating · 100 tok/s' && streamed.tokensIn === '2k' && streamed.tokensInLabel === 'tokens in · 50% cached'
+      && streamed.status === 'finished',
+    `${streamed.waited}/${streamed.generating} ${streamed.generatingLabel} ${streamed.tokensIn} ${streamed.tokensInLabel}`)
+  const whole = A.requestCardFacts({ session_id: 'n', profile: 'default', model: 'ds4', started_at: 100, first_chunk_at: null, ended_at: 112, prompt_tokens: 100, completion_tokens: 50, status: 'done' }, {}, snapA, lane)
+  check('tooltip card: finished request with no first chunk is not streamed (whole response)',
+    whole.waitedLabel === 'whole response' && whole.waited === '12.0s' && whole.generating === 'not streamed',
+    `${whole.waited} ${whole.waitedLabel} / ${whole.generating}`)
+  const generatingNow = A.requestCardFacts({ session_id: 'g', profile: 'default', model: 'ds4', started_at: nowS - 5, first_chunk_at: nowS - 3, ended_at: null, status: 'in-flight' }, {}, snapA, lane)
+  check('tooltip card: in-flight streaming request shows waited and generating so far',
+    generatingNow.waitedLabel === 'waited for 1st token' && generatingNow.waited === '2.0s' && /^3\.\ds$/.test(generatingNow.generating),
+    `${generatingNow.waited} / ${generatingNow.generating}`)
+  // The canvas agrees: an in-flight no-first-chunk bar is not a hatched whole bar.
+  const waitSnap = JSON.parse(JSON.stringify(fixture))
+  const waitServer = waitSnap.servers.find(s => (s.requests || []).some(r => r.ended_at == null && r.first_chunk_at == null))
+  const waitLanes = waitServer ? A.swimLanes(waitSnap, 300, NOW_MS).lanes.find(l => l.label === waitServer.name) : null
+  const waitBars = waitLanes ? waitLanes.bars.filter(bar => bar.request.ended_at == null && bar.request.first_chunk_at == null) : []
+  check('swim lane: an in-flight bar with no first chunk is waiting, not hatched whole',
+    waitBars.length > 0 && waitBars.every(bar => !bar.whole), `${waitBars.length} waiting bars, ${waitBars.filter(b => b.whole).length} whole`)
+
+  // A3. By agent rows: no MIX bar, model chips present, kind badges, idle,
+  //     fixed-width number columns, subagents capped at 4 + '+N more'.
+  const byAgentSnap = JSON.parse(JSON.stringify(fixture))
+  const parent = byAgentSnap.agents.find(row => row.kind === 'session')
+  parent.title = 'Flightdeck hackathon'
+  parent.in_flight = 0
+  const childTemplate = (parent.children || [])[0] || { kind: 'subagent', profile: parent.profile, models: parent.models }
+  parent.children = goals.concat(['List 30 creative names for a fleet-monitoring tool', 'Write a Python function that packs time intervals'])
+    .map((goal, i) => ({
+      ...JSON.parse(JSON.stringify(childTemplate)),
+      kind: 'subagent', role: 'leaf', goal, title: `Subagent: ${goal.slice(0, 40)}…`,
+      session_id: `child-${i}`, parent_session_id: parent.session_id,
+      in_flight: i === 5 ? 1 : 0, requests_5m: 10 - i
+    }))
+  byAgentSnap.agents.push({
+    profile: parent.profile, session_id: 'cron-1', kind: 'cron', cron_job: 'nightly-digest', in_flight: 0,
+    requests_5m: 2, errors_5m: 0, tokens_in: 1000, tokens_out: 100, cached_tokens: 0,
+    latency_ms_p50: null, ttft_ms_p50: null, models: parent.models, children: []
+  })
+  const byAgent = A.AgentView({ snapshot: byAgentSnap, labels: {}, now: NOW_MS, windowSeconds: 300 })
+  const byAgentEls = elements(byAgent)
+  const byAgentText = textOf(byAgent)
+  check('By agent has no MIX bar or mix column',
+    !byAgentEls.some(el => el.props.title && /share of this row/i.test(el.props.title)) && !/\bmix\b/i.test(byAgentText),
+    /\bmix\b/i.test(byAgentText) ? 'mix text present' : 'no mix')
+  const rowsA = byAgentEls.filter(el => el.props['data-agent-row'] != null)
+  const chipLess = rowsA.filter(row => countIn(row, 'data-model-row') === 0)
+  check('By agent: every row carries model chips', rowsA.length > 0 && chipLess.length === 0,
+    chipLess.map(r => r.props['data-agent-row']).join(', ') || `${rowsA.length} rows`)
+  const chipText = textOf(byAgentEls.find(el => el.props['data-model-row'] != null))
+  // name and count are sibling spans (CSS gap between them, so no space in text)
+  check('By agent: a model chip reads "<model> · <n> req"', /^\S.*· \d+ req/.test(chipText), chipText)
+  const badges = new Set(byAgentEls.filter(el => el.props['data-agent-badge'] != null).map(el => el.props['data-agent-badge']))
+  check('By agent: kind badges for session, subagent and cron', badges.has('session') && badges.has('subagent') && badges.has('cron'),
+    [...badges].join(', '))
+  const parentRow = rowsA.find(row => row.props['data-agent-row'] === parent.session_id)
+  check('By agent: an idle agent reads "idle" in the in-flight column',
+    parentRow && textOf(elements(parentRow).find(el => el.props['data-col'] === 'flight')).startsWith('idle'),
+    parentRow ? textOf(elements(parentRow).find(el => el.props['data-col'] === 'flight')) : 'row missing')
+  const parentName = parentRow && elements(parentRow).find(el => el.props['data-agent-name'] != null)
+  check('By agent: the row name is the short label, one line with ellipsis',
+    parentName && textOf(parentName) === 'Flightdeck hackathon' && parentName.props.style.whiteSpace === 'nowrap'
+      && parentName.props.style.textOverflow === 'ellipsis' && parentName.props.style.minWidth === 0,
+    parentName ? textOf(parentName) : 'name missing')
+  const subLabels = rowsA.filter(row => row.props['data-agent-kind'] === 'subagent')
+    .map(row => textOf(elements(row).find(el => el.props['data-agent-name'] != null)))
+  check('By agent: subagent rows never print the full goal inline',
+    subLabels.length > 0 && subLabels.every(text => text.length <= 30 && !text.includes('/Users/')), subLabels.join(' | '))
+  const shownChildren = rowsA.filter(row => String(row.props['data-agent-row']).startsWith('child-'))
+  const more = byAgentEls.find(el => el.props['data-more-subagents'] != null)
+  check('By agent: at most 4 subagents shown, then "+N more"',
+    shownChildren.length === A.AGENT_CHILD_LIMIT && more && more.props['data-more-subagents'] === '2' && textOf(more) === '+2 more'
+      && typeof more.props.onClick === 'function',
+    `${shownChildren.length} shown, ${more ? textOf(more) : 'no expander'}`)
+  check('By agent: the busy subagent sorts into the visible four',
+    shownChildren.some(row => row.props['data-agent-row'] === 'child-5'), shownChildren.map(r => r.props['data-agent-row']).join(', '))
+  // No horizontal overflow by construction: the number block is three fixed
+  // widths (≈250 px) that never shrink; the name column is min-width 0 and
+  // ellipsises. Every row's block is identical so columns line up.
+  const blocks = byAgentEls.filter(el => el.props['data-agent-numbers'] != null)
+  const blockWidths = blocks.map(block => elements(block).filter(el => el.props['data-col'] != null)
+    .map(el => parseInt(el.props.style.width, 10)))
+  const W = A.AGENT_STAT_W
+  check('By agent: every number block is the same three fixed widths, ≤260 px in total',
+    blocks.length === rowsA.length && blockWidths.every(ws => ws.length === 3 && ws[0] === W.flight && ws[1] === W.req && ws[2] === W.tokens)
+      && W.flight + W.req + W.tokens + 24 <= 260 && blocks.every(block => block.props.style.flex === '0 0 auto'),
+    `${blocks.length} blocks for ${rowsA.length} rows · ${W.flight}+${W.req}+${W.tokens}`)
+  const card = A.agentCardFacts(parent.children[3], {}, NOW_MS)
+  check('By agent card carries the full goal, kind and per-model lines',
+    card.full && card.full.includes('I2-health-backend.md') && card.meta.startsWith('subagent') && card.models.length > 0,
+    `${card.name} · ${card.meta} · ${card.models.length} models`)
+}
+
+// --- UI v2 part B ---------------------------------------------------------------
+// Local server cards (header, ring gauges, compact idle variant, dropped count
+// in the tooltip, HELD BY short labels) and cloud cards (provider label,
+// BigStats, plan bars with reset text, the auto-fill grid). Its own factory, so
+// the shared return list above stays untouched.
+{
+  const factoryB = new Function(
+    'atom', 'Badge', 'Button', 'Codicon', 'EmptyState', 'ErrorState', 'ScrollArea', 'SegmentedControl',
+    'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
+    'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
+    'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
+    `${body}\nreturn { serverModelShort, cloudProviderLabel, providerPlanLabel, isQuietServer, fmtResetTime, shortAgentLabel, ServerCard, CloudCard, PlanUsage, ModelView }`
+  )
+  const B = factoryB(
+    atom, Badge, Button, Component, EmptyState, Component, Component, Component,
+    Component, Component, cn, host, profileColor, useQuery, useValue,
+    'palette', 'routes', 'sidebar', 'statusbar',
+    useEffect, useMemo, useRef, useState, jsx, jsxs, globalThis
+  )
+  const NOW_MS = fixture.generated_at * 1000
+  const serverByName = name => JSON.parse(JSON.stringify(fixture.servers.find(s => s.name === name)))
+  const cardOf = (server, extra) => B.ServerCard({ server, models: fixture.models, labels, now: NOW_MS, ...(extra || {}) })
+  const headerOf = card => elements(card).find(el => el.props['data-server-title'] != null)
+  const occurrences = (text, word) => text.split(word).length - 1
+
+  // Header: 'name · model short name', the name exactly once, URL only in the tooltip.
+  const gbCard = cardOf({ ...serverByName('gb10-qwen'), running: 1, in_flight: 1 })
+  const gbHeader = headerOf(gbCard)
+  const gbRow = elements(gbCard).find(el => typeof el.props.title === 'string' && el.props.title.includes('http://127.0.0.1:18009'))
+  check('server header is "name · model" and never repeats the name',
+    gbHeader && textOf(gbHeader) === 'gb10-qwen · GN100 Qwen3.8-Flash-Next FP4'
+      && occurrences(textOf(gbCard), 'gb10-qwen') === 1,
+    gbHeader ? textOf(gbHeader) : 'header missing')
+  check('server URL rides in the header tooltip, not the card text',
+    gbRow && !textOf(gbCard).includes('127.0.0.1'), gbRow ? 'tooltip ok' : textOf(gbCard).slice(0, 120))
+  const echoServer = { ...serverByName('qwen3.5-9b'), running: 1, in_flight: 1 }
+  const echoHeader = headerOf(cardOf(echoServer))
+  check('server header drops a model id that only restates the name (and a helper-model title)',
+    echoHeader && textOf(echoHeader) === 'qwen3.5-9b' && B.serverModelShort(echoServer) === '',
+    echoHeader ? textOf(echoHeader) : 'header missing')
+  check('server model short name drops a kind word and stays short',
+    B.serverModelShort({ name: 'box', kind: 'vllm', title: 'Llama 4 Scout vLLM (8xH100, fp8)' }) === 'Llama 4 Scout'
+      && B.serverModelShort({ name: 'ds4', models: ['ds4'] }) === ''
+      && B.serverModelShort({ name: 'lab', models: ['org/Some-Model-7B-Instruct'] }).length <= 36,
+    `${B.serverModelShort({ name: 'box', kind: 'vllm', title: 'Llama 4 Scout vLLM (8xH100, fp8)' })} | ${B.serverModelShort({ name: 'ds4', models: ['ds4'] })}`)
+
+  // Ring gauges: one per reported health ratio, none without a health block.
+  const ringServer = { ...serverByName('gb10-qwen'), running: 1, in_flight: 1,
+    health: { kv_cache_usage: 0.17, prefix_cache_hit_rate: 0.93, spec_accept_rate: 0.66,
+      disconnects_total: 22, disconnects_delta: 0, preemptions_total: 0, preemptions_delta: 0 } }
+  const ringCard = cardOf(ringServer)
+  const rings = elements(ringCard).filter(el => el.props['data-ring'] != null)
+  const hero = elements(ringCard).find(el => el.props['data-hero'] != null)
+  check('ring gauges render for KV cache, prefix hit and MTP accept inside the hero row',
+    rings.map(el => el.props['data-ring']).join(',') === 'kv,prefix,mtp'
+      && hero && elements(hero).filter(el => el.props['data-ring'] != null).length === 3
+      && elements(hero).some(el => el.props['data-slots-meter'] != null)
+      && ['17%', '93%', '66%'].every(pct => textOf(hero).includes(pct)),
+    hero ? textOf(hero) : 'hero missing')
+  const kvOnlyRings = elements(cardOf({ ...ringServer, health: { kv_cache_usage: 0.4 } })).filter(el => el.props['data-ring'] != null)
+  const noHealthRings = elements(cardOf({ ...ringServer, health: null })).filter(el => el.props['data-ring'] != null)
+  check('ring gauges appear only for reported fields', kvOnlyRings.length === 1 && noHealthRings.length === 0,
+    `${kvOnlyRings.length} with kv only, ${noHealthRings.length} with no health`)
+  const serverKicker = elements(ringCard).find(el => textOf(el) === 'server' && typeof el.props.title === 'string')
+  check('dropped connections leave the card for the tooltip',
+    !textOf(ringCard).includes('dropped') && !textOf(ringCard).includes('(of ')
+      && serverKicker && serverKicker.props.title.includes('Client connections dropped'),
+    serverKicker ? serverKicker.props.title.slice(-90) : 'server kicker missing')
+  const hermesLine = elements(ringCard).find(el => el.props['data-stat-line'] === 'Hermes')
+  check('Hermes-observed numbers sit on their own muted "Hermes" line',
+    hermesLine && textOf(hermesLine).startsWith('Hermes') && textOf(hermesLine).includes('in flight'),
+    hermesLine ? textOf(hermesLine) : 'Hermes line missing')
+  const sparkWrap = elements(ringCard).find(el => el.props['data-card-chart'] === 'server')
+  check('server sparkline is the full-width card footer',
+    sparkWrap && !sparkWrap.props.className && sparkWrap.props.style.marginTop === 'auto',
+    sparkWrap ? JSON.stringify(sparkWrap.props.style) : 'chart wrapper missing')
+
+  // Compact variant: a server with nothing from Hermes in the window folds to
+  // one clickable line; a busy one never does.
+  const idleServer = serverByName('qwen3.5-9b')
+  const idleCard = cardOf(idleServer)
+  const idleArticle = elements(idleCard).find(el => el.type === 'article')
+  const expander = elements(idleCard).find(el => el.props['data-expand-server'] === 'qwen3.5-9b')
+  check('idle server renders the compact one-line variant, expandable on click',
+    B.isQuietServer(idleServer) && idleArticle && idleArticle.props['data-compact'] === 'true'
+      && expander && typeof expander.props.onClick === 'function' && expander.props['aria-expanded'] === 'false'
+      && textOf(idleCard).includes('idle') && !elements(idleCard).some(el => el.props['data-ring'] != null || el.props['data-held-by'] != null),
+    textOf(idleCard).slice(0, 120))
+  const busyServer = serverByName('studio-ds4')
+  check('a server with Hermes traffic in the window keeps the full card',
+    !B.isQuietServer(busyServer) && elements(cardOf(busyServer)).find(el => el.type === 'article').props['data-compact'] === 'false'
+      && !B.isQuietServer({ ...idleServer, error: 'boom' }),
+    'studio-ds4 has a running slot')
+  const layoutView = B.ModelView({ snapshot: fixture, labels, now: NOW_MS, windowSeconds: 60, onHide: null })
+  const quietGroup = elements(layoutView).find(el => el.props['data-quiet-servers'] != null)
+  const activeGrid = elements(layoutView).find(el => el.props['data-server-grid'] != null)
+  // Fixture: gb10-qwen and studio-ds4 carry rows in the window; qwen3.5-9b none.
+  check('quiet servers stack under the full cards',
+    quietGroup && quietGroup.props['data-quiet-servers'] === 1 && activeGrid && activeGrid.props['data-server-grid'] === 2
+      && elements(quietGroup).some(el => el.props['data-server-card'] === 'qwen3.5-9b'),
+    `${quietGroup ? quietGroup.props['data-quiet-servers'] : 'no'} quiet, ${activeGrid ? activeGrid.props['data-server-grid'] : 'no'} full`)
+
+  // HELD BY rows use the short agent label; the full text is the row tooltip.
+  const heldSession = 'held-short-1'
+  const heldTitle = 'Investigate the warehouse SFTP outage and write up the timeline for ops'
+  const heldSnapB = JSON.parse(JSON.stringify(fixture))
+  heldSnapB.agents = [{ profile: 'default', session_id: heldSession, kind: 'session', title: heldTitle }]
+  const heldServer = { ...serverByName('studio-ds4'),
+    agents: [{ profile: 'default', session_id: heldSession, requests: 1, oldest_started_at: fixture.generated_at - 30 }] }
+  const heldRowB = elements(cardOf(heldServer, { snapshot: heldSnapB }))
+    .find(el => el.props['data-held-row'] === heldSession)
+  const wantShort = B.shortAgentLabel(heldSnapB.agents[0], labels)
+  check('server HELD BY rows show shortAgentLabel with the full title in the tooltip',
+    heldRowB && textOf(heldRowB).startsWith(wantShort) && wantShort.length < heldTitle.length
+      && String(heldRowB.props.title).includes(heldTitle),
+    heldRowB ? `${textOf(heldRowB)} | ${wantShort}` : 'held row missing')
+
+  // Cloud cards: provider label mapping, BigStats, tooltip-only notes.
+  check('provider label maps DirectSDK / API / Codex and keeps other slugs',
+    B.cloudProviderLabel('claude-subscription-directsdk-experimental') === 'DirectSDK'
+      && B.cloudProviderLabel('anthropic') === 'API' && B.cloudProviderLabel('openai') === 'API'
+      && B.cloudProviderLabel('openai-codex') === 'Codex' && B.cloudProviderLabel('openrouter') === 'openrouter'
+      && B.providerPlanLabel('anthropic') === 'API',
+    ['claude-subscription-directsdk-experimental', 'anthropic', 'openai-codex', 'openrouter'].map(B.cloudProviderLabel).join(', '))
+  const cloudBase = JSON.parse(JSON.stringify(fixture.models.find(model => model.lane === 'cloud')))
+  const streamedCloud = { ...cloudBase, quota: null, in_flight: 2, requests_5m: 17, requests_1m: 4,
+    streamed: 5, non_streamed: 0, ttft_ms_p50: 929 }
+  const cloudCardB = B.CloudCard({ model: streamedCloud, labels, now: NOW_MS, windowSeconds: 300, snapshot: fixture })
+  const statsB = Object.fromEntries(elements(cloudCardB).filter(el => el.props['data-col'] != null)
+    .map(el => [el.props['data-col'], textOf(el)]))
+  check('cloud card BigStats: in flight, req / 5 min, TTFT p50',
+    statsB['in-flight'] === '2in flight' && statsB.requests === '17req / 5 min' && statsB.ttft === '929msTTFT p50',
+    JSON.stringify(statsB))
+  const oneMinStats = Object.fromEntries(elements(B.CloudCard({ model: streamedCloud, labels, now: NOW_MS, windowSeconds: 60, snapshot: fixture }))
+    .filter(el => el.props['data-col'] != null).map(el => [el.props['data-col'], textOf(el)]))
+  check('cloud card request BigStat follows the 1m window', oneMinStats.requests === '4req / 1 min', JSON.stringify(oneMinStats))
+  const pill = elements(cloudCardB).find(el => el.props['data-provider-label'] != null)
+  check('cloud header shows the provider label; "Hermes traffic only" moves to the tooltip',
+    pill && textOf(pill) === 'DirectSDK' && !textOf(cloudCardB).includes('Hermes traffic only')
+      && String(pill.props.title).includes('Hermes traffic only') && !textOf(cloudCardB).includes('process://'),
+    pill ? textOf(pill) : 'provider pill missing')
+
+  // Plan bars: label, bar, '26% used · resets <day time>'.
+  const resetAt = 1794394800
+  const planB = B.PlanUsage({ quota: { windows: [
+    { label: 'Current week', used_percent: 26, reset_at: resetAt },
+    { label: 'Weekly', used_percent: null, reset_at: resetAt }
+  ] } })
+  const planTexts = elements(planB).filter(el => el.props['data-plan-text'] != null).map(textOf)
+  const planBars = elements(planB).filter(el => el.props['data-plan-bar'] != null)
+  check('plan bar row reads "26% used · resets <time>" over a 26% bar',
+    planTexts[0] === `26% used · resets ${B.fmtResetTime(resetAt)}` && B.fmtResetTime(resetAt)
+      && planBars.length === 1 && planBars[0].props['data-plan-bar'] === 26,
+    `${planTexts.join(' | ')} · ${planBars.length} bars`)
+  check('plan window with no reading keeps its reset text and draws no bar',
+    planTexts[1] === `no usage reported · resets ${B.fmtResetTime(resetAt)}`, planTexts[1] || 'missing')
+
+  // Cloud grid: auto-fill minmax(360px, 1fr) so cards sit 2-3 per row when wide.
+  const cloudGrid = elements(B.ModelView({ snapshot: fixture, labels, now: NOW_MS, windowSeconds: 300, onHide: null }))
+    .find(el => el.props['data-cloud-grid'] != null)
+  check('cloud cards sit in an auto-fill minmax(360px, 1fr) grid',
+    cloudGrid && cloudGrid.props.style.display === 'grid'
+      && cloudGrid.props.style.gridTemplateColumns === 'repeat(auto-fill, minmax(min(360px, 100%), 1fr))',
+    cloudGrid ? cloudGrid.props.style.gridTemplateColumns : 'grid missing')
+}
 
 const failed = results.filter(item => !item.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`)

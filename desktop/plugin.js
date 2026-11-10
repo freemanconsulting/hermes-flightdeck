@@ -337,6 +337,141 @@ function agentLabel(row, labels) {
   return id ? `session ${id.slice(0, 8)}` : 'session'
 }
 
+// Semantic accents. Fixed hues (or the host's own semantic vars) that read on
+// a white panel and on a near-black one alike; text and surfaces stay on the
+// host theme vars.
+const TONE_LOCAL = 'var(--ui-green, #1f8a65)'
+const TONE_CLOUD = 'hsl(214 82% 56%)'
+const TONE_QUEUED = 'var(--ui-red, #cf2d56)'
+const TONE_AMBER = 'hsl(36 92% 50%)'
+
+// A compact agent label for chips, the legend, HELD BY rows and the By agent
+// name: a session's title, a cron's job, a subagent's goal — cut to its first
+// clause and first four words, at most SHORT_LABEL_MAX characters. The full
+// label (agentLabel) always rides in a tooltip.
+const SHORT_LABEL_MAX = 30
+const SHORT_LEAD_WORDS = new Set([
+  'write', 'list', 'explain', 'describe', 'give', 'create', 'make', 'draft', 'produce',
+  'generate', 'summarize', 'summarise', 'compose', 'implement', 'please', 'briefly', 'a', 'an', 'the'
+])
+const SHORT_STOP_WORDS = new Set([
+  'a', 'an', 'the', 'of', 'for', 'to', 'and', 'or', 'that', 'which', 'why', 'how', 'what', 'in',
+  'on', 'with', 'by', 'as', 'at', 'from', 'into', 'about', 'is', 'are', '&', '-', '—'
+])
+
+function shortenPhrase(text, dropLead) {
+  let s = String(text || '').replace(/\s+/g, ' ').trim().replace(/^subagent\s*[:·-]\s*/i, '')
+  if (dropLead) s = s.replace(/^in (?:about |under |roughly |around )?\d+\s*words?,?\s*/i, '')
+  const clause = s.split(/[.;!?](?:\s|$)|:\s|\s[—–-]\s|,\s|\(|\n/)[0].trim()
+  let words = (clause.length >= 2 ? clause : s).split(' ').filter(Boolean)
+  if (dropLead) {
+    while (words.length > 1 && (SHORT_LEAD_WORDS.has(words[0].toLowerCase()) || /^\d+-words?$/i.test(words[0]))) {
+      words.shift()
+    }
+  }
+  words = words.slice(0, 4)
+  const trimStops = list => {
+    while (list.length > 1 && SHORT_STOP_WORDS.has(list[list.length - 1].toLowerCase())) list.pop()
+    return list
+  }
+  trimStops(words)
+  let out = words.join(' ')
+  if (out.length > SHORT_LABEL_MAX) {
+    const parts = out.split(' ')
+    while (parts.length > 1 && parts.join(' ').length > SHORT_LABEL_MAX - 1) parts.pop()
+    trimStops(parts)
+    out = parts.join(' ')
+    if (out.length > SHORT_LABEL_MAX - 1) out = out.slice(0, SHORT_LABEL_MAX - 1)
+    out = `${out}…`
+  }
+  return out
+}
+
+function shortAgentLabel(row, labels) {
+  if (!row) return 'unknown'
+  const title = rowTitle(row) || sessionTitle(labels, row.session_id)
+  if (row.kind === 'subagent') {
+    const goal = row.goal || title
+    return (goal && shortenPhrase(goal, true)) || 'subagent'
+  }
+  if (row.kind === 'cron') {
+    const base = row.cron_job || title
+    return (base && shortenPhrase(base, false)) || 'cron run'
+  }
+  if (title) return shortenPhrase(title, false) || String(title).slice(0, SHORT_LABEL_MAX)
+  const id = String(row.session_id || '')
+  return id ? `session ${id.slice(0, 8)}` : 'session'
+}
+
+// The long form for a tooltip: the full label, then the goal when the label
+// does not already carry it.
+function fullAgentText(row, labels) {
+  // A subagent's stored title is usually an echo of its goal ('Subagent: Write
+  // a …'); print the goal once, and the title only when it says something new.
+  if (row && row.kind === 'subagent' && row.goal) {
+    const role = !row.role || row.role === 'leaf' ? 'subagent' : row.role
+    const goal = String(row.goal)
+    const title = rowTitle(row) || sessionTitle(labels, row.session_id)
+    const core = String(title || '').replace(/^subagent\s*[:·-]\s*/i, '').replace(/[….\s]+$/, '').trim()
+    const echo = !core || goal.replace(/\s+/g, ' ').startsWith(core.replace(/\s+/g, ' '))
+    return echo ? `${role} · ${goal}` : `${role} · ${goal} · ${title}`
+  }
+  const label = agentLabel(row, labels)
+  return row && row.goal && !label.includes(row.goal) ? `${label} — goal: ${row.goal}` : label
+}
+
+// Small uppercase section kicker used inside cards.
+function kickerStyle(extra) {
+  return {
+    fontSize: '0.6rem',
+    fontWeight: 600,
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase',
+    color: 'var(--ui-text-quaternary)',
+    ...extra
+  }
+}
+
+// A big tabular number over a small muted label: the one stat face used by the
+// tooltip card, By agent rows and the cloud cards.
+function BigStat({ value, label, tone, title, size, col, align, width }) {
+  return jsxs('div', {
+    'data-col': col || undefined,
+    title: title || undefined,
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: align === 'right' ? 'flex-end' : 'flex-start',
+      minWidth: 0,
+      width: width != null ? `${width}px` : undefined,
+      flex: width != null ? '0 0 auto' : undefined
+    },
+    children: [
+      jsx('span', {
+        style: {
+          fontSize: size || '1.05rem',
+          fontWeight: 600,
+          lineHeight: 1.15,
+          fontVariantNumeric: 'tabular-nums',
+          letterSpacing: '-0.01em',
+          whiteSpace: 'nowrap',
+          color: tone || 'var(--ui-text-primary)'
+        },
+        children: value
+      }),
+      jsx('span', {
+        style: {
+          fontSize: '0.6rem',
+          lineHeight: 1.3,
+          whiteSpace: 'nowrap',
+          color: 'var(--ui-text-quaternary)'
+        },
+        children: label
+      })
+    ]
+  })
+}
+
 // "started Nov 4 · active 2m ago" — real timestamps only; a missing piece is
 // omitted rather than rendered as an em dash.
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -691,13 +826,9 @@ function quotaWindowCount(quota) {
   return quota.windows.filter(window => window && typeof window === 'object').length
 }
 
-// A short provider label for the shared-plan line: the two Claude lanes get
-// human names, any other provider keeps its slug.
+// A short provider label for the shared-plan line (cloudProviderLabel).
 function providerPlanLabel(provider) {
-  const slug = String(provider || '').trim()
-  if (slug === 'claude-subscription-directsdk-experimental') return 'DirectSDK'
-  if (slug === 'anthropic') return 'API'
-  return slug || 'provider'
+  return cloudProviderLabel(provider)
 }
 
 // The lane's provider may be an alias of the provider row model.options names.
@@ -815,12 +946,11 @@ function Metric({ label, value, accent, title }) {
   })
 }
 
-// Engine health line. Server-side numbers cover all traffic, not just Hermes;
-// every tooltip says so in plain words. Missing fields are omitted, never zero.
-function fmtHealthSeconds(value) {
-  if (value == null) return null
-  return `${Number(value.toFixed(2))}s`
-}
+// Engine health. Server-side numbers come from the server's own /metrics and
+// cover ALL traffic hitting it, not just Hermes; every tooltip says so. KV
+// cache, prefix hit and MTP acceptance are ring gauges in the card's hero row;
+// the rest is one compact stats line. Missing fields are omitted, never zero.
+const SERVER_SIDE_NOTE = "Server-side numbers from the server's own /metrics: they cover ALL traffic hitting the server, not just requests from this machine's Hermes."
 
 function fmtHealthPct(value) {
   if (value == null) return null
@@ -832,161 +962,216 @@ function fmtHealthMem(bytes) {
   return `${(bytes / 1e9).toFixed(1)} GB`
 }
 
-function HealthBar({ pct }) {
-  return jsx('span', {
-    style: {
-      display: 'inline-block',
-      width: '30px',
-      height: '4px',
-      borderRadius: '2px',
-      overflow: 'hidden',
-      background: 'var(--ui-bg-tertiary)',
-      verticalAlign: 'middle'
-    },
-    children: jsx('span', {
-      style: {
-        display: 'block',
-        width: `${Math.max(0, Math.min(100, pct))}%`,
-        height: '100%',
-        background: 'var(--ui-accent)'
-      }
-    })
+// Seconds per output token as '15.9 ms' (one decimal under 100 ms).
+function fmtTpot(seconds) {
+  if (seconds == null) return null
+  const ms = seconds * 1000
+  return `${ms < 100 ? ms.toFixed(1) : Math.round(ms)} ms`
+}
+
+// Client disconnects ride in a tooltip only: a lifetime count on the card read
+// like an error rate.
+function droppedText(health) {
+  if (!health || (health.disconnects_delta == null && health.disconnects_total == null)) return null
+  const parts = []
+  if (health.disconnects_delta != null) parts.push(`${fmtInt(health.disconnects_delta)} in the last sample interval`)
+  if (health.disconnects_total != null) parts.push(`${fmtInt(health.disconnects_total)} since the server started`)
+  return `Client connections dropped: ${parts.join(', ')}.`
+}
+
+const RING_SIZE = 44
+const RING_STROKE = 4.5
+
+// A ring gauge: the arc is the fraction, the number sits in the middle, the
+// label and its plain-words sub-label sit beside it.
+function RingGauge({ id, fraction, label, sub, title, tone }) {
+  const value = Math.max(0, Math.min(1, Number(fraction) || 0))
+  const centre = RING_SIZE / 2
+  const radius = (RING_SIZE - RING_STROKE) / 2
+  const circumference = 2 * Math.PI * radius
+  return jsxs('div', {
+    'data-ring': id,
+    title,
+    style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 },
+    children: [
+      jsxs('div', {
+        style: { position: 'relative', width: `${RING_SIZE}px`, height: `${RING_SIZE}px`, flex: '0 0 auto' },
+        children: [
+          jsxs('svg', {
+            width: RING_SIZE,
+            height: RING_SIZE,
+            viewBox: `0 0 ${RING_SIZE} ${RING_SIZE}`,
+            'aria-hidden': 'true',
+            style: { display: 'block', transform: 'rotate(-90deg)' },
+            children: [
+              jsx('circle', {
+                cx: centre, cy: centre, r: radius, fill: 'none',
+                stroke: 'var(--ui-stroke-primary)', strokeWidth: RING_STROKE
+              }),
+              value > 0
+                ? jsx('circle', {
+                    'data-ring-arc': Math.round(value * 100),
+                    cx: centre, cy: centre, r: radius, fill: 'none',
+                    stroke: tone || TONE_LOCAL, strokeWidth: RING_STROKE, strokeLinecap: 'round',
+                    strokeDasharray: `${(value * circumference).toFixed(2)} ${circumference.toFixed(2)}`
+                  })
+                : null
+            ]
+          }),
+          jsx('span', {
+            style: {
+              position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '0.72rem', fontWeight: 600, fontVariantNumeric: 'tabular-nums',
+              letterSpacing: '-0.02em', color: 'var(--ui-text-primary)'
+            },
+            children: `${Math.round(value * 100)}%`
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', minWidth: 0, lineHeight: 1.25 },
+        children: [
+          jsx('span', {
+            style: { fontSize: '0.7rem', fontWeight: 500, whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
+            children: label
+          }),
+          jsx('span', {
+            style: { fontSize: '0.6rem', whiteSpace: 'nowrap', color: 'var(--ui-text-tertiary)' },
+            children: sub
+          })
+        ]
+      })
+    ]
   })
 }
 
-function ServerHealth({ health }) {
-  if (!health) return null
+function serverHealthRings(health) {
+  if (!health) return []
+  const rings = []
+  if (health.kv_cache_usage != null) {
+    rings.push({
+      id: 'kv', fraction: health.kv_cache_usage, label: 'KV cache', sub: 'in use',
+      tone: health.kv_cache_usage >= 0.85 ? TONE_AMBER : TONE_LOCAL,
+      title: `KV cache fill: how full the server's cache is right now. ${SERVER_SIDE_NOTE}`
+    })
+  }
+  if (health.prefix_cache_hit_rate != null) {
+    rings.push({
+      id: 'prefix', fraction: health.prefix_cache_hit_rate, label: 'Prefix hit', sub: 'of prompt reused',
+      tone: TONE_LOCAL,
+      title: `Prefix cache hit rate: share of prompt-prefix lookups that found a cached match. ${SERVER_SIDE_NOTE}`
+    })
+  }
+  if (health.spec_accept_rate != null) {
+    rings.push({
+      id: 'mtp', fraction: health.spec_accept_rate, label: 'MTP accept', sub: 'drafts accepted',
+      tone: TONE_LOCAL,
+      title: `MTP acceptance: share of drafted tokens the model accepted. ${SERVER_SIDE_NOTE}`
+    })
+  }
+  return rings
+}
+
+// One compact line of label/value pairs behind a small kicker ('server',
+// 'Hermes'). Each item is [muted, strong, muted, strong, ...] text parts so a
+// pair like 'TTFT p50 760ms · p95 7.6s' stays one item.
+function StatLine({ kicker, kickerTitle, items, data }) {
+  if (!items.length) return null
+  return jsxs('div', {
+    'data-stat-line': data || kicker || '',
+    style: {
+      display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: '14px', rowGap: '2px',
+      minWidth: 0, fontSize: '0.65rem', lineHeight: 1.45
+    },
+    children: [
+      kicker
+        ? jsx('span', {
+            title: kickerTitle || undefined,
+            style: kickerStyle({ flex: '0 0 auto', minWidth: '3.4rem' }),
+            children: kicker
+          })
+        : null,
+      ...items.map(item => jsx('span', {
+        'data-stat': item.id,
+        title: item.title || undefined,
+        style: { whiteSpace: 'nowrap', color: 'var(--ui-text-tertiary)' },
+        children: item.parts.map((part, index) => jsx('span', {
+          style: index % 2
+            ? { fontWeight: 600, fontVariantNumeric: 'tabular-nums', color: item.tone || 'var(--ui-text-primary)' }
+            : undefined,
+          children: part
+        }, `${item.id}-${index}`))
+      }, item.id))
+    ]
+  })
+}
+
+function serverStatItems(health) {
+  if (!health) return []
   const items = []
-  const kv = fmtHealthPct(health.kv_cache_usage)
-  if (kv != null) {
-    items.push(jsxs('span', {
-      title: 'KV cache fill on this server — how full its cache is right now; server-side, all traffic',
-      style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
-      children: [
-        jsx('span', { children: 'KV' }),
-        jsx(HealthBar, { pct: Math.round(health.kv_cache_usage * 100) }),
-        jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: kv })
-      ]
-    }))
-  }
-  const prefix = fmtHealthPct(health.prefix_cache_hit_rate)
-  if (prefix != null) {
-    items.push(jsx('span', {
-      title: 'prefix cache hit rate — share of prefix lookups that found a match; server-side, all traffic',
-      children: `prefix hit ${prefix}`
-    }))
-  }
-  const accept = fmtHealthPct(health.spec_accept_rate)
-  if (accept != null) {
-    items.push(jsxs('span', {
-      title: 'MTP acceptance rate — share of drafted tokens the model accepted; server-side, all traffic',
-      style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
-      children: [
-        jsx('span', { children: 'MTP accept' }),
-        jsx(HealthBar, { pct: Math.round(health.spec_accept_rate * 100) }),
-        jsx('span', { style: { fontVariantNumeric: 'tabular-nums' }, children: accept })
-      ]
-    }))
-  }
-  const ttftP50 = fmtHealthSeconds(health.server_ttft_p50)
-  const ttftP95 = fmtHealthSeconds(health.server_ttft_p95)
-  if (ttftP50 != null || ttftP95 != null) {
+  const p50 = health.server_ttft_p50 != null ? fmtMs(health.server_ttft_p50 * 1000) : null
+  const p95 = health.server_ttft_p95 != null ? fmtMs(health.server_ttft_p95 * 1000) : null
+  if (p50 != null || p95 != null) {
     const parts = []
-    if (ttftP50 != null) parts.push(`p50 ${ttftP50}`)
-    if (ttftP95 != null) parts.push(`p95 ${ttftP95}`)
-    items.push(jsx('span', {
-      title: "time to first token from the server's own /metrics histogram — p50 median and p95. Server-side numbers cover ALL traffic hitting the server, not just requests from this machine's Hermes",
-      children: `server TTFT ${parts.join(' / ')}`
-    }))
+    if (p50 != null) parts.push('TTFT p50 ', p50)
+    if (p95 != null) parts.push(p50 != null ? ' · p95 ' : 'TTFT p95 ', p95)
+    items.push({
+      id: 'ttft', parts,
+      title: "time to first token from the server's own /metrics histogram — p50 median and p95. Server-side numbers cover ALL traffic hitting the server, not just requests from this machine's Hermes"
+    })
   }
-  const tpot = health.server_tpot_p50 != null ? `${Math.round(health.server_tpot_p50 * 1000)} ms` : null
+  const tpot = fmtTpot(health.server_tpot_p50)
   if (tpot != null) {
-    items.push(jsx('span', {
-      title: 'time per output token from the server\'s own histogram — median; server-side numbers cover ALL traffic, not just Hermes',
-      children: `TPOT ${tpot}`
-    }))
+    items.push({
+      id: 'tpot', parts: ['time per token ', tpot],
+      title: `Time per output token (median) from the server's own histogram. ${SERVER_SIDE_NOTE}`
+    })
   }
   const mem = fmtHealthMem(health.memory_bytes)
   if (mem != null) {
-    items.push(jsx('span', {
-      title: 'device memory the engine holds; server-side, all traffic',
-      children: `mem ${mem}`
-    }))
+    const peak = fmtHealthMem(health.memory_peak_bytes)
+    items.push({
+      id: 'mem', parts: ['memory ', mem],
+      title: `Device memory the engine holds${peak ? ` (peak ${peak})` : ''}. ${SERVER_SIDE_NOTE}`
+    })
   }
-  // Preemptions/disconnects were rendered nowhere, so the check below could
-  // never see them; a server that preempted a request should say so.
-  const preempt = health.preemptions_delta != null
-    ? `${health.preemptions_delta} preempted${health.preemptions_total != null ? ` (of ${health.preemptions_total})` : ''}`
-    : health.preemptions_total
-      ? `${health.preemptions_total} preempted`
-      : null
-  if (preempt) {
-    items.push(jsx('span', {
-      title: 'requests the engine preempted (evicted to free KV) in the last sample interval, and its lifetime total; server-side, all traffic',
-      children: preempt
-    }))
+  const preempted = health.preemptions_delta != null ? health.preemptions_delta : health.preemptions_total
+  if (preempted != null) {
+    const lifetime = health.preemptions_total != null && health.preemptions_delta != null
+      ? ` (${fmtInt(health.preemptions_total)} since the server started)`
+      : ''
+    const dropped = droppedText(health)
+    items.push({
+      id: 'preempt', parts: ['preemptions ', fmtInt(preempted)],
+      tone: preempted > 0 ? TONE_AMBER : undefined,
+      title: `Requests the engine preempted (evicted to free KV cache) in the last sample interval${lifetime}.${dropped ? ` ${dropped}` : ''} ${SERVER_SIDE_NOTE}`
+    })
   }
-  const drops = health.disconnects_delta != null
-    ? `${health.disconnects_delta} dropped${health.disconnects_total != null ? ` (of ${health.disconnects_total})` : ''}`
-    : health.disconnects_total
-      ? `${health.disconnects_total} dropped`
-      : null
-  if (drops) {
-    items.push(jsx('span', {
-      title: 'client connections dropped in the last sample interval, and the lifetime total; server-side, all traffic',
-      children: drops
-    }))
-  }
-  if (!items.length) return null
-  const children = []
-  items.forEach((item, i) => {
-    if (i > 0) children.push(jsx('span', { style: { color: 'var(--ui-stroke-tertiary)' }, children: '·' }, `sep-${i}`))
-    children.push(item)
-  })
-  return jsx('div', {
-    style: {
-      display: 'flex',
-      flexWrap: 'wrap',
-      alignItems: 'center',
-      columnGap: '8px',
-      rowGap: '2px',
-      fontSize: '0.6rem',
-      color: 'var(--ui-text-quaternary)'
-    },
-    children
-  })
+  return items
 }
 
-// Same cells as the local card's slot gauge, filled by percentage: a plan
-// window is the same kind of "N of a fixed allowance consumed" reading, so it
-// wears the same face. Colour escalates as the allowance runs out.
-function UsageBar({ percent }) {
-  const cells = []
+// A plan window's allowance as one thin continuous bar, filled by the used
+// percent. The fill escalates amber then red as the allowance runs out; a
+// small non-zero reading keeps a visible sliver rather than vanishing.
+function PlanBar({ percent, tone }) {
   const pct = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0
-  const used = Math.max(0, Math.min(24, Math.round((pct / 100) * 24)))
-  const tone = pct >= 90
-    ? 'bg-(--ui-destructive)'
-    : pct >= 75
-      ? 'bg-(--ui-warning)'
-      : 'bg-(--ui-accent)'
-  for (let i = 0; i < 24; i += 1) {
-    cells.push(
-      jsx(
-        'span',
-        {
-          className: cn(
-            'h-3 w-2 rounded-[1.5px] transition-colors duration-500',
-            i < used
-              ? tone
-              : 'bg-(--ui-bg-tertiary) shadow-[inset_0_0_0_1px_var(--ui-stroke-secondary)]'
-          ),
-          title: i < used ? 'allowance used' : 'allowance left'
-        },
-        `usage-${i}`
-      )
-    )
-  }
-  return jsx('span', { className: 'inline-flex items-center gap-[3px]', children: cells })
+  const fill = pct >= 90 ? TONE_QUEUED : pct >= 75 ? TONE_AMBER : (tone || TONE_CLOUD)
+  return jsx('div', {
+    'data-plan-bar': Math.round(pct),
+    title: `${Math.round(pct)}% of this allowance used`,
+    style: {
+      position: 'relative', height: '6px', borderRadius: '3px', overflow: 'hidden', minWidth: 0,
+      background: 'var(--ui-stroke-secondary)'
+    },
+    children: pct > 0
+      ? jsx('div', {
+          style: {
+            width: `${pct}%`, minWidth: '6px', height: '100%', borderRadius: '3px',
+            background: fill, transition: 'width 500ms ease'
+          }
+        })
+      : null
+  })
 }
 
 // Plan-window reset time in the user's locale: a clock time today/tomorrow,
@@ -1050,7 +1235,9 @@ function SlotBar({ total, running, waiting }) {
   return jsx('span', { className: 'inline-flex items-center gap-[3px]', children: cells })
 }
 
-function Sparkline({ samples }) {
+// Throughput sparkline, full card width. `caption` (left) names what the
+// chart is; the legend and the decode max sit on the right of the same row.
+function Sparkline({ samples, caption, captionTitle, span, tone }) {
   const series = useMemo(() => {
     if (!Array.isArray(samples) || samples.length < 2) return null
     const rows = samples.filter(s => Array.isArray(s) && s.length >= 3 && s[1] != null && s[2] != null)
@@ -1066,8 +1253,8 @@ function Sparkline({ samples }) {
     const prefill = []
     for (let i = 0; i < rows.length; i += 1) {
       const x = (i / (rows.length - 1)) * 100
-      decode.push(`${x.toFixed(2)},${(25 - (rows[i][1] / maxDecode) * 22).toFixed(2)}`)
-      prefill.push(`${x.toFixed(2)},${(25 - (rows[i][2] / maxPrefill) * 22).toFixed(2)}`)
+      decode.push(`${x.toFixed(2)},${(25 - (rows[i][1] / (maxDecode || 1)) * 22).toFixed(2)}`)
+      prefill.push(`${x.toFixed(2)},${(25 - (rows[i][2] / (maxPrefill || 1)) * 22).toFixed(2)}`)
     }
     return {
       decode: decode.join(' '), prefill: prefill.join(' '),
@@ -1076,28 +1263,39 @@ function Sparkline({ samples }) {
   }, [samples])
 
   if (!series) return null
+  const line = tone || 'var(--ui-accent)'
+  const dot = color => jsx('span', {
+    style: { width: '5px', height: '5px', borderRadius: '999px', background: color, flex: '0 0 auto' }
+  })
   return jsxs('div', {
-    className: 'flex flex-col gap-0.5',
+    'data-sparkline': 'throughput',
+    style: { display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 },
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2 text-[0.55rem] tabular-nums text-(--ui-text-quaternary)',
+        style: {
+          display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0,
+          fontSize: '0.6rem', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary)'
+        },
         children: [
-          jsx('span', { children: `max ${fmtRate(series.maxDecode)} tok/s` }),
+          jsx('span', {
+            title: captionTitle || undefined,
+            style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+            children: caption || ''
+          }),
           jsxs('span', {
-            className: 'inline-flex items-center gap-1',
-            children: [
-              jsx('span', { className: 'size-1 rounded-full', style: { background: 'var(--ui-accent)' } }),
-              jsx('span', { children: 'decode' }),
-              jsx('span', { className: 'size-1 rounded-full', style: { background: 'var(--ui-text-quaternary)' } }),
-              jsx('span', { children: 'prefill' })
-            ]
+            style: { display: 'inline-flex', alignItems: 'center', gap: '4px', flex: '0 0 auto' },
+            children: [dot(line), 'decode', dot('var(--ui-text-quaternary)'), 'prefill']
+          }),
+          jsx('span', {
+            style: { flex: '0 0 auto', whiteSpace: 'nowrap' },
+            children: `max ${fmtRate(series.maxDecode)} tok/s${span ? ` · ${span}` : ''}`
           })
         ]
       }),
       jsxs('svg', {
         viewBox: '0 0 100 26',
         preserveAspectRatio: 'none',
-        className: 'h-6 w-full',
+        style: { display: 'block', width: '100%', height: '28px' },
         'aria-hidden': 'true',
         children: [
           jsx('line', {
@@ -1105,11 +1303,11 @@ function Sparkline({ samples }) {
             stroke: 'var(--ui-stroke-secondary)', strokeWidth: 0.5,
             vectorEffect: 'non-scaling-stroke'
           }),
-          jsx('polygon', { points: series.area, fill: 'var(--ui-accent)', opacity: 0.1 }),
+          jsx('polygon', { points: series.area, fill: line, opacity: 0.1 }),
           jsx('polyline', {
             points: series.decode,
             fill: 'none',
-            stroke: 'var(--ui-accent)',
+            stroke: line,
             strokeWidth: 1.4,
             vectorEffect: 'non-scaling-stroke',
             strokeLinejoin: 'round'
@@ -1130,7 +1328,7 @@ function Sparkline({ samples }) {
 
 // Requests per 15 s bucket over the window. Bars, not a gauge: no track, no
 // full-width fill, nothing that can read as utilization when nothing is in flight.
-function RequestSparkline({ buckets }) {
+function RequestSparkline({ buckets, caption, captionTitle, tone }) {
   const series = useMemo(() => {
     if (!Array.isArray(buckets) || !buckets.length) return null
     const max = Math.max(...buckets, 1)
@@ -1149,16 +1347,27 @@ function RequestSparkline({ buckets }) {
 
   if (!series) return null
   return jsxs('div', {
-    className: 'flex flex-col gap-0.5',
+    'data-sparkline': 'requests',
+    style: { display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 },
     children: [
-      jsx('span', {
-        className: 'text-[0.55rem] tabular-nums text-(--ui-text-quaternary)',
-        children: `max ${series.max} / 15s`
+      jsxs('div', {
+        style: {
+          display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0,
+          fontSize: '0.6rem', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary)'
+        },
+        children: [
+          jsx('span', {
+            title: captionTitle || undefined,
+            style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+            children: caption || ''
+          }),
+          jsx('span', { style: { flex: '0 0 auto' }, children: `max ${series.max} / 15s` })
+        ]
       }),
       jsxs('svg', {
         viewBox: '0 0 100 20',
         preserveAspectRatio: 'none',
-        className: 'h-5 w-full',
+        style: { display: 'block', width: '100%', height: '22px' },
         'aria-hidden': 'true',
         children: [
           jsx('line', {
@@ -1169,7 +1378,7 @@ function RequestSparkline({ buckets }) {
           series.bars.map(bar =>
             jsx('rect', {
               x: bar.x, y: 20 - bar.height, width: bar.width, height: bar.height,
-              fill: 'var(--ui-accent)', opacity: bar.count > 0 ? 0.7 : 0
+              fill: tone || 'var(--ui-accent)', opacity: bar.count > 0 ? 0.7 : 0
             }, `bucket-${bar.x}`)
           )
         ]
@@ -1184,68 +1393,88 @@ function RequestSparkline({ buckets }) {
 // The HELD BY section shared by the local server card and the cloud model
 // card: one row per agent with an in-flight request right now. Agents whose
 // requests all finished in the window are history (swim lane / By agent), not
-// holders. Four rows fit; the rest go into the '+N more' tooltip.
+// holders. Rows carry the short agent label; the full label rides in the row
+// tooltip. Four rows fit; the rest go into the '+N more' tooltip.
 function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
   const held = (Array.isArray(agents) ? agents : []).filter(a => (a.requests || a.in_flight || 0) > 0)
   const shown = held.slice(0, 4)
   const rest = held.slice(4)
-  const rowLabel = agent => agentLabel((rowBySession && rowBySession.get(agent.session_id)) || agent, labels)
+  const rowOf = agent => (rowBySession && rowBySession.get(agent.session_id)) || agent
+  // A model column only earns its width when the holders use different models.
+  const showModel = new Set(held.map(agent => agent.model).filter(Boolean)).size > 1
   return jsxs('div', {
-    className: 'flex flex-col gap-0.5 border-t border-(--ui-stroke-secondary) pt-1.5',
+    'data-held-by': held.length,
+    style: {
+      display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0,
+      borderTop: '1px solid var(--ui-stroke-secondary)', paddingTop: '7px'
+    },
     children: [
-      jsx('span', {
-        className: 'text-[0.6rem] uppercase tracking-[0.08em] text-(--ui-text-quaternary)',
-        children: 'held by'
-      }),
+      jsx('span', { style: kickerStyle(), children: 'held by' }),
       held.length
-        ? shown.map(agent =>
-            jsxs(
+        ? shown.map(agent => {
+            const count = agent.requests || agent.in_flight || 0
+            return jsxs(
               'div',
               {
+                'data-held-row': agent.session_id || '',
                 className: 'flex items-center gap-2 text-[0.6875rem]',
+                title: fullAgentText(rowOf(agent), labels),
                 children: [
                   jsx('span', {
-                    className: 'size-1.5 shrink-0 rounded-full',
-                    style: { background: profileTone(agent.profile) }
+                    style: { width: '6px', height: '6px', borderRadius: '999px', flex: '0 0 auto', background: profileTone(agent.profile) }
                   }),
                   jsx('span', {
-                    className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
-                    children: rowLabel(agent)
+                    style: {
+                      flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)'
+                    },
+                    children: shortAgentLabel(rowOf(agent), labels)
                   }),
-                  agent.model
+                  showModel && agent.model
                     ? jsx('span', {
-                        className: 'w-36 shrink-0 truncate text-right font-mono text-[0.6rem] text-(--ui-text-quaternary)',
-                        children: agent.model
+                        title: agent.model,
+                        style: {
+                          flex: '0 1 auto', maxWidth: '9rem', overflow: 'hidden', textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)'
+                        },
+                        children: laneModelShort(agent.model)
                       })
                     : null,
                   jsx('span', {
-                    className: 'w-14 shrink-0 text-right tabular-nums text-(--ui-text-tertiary)',
+                    title: 'how long its oldest in-flight request has been open',
+                    style: {
+                      flex: '0 0 auto', minWidth: '3rem', textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+                      color: 'var(--ui-text-tertiary)'
+                    },
                     children: elapsedOf(agent.oldest_started_at, now) || '—'
                   }),
-                  agent.requests || agent.in_flight
-                    ? jsx(Badge, { variant: 'muted', size: 'xs', children: `${agent.requests || agent.in_flight}` })
+                  count > 1
+                    ? jsx(Badge, { variant: 'muted', size: 'xs', title: `${count} requests in flight`, children: `×${count}` })
                     : null
                 ]
               },
               `${agent.session_id}-${agent.model || ''}`
             )
-          )
+          })
         : jsx('span', {
-            className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
+            style: { fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)' },
             children: 'no in-flight request observed'
           }),
       rest.length
         ? jsx('span', {
-            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
-            title: rest.map(rowLabel).join('\n'),
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            title: rest.map(agent => fullAgentText(rowOf(agent), labels)).join('\n'),
             children: `+${rest.length} more`
           })
         : null,
       unattributed > 0
         ? jsxs('div', {
             className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+            title: 'The server counts these as running, but no Hermes row on this machine matches them.',
             children: [
-              jsx('span', { className: 'size-1.5 shrink-0 rounded-full bg-(--ui-bg-tertiary)' }),
+              jsx('span', {
+                style: { width: '6px', height: '6px', borderRadius: '999px', flex: '0 0 auto', background: 'var(--ui-bg-tertiary)', boxShadow: 'inset 0 0 0 1px var(--ui-stroke-tertiary)' }
+              }),
               jsx('span', { className: 'min-w-0 truncate', children: 'not observed by Flightdeck' }),
               jsx('span', { className: 'ml-auto tabular-nums', children: unattributed })
             ]
@@ -1253,143 +1482,289 @@ function HeldBy({ agents, labels, now, rowBySession, unattributed, over }) {
         : null,
       over > 0
         ? jsx('span', {
-            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
-            children: `${over} row(s) the server does not count (queued or closing)`
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            title: 'Hermes has these requests open, but the server does not count them as running yet (queued at the client, or closing).',
+            children: `${plural(over, 'row')} the server does not count (queued or closing)`
           })
         : null
     ]
   })
 }
 
-function ServerCard({ server, models, labels, now }) {
+// The model a local server runs, for the card header — never a repeat of the
+// server's own name. The title's first clause wins (minus the name and any
+// word the kind badge already says); else the served model id, unless that id
+// only restates the server name. '' when nothing new is left.
+const SERVER_MODEL_SHORT_MAX = 36
+
+function serverModelShort(server) {
+  if (!server) return ''
+  const name = String(server.name || '').trim()
+  const squash = text => String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const squashedName = squash(name)
+  const kind = squash(server.kind)
+  const title = String(server.title || '').trim()
+  let text = ''
+  if (title && !/^helper model\b/i.test(title)) {
+    text = title.split(/\s+[-–—·]\s+|\s*\(|:\s|,\s/)[0].trim()
+    text = text.split(/\s+/).filter(word => {
+      const squashed = squash(word)
+      return squashed && squashed !== kind && squashed !== squashedName
+    }).join(' ')
+  }
+  if (!text) {
+    const served = Array.isArray(server.models) && server.models.length ? String(server.models[0]) : ''
+    text = served ? modelDisplayName(served).replace(/\.gguf$/i, '') : ''
+    if (squashedName && squash(text).includes(squashedName)) return ''
+  }
+  if (!text || squash(text) === squashedName) return ''
+  return text.length > SERVER_MODEL_SHORT_MAX ? `${text.slice(0, SERVER_MODEL_SHORT_MAX - 1)}…` : text
+}
+
+// A server with nothing from Hermes in the window — no row in flight or
+// finished, nothing running or queued — folds to one line until clicked. An
+// erroring server never folds: its state is the news.
+function isQuietServer(server) {
+  if (!server || server.error || server.healthy === false) return false
+  if ((server.in_flight || 0) > 0 || (server.running || 0) > 0 || (server.waiting || 0) > 0) return false
+  if (Array.isArray(server.requests) && server.requests.length) return false
+  if (Array.isArray(server.agents) && server.agents.some(agent => (agent.requests || agent.in_flight || 0) > 0)) return false
+  return true
+}
+
+function windowRequests(model, windowSeconds) {
+  if (!model) return null
+  return windowSeconds <= 60 ? model.requests_1m : model.requests_5m
+}
+
+const BUTTON_RESET = {
+  background: 'transparent', border: 0, padding: 0, margin: 0, font: 'inherit', color: 'inherit',
+  textAlign: 'left', cursor: 'pointer'
+}
+
+function ServerCard({ server, models, labels, now, snapshot, windowSeconds = 300 }) {
+  const [expanded, setExpanded] = useState(false)
   const verdict = serverVerdict(server)
+  const quiet = isQuietServer(server)
+  const modelShort = serverModelShort(server)
+  // The URL and the full free-text title live in the header tooltip.
+  const tooltip = [server.title, server.base_url].filter(Boolean).join('\n')
+  const sampled = server.sampled_at ? Date.parse(server.sampled_at) / 1000 : null
+  const span = fmtDuration(windowSeconds)
+  const headerName = jsxs('span', {
+    'data-server-title': server.name,
+    style: {
+      minWidth: 0, flex: '0 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      fontSize: '0.8125rem', letterSpacing: '-0.01em'
+    },
+    children: [
+      jsx('span', { style: { fontWeight: 600, color: 'var(--ui-text-primary)' }, children: server.name }),
+      modelShort
+        ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: ` · ${modelShort}` })
+        : null
+    ]
+  })
+  const kindBadges = [
+    server.kind ? jsx(Badge, { variant: 'outline', size: 'xs', children: server.kind }, 'kind') : null,
+    server.aux
+      ? jsx(Badge, { variant: 'muted', size: 'xs', title: server.title || 'auxiliary helper model', children: 'aux' }, 'aux')
+      : null
+  ]
+
+  if (quiet && !expanded) {
+    return jsx('article', {
+      'data-server-card': server.name,
+      'data-compact': 'true',
+      className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary)',
+      children: jsxs('button', {
+        type: 'button',
+        'aria-expanded': 'false',
+        'data-expand-server': server.name,
+        title: `${tooltip ? `${tooltip}\n` : ''}No Hermes requests in the last ${span}. Click for the full card.`,
+        onClick: () => setExpanded(true),
+        style: {
+          ...BUTTON_RESET, display: 'flex', alignItems: 'center', gap: '8px', width: '100%', minWidth: 0,
+          padding: '7px 12px', fontSize: '0.6875rem'
+        },
+        children: [
+          jsx(StatusDot, { tone: verdict.tone, className: 'size-2 shrink-0' }),
+          headerName,
+          ...kindBadges,
+          jsx('span', {
+            style: {
+              marginLeft: 'auto', flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)'
+            },
+            children: `idle · no Hermes requests in ${span}`
+          }),
+          jsx(Badge, { variant: verdict.variant, size: 'xs', children: verdict.label }),
+          jsx(Codicon, { name: 'chevron-down', size: 12, className: 'shrink-0 text-(--ui-text-quaternary)' })
+        ]
+      })
+    })
+  }
+
   const agents = Array.isArray(server.agents) ? server.agents : []
   const unattributed = server.unattributed || 0
   const over = server.over_attributed || 0
-  const sampled = server.sampled_at ? Date.parse(server.sampled_at) / 1000 : null
+  const rowBySession = snapshot ? agentRowBySession(snapshot) : null
   // The server object carries no TTFT of its own; the busiest model lane on it
   // does, and that is the honest number to show next to the server's rates.
   const serverModels = Array.isArray(models) ? models.filter(m => m.server_name === server.name) : []
   const busiest = serverModels.slice().sort((a, b) => (b.in_flight || 0) - (a.in_flight || 0))[0]
   const ttft = server.ttft_ms_p50 != null ? server.ttft_ms_p50 : busiest ? busiest.ttft_ms_p50 : null
   const latency = server.latency_ms_p50 != null ? server.latency_ms_p50 : busiest ? busiest.latency_ms_p50 : null
-  // A server whose rows are mostly whole-response has no honest TTFT or decode
-  // rate; its busiest lane's latency is the number to show instead.
+  // A server whose rows are mostly whole-response has no honest TTFT; its
+  // busiest lane's latency is the number to show instead.
   const wholeResponse = busiest ? (busiest.non_streamed || 0) > (busiest.streamed || 0) : false
+  const requestCount = serverModels.length
+    ? serverModels.reduce((sum, model) => sum + (windowRequests(model, windowSeconds) || 0), 0)
+    : (Array.isArray(server.requests) ? server.requests.length : null)
+  const rings = serverHealthRings(server.health)
+  const statItems = serverStatItems(server.health)
+  const aliases = busiest && busiest.provider_aliases && busiest.provider_aliases.length > 1
+    ? ` · providers: ${busiest.provider_aliases.join(', ')}`
+    : ''
+  const hermesItems = [
+    {
+      id: 'in-flight', parts: ['in flight ', fmtInt(server.in_flight || 0)],
+      tone: (server.in_flight || 0) > 0 ? TONE_LOCAL : undefined,
+      title: "requests this machine's Hermes has open on this server right now"
+    },
+    requestCount != null
+      ? { id: 'requests', parts: [`req / ${span} `, fmtInt(requestCount)], title: `requests Hermes sent this server in the last ${span}` }
+      : null,
+    latency != null
+      ? {
+          id: 'latency', parts: ['latency p50 ', fmtMs(latency)],
+          title: "request duration (median) as observed by this machine's Hermes — only the requests Hermes sent, unlike the server-side numbers above"
+        }
+      : null,
+    ttft != null || wholeResponse
+      ? {
+          id: 'ttft', parts: ['TTFT p50 ', wholeResponse ? 'not streamed' : fmtMs(ttft)],
+          title: `time to first token (median) as observed by this machine's Hermes — only the requests Hermes sent, unlike the server's own /metrics quantiles above${wholeResponse ? '; not applicable: this server returns whole responses' : ''}${aliases}`
+        }
+      : null
+  ].filter(Boolean)
+  const rateCaption = server.decode_tps != null || server.prefill_tps != null
+    ? `now decode ${fmtRate(server.decode_tps)} · prefill ${fmtRate(server.prefill_tps)} tok/s`
+    : 'decode / prefill'
+  const dropped = droppedText(server.health)
 
   return jsxs('article', {
-    className: 'flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2.5',
-    title: server.title || undefined,
+    'data-server-card': server.name,
+    'data-compact': 'false',
+    className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary)',
+    style: { display: 'flex', flexDirection: 'column', gap: '10px', minWidth: 0, padding: '10px 12px' },
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2',
+        title: tooltip || undefined,
+        style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 },
         children: [
           jsx(StatusDot, {
             tone: verdict.tone,
-            className: cn('size-2', server.in_flight > 0 && 'animate-pulse')
+            className: cn('size-2 shrink-0', server.in_flight > 0 && 'animate-pulse')
           }),
-          jsx('span', {
-            className: 'text-[0.8125rem] font-semibold tracking-tight text-(--ui-text-primary)',
-            children: server.name
-          }),
-          jsx(Badge, { variant: 'outline', size: 'xs', children: server.kind }),
-          server.aux
-            ? jsx(Badge, { variant: 'muted', size: 'xs', title: server.title || 'auxiliary helper model', children: 'aux' })
-            : null,
+          headerName,
+          ...kindBadges,
           jsx(Badge, { variant: verdict.variant, size: 'xs', children: verdict.label }),
           jsx('span', {
-            className: 'ml-auto truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
-            children: server.base_url
+            title: server.error ? 'the last probe failed' : 'when Flightdeck last read this server',
+            style: { marginLeft: 'auto', flex: '0 0 auto', fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+            children: server.error ? 'unreachable' : sampled != null ? `live · ${fmtAgo(sampled, now)}` : 'live'
           }),
-          sampled != null
-            ? jsx('span', {
-                className: 'shrink-0 text-[0.6rem] text-(--ui-text-quaternary)',
-                children: fmtAgo(sampled, now)
+          quiet
+            ? jsx('button', {
+                type: 'button',
+                'aria-expanded': 'true',
+                'aria-label': `Fold ${server.name} to one line`,
+                title: 'Fold to one line',
+                onClick: () => setExpanded(false),
+                style: { ...BUTTON_RESET, display: 'inline-flex', flex: '0 0 auto', color: 'var(--ui-text-quaternary)' },
+                children: jsx(Codicon, { name: 'chevron-up', size: 12 })
               })
             : null
         ]
       }),
       jsxs('div', {
-        className: 'flex items-center gap-2 text-[0.6875rem]',
+        'data-hero': '',
+        style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: '24px', rowGap: '10px', minWidth: 0 },
         children: [
-          jsx('span', {
-            className: 'text-(--ui-text-tertiary)',
-            title: 'Requests the server can run at once; more than this wait in its queue.',
-            children: 'slots'
+          jsxs('div', {
+            'data-slots-meter': '',
+            style: { display: 'flex', flexDirection: 'column', gap: '5px', minWidth: 0 },
+            children: [
+              jsxs('div', {
+                style: { display: 'flex', alignItems: 'baseline', gap: '6px' },
+                children: [
+                  jsx('span', {
+                    style: {
+                      fontSize: '1.5rem', fontWeight: 600, lineHeight: 1, letterSpacing: '-0.02em',
+                      fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', color: 'var(--ui-text-primary)'
+                    },
+                    children: `${server.running != null ? server.running : '—'} / ${server.slots != null ? server.slots : '—'}`
+                  }),
+                  jsx('span', {
+                    title: 'Requests the server can run at once; more than this wait in its queue.',
+                    style: { fontSize: '0.65rem', color: 'var(--ui-text-tertiary)' },
+                    children: 'slots'
+                  }),
+                  server.waiting > 0
+                    ? jsx(Badge, { variant: 'warn', size: 'xs', children: `${server.waiting} queued` })
+                    : null
+                ]
+              }),
+              jsx(SlotBar, { total: server.slots, running: server.running, waiting: server.waiting })
+            ]
           }),
-          jsx(SlotBar, { total: server.slots, running: server.running, waiting: server.waiting }),
-          jsx('span', {
-            className: 'tabular-nums text-(--ui-text-secondary)',
-            children: `${server.running != null ? server.running : '—'}/${server.slots != null ? server.slots : '—'}`
-          }),
-          server.waiting > 0
-            ? jsx(Badge, { variant: 'warn', size: 'xs', children: `${server.waiting} queued` })
-            : null,
-          jsx('span', {
-            className: 'ml-auto tabular-nums text-(--ui-text-quaternary)',
-            children: server.error ? 'unreachable' : 'live'
-          })
+          ...rings.map(ring => jsx(RingGauge, { ...ring }, ring.id))
         ]
       }),
-      jsx(ServerHealth, { health: server.health }),
-      jsxs('div', {
-        className: 'flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[0.6875rem]',
-        children: [
-          jsx(Metric, {
-            label: 'decode',
-            value: server.decode_tps != null ? `${fmtRate(server.decode_tps)} tok/s` : '—',
-            accent: true,
-            title: 'output tokens per second while streaming'
-          }),
-          jsx(Metric, {
-            label: 'prefill',
-            value: server.prefill_tps != null ? `${fmtRate(server.prefill_tps)} tok/s` : '—',
-            title: 'prompt tokens processed per second before the first token'
-          }),
-          jsx(Metric, {
-            label: 'Hermes latency p50',
-            value: fmtMs(latency),
-            title: "request duration (median) as observed by this machine's Hermes — only the requests Hermes sent, unlike the server-side numbers in the health row"
-          }),
-          jsx(Metric, {
-            label: 'Hermes TTFT p50',
-            value: fmtMs(ttft),
-            title: `time to first token (median) as observed by this machine's Hermes — only the requests Hermes sent, unlike the server's own /metrics quantiles in the health row${wholeResponse ? '; not applicable: this server returns whole responses' : ''}${busiest && busiest.provider_aliases && busiest.provider_aliases.length > 1 ? ` · providers: ${busiest.provider_aliases.join(', ')}` : ''}`
-          }),
-          jsx(Metric, {
-            label: 'in flight',
-            value: server.in_flight != null ? server.in_flight : '—',
-            title: 'requests the server counts as running right now'
-          })
-        ]
+      jsx(StatLine, {
+        kicker: 'server',
+        kickerTitle: `${SERVER_SIDE_NOTE}${dropped ? ` ${dropped}` : ''}`,
+        items: statItems
       }),
-      jsx(HeldBy, { agents, labels, now, unattributed, over }),
-      jsxs('div', {
-        className: 'flex items-center gap-2',
-        children: [
-          jsx('div', { className: 'min-w-0 flex-1', children: jsx(Sparkline, { samples: server.samples }) }),
-          jsx('span', {
-            className: 'shrink-0 text-[0.6rem] text-(--ui-text-quaternary)',
-            children: 'decode / prefill · 5m'
-          })
-        ]
+      jsx(StatLine, {
+        kicker: 'Hermes',
+        kickerTitle: "Observed by this machine's Hermes: only the requests it sent to this server.",
+        items: hermesItems
+      }),
+      jsx(HeldBy, { agents, labels, now, rowBySession, unattributed, over }),
+      // The chart is the card's footer: pinned to the bottom so cards that
+      // share a grid row line their charts up.
+      jsx('div', {
+        'data-card-chart': 'server',
+        style: { minWidth: 0, marginTop: 'auto' },
+        children: jsx(Sparkline, {
+          samples: server.samples,
+          caption: rateCaption,
+          captionTitle: "the server's own decode and prefill throughput right now; the chart is its recent history",
+          span: '5m',
+          tone: TONE_LOCAL
+        }) || jsx('span', {
+          style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+          children: `decode / prefill · no throughput in the last 5m`
+        })
       })
     ]
   })
 }
 
 // Plan usage from the snapshot's `quota` block (the backend fills it; may be
-// null). One row per window — label, the slot-gauge bar filled by used_percent,
-// '42% used · resets 3:10 PM'. A window with a null used_percent still shows
-// its label and reset, never a fake fill. `unavailable_reason` is one honest
-// muted line; a null quota renders nothing at all unless the live usage check
-// has a pending/absent/error state, which gets one muted waiting line.
-function PlanUsage({ quota, state }) {
+// null). One row per window, as in the video: label on the left, '42% used ·
+// resets 3:10 PM' on the right, one thin bar under them. A window with a null
+// used_percent still shows its label and reset, never a fake fill.
+// `unavailable_reason` is one honest muted line; a null quota renders nothing
+// at all unless the live usage check has a pending/absent/error state, which
+// gets one muted waiting line.
+function PlanUsage({ quota, state, tone }) {
   if (!quota || typeof quota !== 'object') {
     const waiting = planUsageWaitingLine(state)
     return waiting
       ? jsx('span', {
-          className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+          style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
           title: waiting.title,
           children: waiting.text
         })
@@ -1400,84 +1775,115 @@ function PlanUsage({ quota, state }) {
     : []
   if (!windows.length && !quota.unavailable_reason) return null
   const labelTexts = windows.map((window, index) => window.label || `window ${index + 1}`)
-  const longestLabel = labelTexts.reduce((longest, label) => label.length > longest.length ? label : longest, '')
-  // Fit the longest window label ('Current session', 'Fable week') without
-  // truncating: ~0.62rem per character at this size, floor 9.5rem, cap 14rem.
-  const labelWidth = `${Math.min(14, Math.max(9.5, longestLabel.length * 0.62))}rem`
   const planText = [
     quota.plan ? quota.title ? `${quota.plan} · ${quota.title}` : quota.plan : (quota.title || null),
     quota.source ? `via ${quota.source}` : null,
     quota.fetched_at != null ? `updated ${fmtAgo(quota.fetched_at, Date.now() / 1000)}` : null
   ].filter(Boolean).join(' · ')
-  // Prefix the muted plan/title line so a title-only quota ('account 1 of 2')
-  // never renders as a bare stray value under the gauge.
-  const planLineText = planText ? `plan usage: ${planText}` : null
   return jsxs('div', {
-    className: 'flex flex-col gap-1',
+    'data-plan-usage': windows.length,
+    style: { display: 'flex', flexDirection: 'column', gap: '7px', minWidth: 0 },
     children: [
+      windows.length
+        ? jsxs('div', {
+            style: { display: 'flex', alignItems: 'baseline', gap: '6px', minWidth: 0 },
+            children: [
+              jsx('span', { style: kickerStyle({ flex: '0 0 auto' }), children: 'plan usage' }),
+              // The plan/title rides next to the kicker, so a title-only quota
+              // ('account 1 of 2') never renders as a stray value under a bar.
+              planText
+                ? jsx('span', {
+                    title: planText,
+                    style: {
+                      minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      fontSize: '0.6rem', color: 'var(--ui-text-quaternary)'
+                    },
+                    children: `· ${planText}`
+                  })
+                : null
+            ]
+          })
+        : null,
       windows.map((window, index) => {
         const used = Number.isFinite(window.used_percent)
           ? Math.max(0, Math.min(100, window.used_percent))
           : null
         const reset = fmtResetTime(window.reset_at)
-        const text = used == null
-          ? (reset ? `resets ${reset}` : 'no usage reported')
-          : (reset ? `${Math.round(used)}% used · resets ${reset}` : `${Math.round(used)}% used`)
+        const modelCap = window.detail === 'model-specific cap'
         return jsxs('div', {
-          className: 'flex items-center gap-2 text-[0.65rem]',
+          'data-plan-window': labelTexts[index],
+          style: { display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 },
           children: [
-            jsx('span', {
-              className: 'shrink-0 text-(--ui-text-tertiary)',
-              style: { minWidth: labelWidth, whiteSpace: 'nowrap' },
-              title: labelTexts[index],
-              children: labelTexts[index]
-            }),
-            used == null
-              ? jsx('span', {
-                  className: 'text-[0.65rem] text-(--ui-text-quaternary)',
-                  children: 'no usage reported'
+            jsxs('div', {
+              style: { display: 'flex', alignItems: 'baseline', gap: '6px', minWidth: 0, fontSize: '0.65rem' },
+              children: [
+                jsx('span', {
+                  title: labelTexts[index],
+                  style: { flex: '0 0 auto', minWidth: 'max-content', whiteSpace: 'nowrap', color: 'var(--ui-text-secondary)' },
+                  children: labelTexts[index]
+                }),
+                modelCap
+                  ? jsx('span', {
+                      title: 'Weekly limit for this model family only; the account limit is the Current week row.',
+                      style: { flex: '0 0 auto', whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)' },
+                      children: '· model cap'
+                    })
+                  : window.detail
+                    ? jsx('span', {
+                        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)' },
+                        children: window.detail
+                      })
+                    : null,
+                jsxs('span', {
+                  'data-plan-text': '',
+                  style: {
+                    marginLeft: 'auto', flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-tertiary)'
+                  },
+                  children: used == null
+                    ? [reset ? `no usage reported · resets ${reset}` : 'no usage reported']
+                    : [
+                        jsx('span', {
+                          style: { fontWeight: 600, color: 'var(--ui-text-primary)' },
+                          children: `${Math.round(used)}%`
+                        }, 'pct'),
+                        reset ? ` used · resets ${reset}` : ' used'
+                      ]
                 })
-              : jsx(UsageBar, { percent: used }),
-            jsx('span', {
-              className: 'tabular-nums text-(--ui-text-secondary)',
-              children: text
+              ]
             }),
-            window.detail === 'model-specific cap'
-              ? jsx('span', {
-                  className: 'min-w-0 truncate text-(--ui-text-quaternary)',
-                  title: 'Weekly limit for this model family only; the account limit is the Current week row.',
-                  children: '· model cap'
-                })
-              : window.detail
-                ? jsx('span', {
-                    className: 'min-w-0 truncate text-(--ui-text-quaternary)',
-                    children: window.detail
-                  })
-                : null
+            used == null ? null : jsx(PlanBar, { percent: used, tone })
           ]
         }, `${window.label || 'window'}-${index}`)
       }),
       quota.as_of != null && Number.isFinite(quota.as_of)
         ? jsx('span', {
-            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
             title: "The provider's usage check did not answer on the last refresh; showing the most recent good reading.",
             children: `as of ${fmtResetTime(quota.as_of)} (last refresh failed)`
           })
         : null,
-      planLineText
-        ? jsx('span', {
-            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
-            children: planLineText
-          })
-        : null,
       quota.unavailable_reason
         ? jsx('span', {
-            className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+            style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
             children: `plan usage unavailable: ${quota.unavailable_reason}`
           })
         : null
     ]
   })
+}
+
+// A cloud lane's provider as a short label: the subscription-direct lane is
+// DirectSDK, a vendor's metered API is API, the ChatGPT-plan lane is Codex.
+// Anything else keeps its slug; the full provider/model rides in the tooltip.
+function cloudProviderLabel(provider) {
+  const slug = String(provider || '').trim()
+  const key = slug.toLowerCase()
+  if (!key) return 'provider'
+  if (key.includes('directsdk')) return 'DirectSDK'
+  if (key.includes('codex')) return 'Codex'
+  if (key === 'anthropic' || key === 'openai' || key === 'gemini' || key === 'google' || key === 'xai') return 'API'
+  return slug
 }
 
 function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, planUsage, sharedWith }) {
@@ -1524,85 +1930,119 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
   const nonStreamed = model.non_streamed || 0
   const wholeResponse = nonStreamed > streamed
   const cachedPct = tokens.prompt ? Math.round((tokens.cached || 0) / tokens.prompt * 100) : null
+  const span = fmtDuration(windowSeconds)
+  const requestsInWindow = windowRequests(model, windowSeconds)
+  const providerLabel = cloudProviderLabel(model.provider)
+  const fullLabel = fullModelLabel(model.provider, model.model)
+  const headerTitle = [
+    fullLabel,
+    model.base_url,
+    "Hermes traffic only: every number on this card comes from this machine's Hermes requests; the provider publishes no server load."
+  ].filter(Boolean).join('\n')
+  const detailItems = [
+    model.latency_ms_p50 != null
+      ? { id: 'latency', parts: ['latency p50 ', fmtMs(model.latency_ms_p50)], title: 'request duration (median)' }
+      : null,
+    !wholeResponse && model.decode_tps != null
+      ? { id: 'decode', parts: ['decode ', `${fmtRate(model.decode_tps)} tok/s`], title: 'output tokens per second while streaming' }
+      : null,
+    tokens.prompt
+      ? {
+          id: 'input', parts: ['in ', `${tokenText(tokens.prompt)}${cachedPct ? ` · ${cachedPct}% cached` : ''}`],
+          title: 'prompt tokens sent to the model; the cached share was reused, not reprocessed'
+        }
+      : null,
+    tokens.completion
+      ? { id: 'output', parts: ['out ', tokenText(tokens.completion)], title: 'completion tokens generated' }
+      : null,
+    model.errors_5m
+      ? {
+          id: 'errors', parts: ['errors ', `${fmtInt(model.errors_5m)}${model.errors_429_5m ? ` · ${model.errors_429_5m} × 429` : ''}`],
+          tone: TONE_QUEUED, title: 'failed requests in the window; 429s are rate limits'
+        }
+      : null
+  ].filter(Boolean)
+  const chart = samples.length
+    ? jsx(Sparkline, {
+        samples,
+        caption: `decode / prefill · ${span} · Hermes-observed`,
+        captionTitle: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
+        tone: TONE_CLOUD
+      })
+    : bucketValue
+      ? jsx(RequestSparkline, {
+          buckets: model.requests_buckets,
+          caption: `requests, last ${span}`,
+          captionTitle: "This machine's Hermes requests per 15 s; the provider does not publish server load.",
+          tone: TONE_CLOUD
+        })
+      : null
 
   return jsxs('article', {
-    className: 'flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary) px-3 py-2.5',
+    'data-cloud-card': model.key || fullLabel,
+    className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-quinary)',
+    style: { display: 'flex', flexDirection: 'column', gap: '10px', minWidth: 0, padding: '10px 12px' },
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2',
+        title: headerTitle,
+        style: { display: 'flex', alignItems: 'center', gap: '7px', minWidth: 0 },
         children: [
           jsx(StatusDot, {
             tone: inFlight > 0 ? 'good' : 'muted',
-            className: cn('size-2', inFlight > 0 && 'animate-pulse')
+            className: cn('size-2 shrink-0', inFlight > 0 && 'animate-pulse')
           }),
-          jsx(Codicon, { name: 'cloud', size: 12, className: 'text-(--ui-text-tertiary)' }),
+          jsx(Codicon, { name: 'cloud', size: 12, className: 'shrink-0 text-(--ui-text-tertiary)' }),
           jsx('span', {
-            className: 'text-[0.8125rem] font-semibold tracking-tight text-(--ui-text-primary)',
-            title: fullModelLabel(model.provider, model.model),
+            title: fullLabel,
+            style: {
+              minWidth: 0, flex: '0 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              fontSize: '0.8125rem', fontWeight: 600, letterSpacing: '-0.01em', color: 'var(--ui-text-primary)'
+            },
             children: modelDisplayName(model.model || model.provider)
           }),
-          jsx(Badge, { variant: 'outline', size: 'xs', children: 'Hermes traffic only' }),
           jsx('span', {
-            className: 'ml-auto truncate font-mono text-[0.6rem] text-(--ui-text-quaternary)',
-            children: model.base_url
+            'data-provider-label': providerLabel,
+            title: headerTitle,
+            style: {
+              flex: '0 0 auto', whiteSpace: 'nowrap', fontSize: '0.6rem', fontWeight: 500,
+              padding: '1px 6px', borderRadius: '999px', color: 'var(--ui-text-tertiary)',
+              boxShadow: 'inset 0 0 0 1px var(--ui-stroke-secondary)'
+            },
+            children: providerLabel
           })
         ]
       }),
       jsxs('div', {
-        className: 'flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[0.6875rem]',
+        'data-cloud-stats': '',
+        style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', columnGap: '12px', minWidth: 0 },
         children: [
-          jsx(Metric, {
-            label: 'in flight',
-            value: inFlight,
-            accent: inFlight > 0,
-            title: 'requests running right now'
+          jsx(BigStat, {
+            col: 'in-flight', value: fmtInt(inFlight), label: 'in flight', size: '1.35rem',
+            tone: inFlight > 0 ? TONE_CLOUD : undefined, title: 'requests running right now'
           }),
-          jsx(Metric, {
-            label: 'req/min',
-            value: model.requests_1m != null ? model.requests_1m : '—',
-            title: 'requests per minute in the window'
+          jsx(BigStat, {
+            col: 'requests', value: fmtInt(requestsInWindow), label: `req / ${windowSeconds <= 60 ? '1 min' : '5 min'}`,
+            size: '1.35rem', title: `requests Hermes sent this lane in the last ${windowSeconds <= 60 ? 'minute' : '5 minutes'}`
           }),
-          jsx(Metric, {
-            label: 'latency p50',
-            value: fmtMs(model.latency_ms_p50),
-            title: 'request duration (median)'
-          }),
-          jsx(Metric, {
-            label: 'TTFT p50',
+          jsx(BigStat, {
+            col: 'ttft',
             value: wholeResponse ? 'not streamed' : fmtMs(model.ttft_ms_p50),
+            label: 'TTFT p50',
+            size: wholeResponse ? '0.95rem' : '1.35rem',
             title: wholeResponse
               ? 'time to first token (median) — not applicable: this lane returns whole responses'
               : 'time to first token (median)'
-          }),
-          jsx(Metric, {
-            label: 'decode',
-            value: wholeResponse ? 'not streamed' : (model.decode_tps != null ? `${fmtRate(model.decode_tps)} tok/s` : '—'),
-            title: 'output tokens per second while streaming'
-          }),
-          jsx(Metric, {
-            label: 'input',
-            value: `${tokenText(tokens.prompt)}${cachedPct ? ` · ${cachedPct}% cached` : ''}`,
-            title: 'prompt tokens sent to the model; cached share was reused, not reprocessed'
-          }),
-          jsx(Metric, {
-            label: 'output',
-            value: tokenText(tokens.completion),
-            title: 'completion tokens generated'
-          }),
-          jsx(Metric, {
-            label: 'errors',
-            value: `${model.errors_5m != null ? model.errors_5m : 0}${model.errors_429_5m ? ` · ${model.errors_429_5m} × 429` : ''}`,
-            title: 'failed requests in the window; 429s are rate limits'
           })
         ]
       }),
+      jsx(StatLine, { data: 'cloud-detail', items: detailItems }),
       sharedWith
         ? jsx('span', {
-            className: 'text-[0.65rem] text-(--ui-text-quaternary)',
+            style: { fontSize: '0.65rem', color: 'var(--ui-text-quaternary)' },
             title: 'Same subscription as the other card; usage counts once.',
             children: `shared plan with ${modelDisplayName(sharedWith.model || sharedWith.provider)} (${providerPlanLabel(sharedWith.provider)})`
           })
-        : jsx(PlanUsage, { quota: resolvedPlanUsage, state: planUsageState }),
+        : jsx(PlanUsage, { quota: resolvedPlanUsage, state: planUsageState, tone: TONE_CLOUD }),
       quota || plan
         ? jsxs('div', {
             className: 'flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-[0.65rem] text-(--ui-text-tertiary)',
@@ -1613,24 +2053,14 @@ function CloudCard({ model, labels, now, windowSeconds, snapshot, usageMap, plan
           })
         : null,
       jsx(HeldBy, { agents: heldRows, labels, now, rowBySession }),
-      jsxs('div', {
-        className: 'flex items-center gap-2',
-        children: [
-          jsx('div', {
-            className: 'min-w-0 flex-1',
-            children: samples.length
-              ? jsx(Sparkline, { samples })
-              : (bucketValue ? jsx(RequestSparkline, { buckets: model.requests_buckets }) : null)
-          }),
-          jsx('span', {
-            className: 'shrink-0 text-right text-[0.6rem] text-(--ui-text-quaternary)',
-            style: { minWidth: '13rem' },
-            title: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
-            children: samples.length
-              ? `decode / prefill · ${fmtDuration(windowSeconds)} · Hermes-observed`
-              : `requests, last ${fmtDuration(windowSeconds)}`
-          })
-        ]
+      jsx('div', {
+        'data-card-chart': 'cloud',
+        style: { minWidth: 0, marginTop: 'auto' },
+        children: chart || jsx('span', {
+          title: "Computed from this machine's Hermes requests only; the provider does not publish server throughput.",
+          style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' },
+          children: `decode / prefill · ${span} · Hermes-observed · no streamed output yet`
+        })
       })
     ]
   })
@@ -1758,8 +2188,14 @@ function requestTooltip(request, labels, snapshot, lane) {
   const generating = genSpan != null && genSpan >= 0.5 && request.completion_tokens != null
     ? request.completion_tokens / genSpan
     : null
-  const whole = isWholeResponse(request)
-  const timing = whole
+  const inFlightRow = request.ended_at == null
+  const whole = !inFlightRow && isWholeResponse(request)
+  const waitingSoFar = inFlightRow && request.first_chunk_at == null && request.started_at != null
+    ? Math.max(0, Date.now() / 1000 - request.started_at) * 1000
+    : null
+  const timing = waitingSoFar != null
+    ? `waiting for first token · ${fmtMs(waitingSoFar)} so far`
+    : whole
     ? `whole response after ${fmtMs(ttft)} (not streamed)`
     : (generating != null
         ? `first token after ${fmtMs(ttft)} · generated ${fmtInt(request.completion_tokens)} tok at ${fmtRate(generating)} tok/s`
@@ -1773,6 +2209,123 @@ function requestTooltip(request, labels, snapshot, lane) {
     `${tokenText(request.prompt_tokens)} in / ${tokenText(request.completion_tokens)} out`,
     status
   ].join('\n')
+}
+
+// The facts the hover card shows for one request bar: a short name, model on
+// lane, and five numbers. Same sources as requestTooltip (its text form rides
+// on the card's aria-label).
+function requestCardFacts(request, labels, snapshot, lane, rowBySession) {
+  const map = rowBySession || agentRowBySession(snapshot)
+  const agentRow = map.get(request.session_id) ||
+    { kind: request.kind, profile: request.profile, session_id: request.session_id }
+  const nowS = Date.now() / 1000
+  const inFlight = request.ended_at == null
+  // 'Not streamed' is a verdict on a FINISHED row only. An in-flight row with
+  // no first chunk yet is still waiting: its wait so far, generating '—'.
+  const whole = !inFlight && isWholeResponse(request)
+  const end = inFlight ? nowS : request.ended_at
+  const firstAt = request.first_chunk_at != null ? request.first_chunk_at : null
+  const waited = request.started_at != null
+    ? Math.max(0, (whole || firstAt == null ? end : firstAt) - request.started_at)
+    : null
+  const genSpan = !whole && firstAt != null ? Math.max(0, end - firstAt) : null
+  const rate = genSpan != null && genSpan >= 0.5 && request.completion_tokens != null
+    ? request.completion_tokens / genSpan
+    : null
+  const errored = /error/i.test(String(request.status || ''))
+  const cachedPct = request.prompt_tokens && request.cached_tokens
+    ? Math.round((request.cached_tokens / request.prompt_tokens) * 100)
+    : null
+  const full = fullAgentText(agentRow, labels || {})
+  const short = shortAgentLabel(agentRow, labels || {})
+  return {
+    name: short,
+    full: full !== short ? full : null,
+    modelLine: `${modelDisplayName(request.model || 'model unknown')} · ${laneModelShort(lane && lane.label)}${lane && lane.kind ? ` (${lane.kind})` : ''}`,
+    waited: waited != null ? fmtMs(waited * 1000) : '—',
+    waitedLabel: whole ? 'whole response' : (firstAt == null && inFlight ? 'waiting so far' : 'waited for 1st token'),
+    generating: whole ? 'not streamed' : (genSpan != null ? fmtMs(genSpan * 1000) : '—'),
+    generatingLabel: rate != null ? `generating · ${fmtRate(rate)} tok/s` : 'generating',
+    tokensIn: fmtTokens(request.prompt_tokens),
+    tokensInLabel: cachedPct ? `tokens in · ${cachedPct}% cached` : 'tokens in',
+    tokensOut: fmtTokens(request.completion_tokens),
+    status: inFlight ? 'running' : (errored ? 'error' : 'finished'),
+    statusTone: inFlight ? TONE_LOCAL : (errored ? TONE_QUEUED : 'var(--ui-text-secondary)')
+  }
+}
+
+const REQUEST_CARD_W = 268
+
+function RequestCard({ facts, color, text, left, top }) {
+  return jsxs('div', {
+    role: 'tooltip',
+    'data-request-card': facts.name,
+    'aria-label': text,
+    style: {
+      position: 'absolute',
+      zIndex: 20,
+      pointerEvents: 'none',
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${REQUEST_CARD_W}px`,
+      boxSizing: 'border-box',
+      padding: '10px 12px',
+      borderRadius: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      background: 'var(--ui-bg-elevated, var(--ui-bg-editor))',
+      boxShadow: '0 8px 24px rgba(0, 0, 0, 0.18)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px'
+    },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 },
+            children: [
+              jsx('span', { style: { width: '8px', height: '8px', borderRadius: '2px', flex: '0 0 auto', background: color } }),
+              jsx('span', {
+                style: {
+                  fontSize: '0.8125rem', fontWeight: 650, color: 'var(--ui-text-primary)',
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0
+                },
+                children: facts.name
+              })
+            ]
+          }),
+          jsx('span', {
+            style: {
+              fontSize: '0.65rem', color: 'var(--ui-text-tertiary)',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+            },
+            children: facts.modelLine
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: { display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: '12px', rowGap: '6px' },
+        children: [
+          jsx(BigStat, { value: facts.waited, label: facts.waitedLabel, size: '0.95rem' }),
+          jsx(BigStat, { value: facts.generating, label: facts.generatingLabel, size: '0.95rem' }),
+          jsx(BigStat, { value: facts.tokensIn, label: facts.tokensInLabel, size: '0.95rem' }),
+          jsx(BigStat, { value: facts.tokensOut, label: 'tokens out', size: '0.95rem' }),
+          jsx(BigStat, { value: facts.status, label: 'status', size: '0.95rem', tone: facts.statusTone })
+        ]
+      }),
+      facts.full
+        ? jsx('span', {
+            style: {
+              fontSize: '0.65rem', lineHeight: 1.35, color: 'var(--ui-text-tertiary)',
+              display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+              borderTop: '1px solid var(--ui-stroke-secondary)', paddingTop: '6px'
+            },
+            children: facts.full
+          })
+        : null
+    ]
+  })
 }
 
 // The swim lane's window comes from the snapshot itself, never the page clock:
@@ -1791,8 +2344,10 @@ function swimWindow(snapshot, windowSeconds, now) {
 // No streamed output: no first chunk at all, or a first token at/after the end
 // (minus a quarter-second of slack). A non-streamed response has nothing honest
 // to show as 'generating', so it draws as the hatched whole-response bar.
-// THIS is the single streamed predicate: the canvas hatches a bar exactly when
-// this is true, and the lane's 'n streamed' count is the rows where it is false.
+// THIS is the single streamed predicate: the canvas hatches a FINISHED bar
+// exactly when this is true (an in-flight row with no first chunk is still
+// waiting, drawn low-alpha), and the lane's 'n streamed' count is the rows
+// where it is false.
 function isWholeResponse(request) {
   if (!request) return true
   const first = request.first_chunk_at
@@ -1896,7 +2451,10 @@ function stackBars(requests, win) {
     // Back-to-back on this exact sub-row (an agent loop: the next call starts
     // the instant the previous ends) — drawn with a 1 px gap at its start.
     const abutStart = rows.some(other => other.slot === slot && Math.abs(other.end - start) < 0.001)
-    rows.push({ request, start, end, slot, whole: isWholeResponse(request), abutStart })
+    // Hatched 'not streamed' is a verdict on a FINISHED row; an in-flight row
+    // with no first chunk yet is still waiting and draws low-alpha.
+    const whole = request.ended_at != null && isWholeResponse(request)
+    rows.push({ request, start, end, slot, whole, abutStart })
   }
   return rows
 }
@@ -1950,9 +2508,10 @@ function lanePhasePresence(lanes) {
     for (const bar of lane.bars || []) {
       if (lane.slots != null && bar.slot >= lane.slots) { present.queued = true; continue }
       if (bar.whole) { present.whole = true; continue }
-      if (bar.request && bar.request.first_chunk_at != null && bar.request.first_chunk_at > bar.start) {
-        present.waiting = true
-      }
+      const first = bar.request ? bar.request.first_chunk_at : null
+      // An in-flight bar with no first chunk is all waiting, no generating.
+      if (first == null) { present.waiting = true; continue }
+      if (first > bar.start) present.waiting = true
       present.generating = true
     }
   }
@@ -2095,13 +2654,53 @@ const SWIM_LANE_AXIS_H = 16
 const LANE_TARGET_H = 64
 const SWIM_LANE_MIN_H = 190
 const SWIM_LANE_MIN_LANE_H = 40
+// A request row is tall enough to carry a name chip; a lane grows with its
+// peak concurrency (capped) so stacked rows never shrink below chip height.
+const SWIM_ROW_TARGET_H = 15
+const SWIM_ROW_GAP = 2
+const SWIM_LANE_MAX_H = 150
 
-function swimLaneHeight(laneCount) {
-  if (!laneCount) return SWIM_LANE_MIN_H
-  return Math.max(
-    SWIM_LANE_MIN_H,
-    SWIM_LANE_TOP + SWIM_LANE_AXIS_H + laneCount * LANE_TARGET_H
-  )
+function laneWantHeight(lane) {
+  const peak = Math.max(1, (lane && lane.concurrency) || 1)
+  return Math.min(SWIM_LANE_MAX_H, Math.max(LANE_TARGET_H, 14 + peak * (SWIM_ROW_TARGET_H + SWIM_ROW_GAP)))
+}
+
+// Accepts the lanes (each lane's own height) or a bare count (uniform lanes).
+function swimLaneHeight(lanesOrCount) {
+  const lanes = Array.isArray(lanesOrCount) ? lanesOrCount : null
+  const count = lanes ? lanes.length : (lanesOrCount || 0)
+  if (!count) return SWIM_LANE_MIN_H
+  const want = lanes
+    ? lanes.reduce((sum, lane) => sum + laneWantHeight(lane), 0)
+    : count * LANE_TARGET_H
+  return Math.max(SWIM_LANE_MIN_H, SWIM_LANE_TOP + SWIM_LANE_AXIS_H + want)
+}
+
+// One name chip on the canvas: rounded, opaque elevated surface, agent-colour
+// rule on the left, primary text. Falls back to plain rects on a context with
+// no roundRect.
+function drawChip(ctx2, x, y, w, h, color, text, theme) {
+  ctx2.save()
+  ctx2.globalAlpha = 1
+  ctx2.fillStyle = theme.surface
+  ctx2.strokeStyle = color
+  ctx2.lineWidth = 1
+  if (typeof ctx2.roundRect === 'function') {
+    ctx2.beginPath()
+    ctx2.roundRect(x + 0.5, y + 0.5, w - 1, h - 1, 4)
+    ctx2.fill()
+    ctx2.stroke()
+  } else {
+    ctx2.fillRect(x, y, w, h)
+    ctx2.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1)
+  }
+  ctx2.fillStyle = color
+  ctx2.fillRect(x + 3, y + 3, 2, h - 6)
+  ctx2.fillStyle = theme.text
+  ctx2.font = theme.chipFont
+  ctx2.textBaseline = 'middle'
+  ctx2.fillText(text, x + 8, y + h / 2 + 0.5)
+  ctx2.restore()
 }
 
 function shadeColor(color, amount) {
@@ -2118,12 +2717,21 @@ function shadeColor(color, amount) {
   return `#${to2(part(16))}${to2(part(8))}${to2(part(0))}`
 }
 
-function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
+function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySession) {
   const style = getComputedStyle(canvas)
   const accent = style.getPropertyValue('--ui-accent').trim() || 'currentColor'
   const dim = style.getPropertyValue('--ui-text-quaternary').trim() || 'currentColor'
   const stroke = style.getPropertyValue('--ui-stroke-secondary').trim() || 'currentColor'
   const text = style.getPropertyValue('--ui-text-tertiary').trim() || 'currentColor'
+  const localTone = style.getPropertyValue('--ui-green').trim() || '#1f8a65'
+  const family = style.fontFamily || 'sans-serif'
+  const theme = {
+    surface: style.getPropertyValue('--ui-bg-elevated').trim() || style.getPropertyValue('--ui-bg-editor').trim() || '#ffffff',
+    text: style.getPropertyValue('--ui-text-primary').trim() || 'currentColor',
+    chipFont: `600 10px ${family}`
+  }
+  const placed = []
+  const chipHits = []
 
   const gutter = 124
   // Right gutter: wide enough for the widest right-side scale label of any lane
@@ -2155,16 +2763,23 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     return hits
   }
 
-  // Fill the canvas with the lanes: the container was sized for the lane
-  // count, so every lane fits. The floor only guards a stale tiny canvas.
-  const laneH = Math.max(SWIM_LANE_MIN_LANE_H, (height - top - axisH) / lanes.length)
+  // Fill the canvas with the lanes: the container was sized from each lane's
+  // wanted height, so every lane fits; heights scale proportionally. The floor
+  // only guards a stale tiny canvas.
+  const wants = lanes.map(laneWantHeight)
+  const wantTotal = wants.reduce((sum, h) => sum + h, 0) || 1
+  const laneScale = (height - top - axisH) / wantTotal
+  const laneHs = wants.map(h => Math.max(SWIM_LANE_MIN_LANE_H, h * laneScale))
   // Every lane with per-request rows feeds the palette, so a cloud lane's
   // agent bars get legend colours just like a local lane's.
   const colors = agentColorMap(lanes.filter(lane => (lane.requests || []).length))
 
+  let laneY = top
   for (let li = 0; li < lanes.length; li += 1) {
     const lane = lanes[li]
-    const y = top + li * laneH
+    const laneH = laneHs[li]
+    const y = laneY
+    laneY += laneH
     const innerH = laneH - 6
     // The exact strings this lane paints on its right edge — the same strings
     // the gutter was measured from, so they can never clip.
@@ -2179,8 +2794,8 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     // the y-axis (concurrency), so the row height grows to fill the lane —
     // peak 1 draws one thick bar, peak 8 draws eight thin ones.
     const peak = Math.max(1, lane.concurrency)
-    const rowGap = 2
-    const rowH = Math.max(3, Math.min(14, (innerH - 8 - rowGap * (peak - 1)) / peak))
+    const rowGap = SWIM_ROW_GAP
+    const rowH = Math.max(3, Math.min(16, (innerH - 8 - rowGap * (peak - 1)) / peak))
     const barTop = y + 4
 
     if (lane.ticks) {
@@ -2206,6 +2821,7 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     } else {
       // Per-request bars, stacked into sub-rows by overlap: rows stacked at any
       // x = concurrent requests at that moment.
+      const laneHitStart = hits.length
       lane.bars.forEach(item => {
         const { request, start, end, slot, whole } = item
         // Request boundaries: a bar that starts the instant the previous one on
@@ -2265,6 +2881,44 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
         hits.push({ x: x1, y: barY, w: Math.max(2, x2 - x1), h: rowH, request, lane })
       })
 
+      // Name chips: at most one per agent per lane. In-flight bars go first,
+      // right-aligned at the growing edge (a just-started bar lets its chip
+      // extend left over the row's own history); a finished bar gets a chip
+      // only when the whole chip fits inside it. Chips never overlap.
+      if (rowH >= 9) {
+        const chipH = Math.min(15, Math.max(11, Math.round(rowH + 1)))
+        const named = new Set()
+        const candidates = hits.slice(laneHitStart)
+          .map(hit => ({ hit, live: hit.request.ended_at == null }))
+          .sort((a, b) => (Number(b.live) - Number(a.live)) || (b.hit.w - a.hit.w))
+        ctx2.font = theme.chipFont
+        for (const { hit, live } of candidates) {
+          const key = agentKey(hit.request)
+          if (named.has(key)) continue
+          if (!live && hit.w < 48) break
+          const row = (rowBySession && rowBySession.get(hit.request.session_id)) ||
+            { kind: hit.request.kind, profile: hit.request.profile, session_id: hit.request.session_id }
+          const room = live ? Math.min(170, Math.max(64, plotW * 0.4)) : hit.w - 6
+          const chipText = truncateText(ctx2, shortAgentLabel(row, labels || {}), room - 12)
+          // A stub like 'Depl…' names nothing: a cut label needs a few real
+          // characters (more on a finished bar, which is optional anyway).
+          const cut = chipText.endsWith('…')
+          if (chipText.length < 3 || (cut && chipText.length < (live ? 6 : 10))) continue
+          const w = Math.ceil(ctx2.measureText(chipText).width) + 12
+          if (w > room + 1) continue
+          const x = Math.max(gutter + 2, hit.x + hit.w - 3 - w)
+          const chipY = Math.round(Math.max(y + 1, Math.min(y + innerH - chipH - 1, hit.y + hit.h / 2 - chipH / 2)))
+          const rect = { x, y: chipY, w, h: chipH }
+          const clash = placed.some(p =>
+            rect.x < p.x + p.w + 2 && p.x < rect.x + rect.w + 2 && rect.y < p.y + p.h && p.y < rect.y + rect.h)
+          if (clash) continue
+          placed.push(rect)
+          named.add(key)
+          drawChip(ctx2, x, chipY, w, chipH, colors.get(key) || accent, chipText, theme)
+          chipHits.push({ ...rect, request: hit.request, lane, chip: true })
+        }
+      }
+
       // Idle local lane: no rows at all (only an in-flight count) — a flat zero
       // baseline plus a muted 'idle' label instead of an empty frame.
       if (!lane.bars.length && lane.kind === 'local') {
@@ -2302,9 +2956,11 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     }
 
     // Lane label in the gutter: local/cloud first, then the lane's own name.
-    ctx2.fillStyle = lane.kind === 'local' ? text : accent
+    // Kind dot + kind word in the semantic tone: local green, cloud blue.
+    ctx2.fillStyle = lane.kind === 'local' ? localTone : TONE_CLOUD
+    ctx2.fillRect(8, y + 7, 6, 6)
     ctx2.font = '600 10px sans-serif'
-    ctx2.fillText(truncateText(ctx2, lane.kind, gutter - 14), 8, y + 10)
+    ctx2.fillText(truncateText(ctx2, lane.kind, gutter - 28), 19, y + 10)
     ctx2.fillStyle = text
     ctx2.font = '600 11px sans-serif'
     // Provider prefixes never make the gutter — a lane shows its model half.
@@ -2319,13 +2975,21 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
   ctx2.strokeStyle = stroke
   ctx2.lineWidth = 1
   ctx2.globalAlpha = 0.6
-  for (let i = 0; i <= 4; i += 1) {
+  for (let i = 0; i < 4; i += 1) {
     const x = gutter + (plotW * i) / 4
     ctx2.beginPath()
     ctx2.moveTo(x + 0.5, top)
     ctx2.lineTo(x + 0.5, height - axisH)
     ctx2.stroke()
   }
+  // 'now' is the amber edge every in-flight bar grows into.
+  ctx2.strokeStyle = TONE_AMBER
+  ctx2.globalAlpha = 0.9
+  ctx2.lineWidth = 1.5
+  ctx2.beginPath()
+  ctx2.moveTo(gutter + plotW, top)
+  ctx2.lineTo(gutter + plotW, height - axisH)
+  ctx2.stroke()
   ctx2.restore()
   ctx2.fillStyle = dim
   ctx2.font = '10px sans-serif'
@@ -2335,10 +2999,15 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels) {
     const x = gutter + (plotW * i) / 4
     const offset = win.seconds * (1 - i / 4)
     const label = i === 4 ? 'now' : `-${fmtElapsed(offset)}`
+    if (i === 4) {
+      ctx2.fillStyle = TONE_AMBER
+      ctx2.font = '600 10px sans-serif'
+    }
     ctx2.fillText(label, i === 4 ? x - 18 : x + 2, height - axisH + 2)
   }
   ctx2.textBaseline = 'middle'
-  return hits
+  // Chips sit on top of bars, so they hit-test first.
+  return chipHits.concat(hits)
 }
 
 function SwimLane({ snapshot, labels, windowSeconds, now }) {
@@ -2350,6 +3019,11 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
   const { win, lanes } = useMemo(
     () => swimLanes(snapshot, windowSeconds, now),
     [snapshot, windowSeconds, now]
+  )
+  const rowBySession = useMemo(() => agentRowBySession(snapshot), [snapshot])
+  const laneColors = useMemo(
+    () => agentColorMap(lanes.filter(lane => (lane.requests || []).length)),
+    [lanes]
   )
 
   useEffect(() => {
@@ -2372,8 +3046,8 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
     const ctx2 = canvas.getContext('2d')
     if (!ctx2) return
     ctx2.setTransform(dpr, 0, 0, dpr, 0, 0)
-    hitsRef.current = drawSwimLane(ctx2, size.width, size.height, lanes, win, canvas, labels)
-  }, [lanes, win, size, labels])
+    hitsRef.current = drawSwimLane(ctx2, size.width, size.height, lanes, win, canvas, labels, rowBySession)
+  }, [lanes, win, size, labels, rowBySession])
 
   const legend = useMemo(() => {
     // Every lane with per-request rows feeds the palette, so a cloud lane's
@@ -2396,10 +3070,12 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
       if (Array.isArray(row.children)) row.children.forEach(visitAgentRow)
     }
     agentRows.forEach(visitAgentRow)
-    // Same label builder as the By agent rows, so the legend and the tree never
-    // read differently. Two sessions can still share a title (e.g. two
+    // Same short label as the chips and the By agent rows, so the legend and
+    // the tree never read differently. The profile prefix only appears when
+    // the chart mixes profiles. Two sessions can still share a title (e.g. two
     // untitled 'default' sessions) — disambiguate with the id tail.
     const seen = new Map()
+    const profiles = new Set(entries.map(([key]) => key.split('|')[0]))
     return entries.map(([key, color]) => {
       const [profile, session] = key.split('|')
       const agentRow = (session && rowBySession.get(session)) || null
@@ -2416,14 +3092,15 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         role: agentRow && agentRow.role,
         goal: agentRow && agentRow.goal
       }
-      // agentLabel prefers the row's own title; the date id is the last resort.
-      const base = agentLabel(row, labels || {}) || (session ? `session ${session.slice(0, 8)}` : profile)
-      const label = `${profile} · ${base}`
+      // shortAgentLabel prefers the row's own title; the date id is the last resort.
+      const base = shortAgentLabel(row, labels || {}) || (session ? `session ${session.slice(0, 8)}` : profile)
+      const label = profiles.size > 1 ? `${profile} · ${base}` : base
       const n = (seen.get(label) || 0) + 1
       seen.set(label, n)
       return {
         key,
         color,
+        full: fullAgentText(row, labels || {}),
         label: n > 1 && session ? `${label} · ${session.slice(-6)}` : label
       }
     })
@@ -2433,12 +3110,42 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
     const rect = event.currentTarget.getBoundingClientRect()
     const x = event.clientX - rect.left
     const y = event.clientY - rect.top
+    // Hit boxes are in canvas space; the canvas sits inside a 4 px padding +
+    // 1 px border.
+    const cx = x - 5
+    const cy = y - 5
     const hit = (hitsRef.current || []).find(item =>
-      x >= item.x - 1 && x <= item.x + item.w + 1 && y >= item.y - 1 && y <= item.y + item.h + 1
+      cx >= item.x - 1 && cx <= item.x + item.w + 1 && cy >= item.y - 1 && cy <= item.y + item.h + 1
     )
-    if (hit) setHover({ x, y, text: requestTooltip(hit.request, labels, snapshot, hit.lane) })
-    else if (hover) setHover(null)
+    if (hit) {
+      if (!hover || hover.request !== hit.request || Math.abs(hover.x - x) > 2 || Math.abs(hover.y - y) > 2) {
+        setHover({ x, y, request: hit.request, lane: hit.lane })
+      }
+    } else if (hover) setHover(null)
   }
+
+  // The hover card: near the pointer, flipped to the left/up when it would
+  // run off the panel, clamped inside it horizontally.
+  const boxH = swimLaneHeight(lanes)
+  const card = (() => {
+    if (!hover || !hover.request) return null
+    const facts = requestCardFacts(hover.request, labels, snapshot, hover.lane, rowBySession)
+    const panelW = size.width + 10 || 600
+    const cardH = facts.full ? 168 : 138
+    let left = hover.x + 14
+    if (left + REQUEST_CARD_W > panelW - 4) left = hover.x - 14 - REQUEST_CARD_W
+    left = Math.max(4, Math.min(left, panelW - REQUEST_CARD_W - 4))
+    let top = hover.y + 14
+    if (top + cardH > boxH + 40) top = hover.y - 14 - cardH
+    top = Math.max(4, top)
+    return jsx(RequestCard, {
+      facts,
+      color: laneColors.get(agentKey(hover.request)) || 'var(--ui-accent)',
+      text: requestTooltip(hover.request, labels, snapshot, hover.lane),
+      left,
+      top
+    })
+  })()
 
   return jsxs('div', {
     className: 'flex flex-col gap-1',
@@ -2447,7 +3154,8 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
         ref: wrapRef,
         className: 'relative w-full',
         style: {
-          height: `${swimLaneHeight(lanes.length)}px`,
+          position: 'relative',
+          height: `${boxH}px`,
           padding: '4px',
           borderRadius: '8px',
           border: '1px solid var(--ui-stroke-secondary)',
@@ -2463,22 +3171,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
             role: 'img',
             'aria-label': 'Swim-lane timeline: one lane per server or cloud model with traffic, local lanes first; every lane uses the same encoding — one horizontal bar per request (low-alpha waiting for first token, full-colour generating, hatched when the response was not streamed, dashed queued beyond slots), separated by a 1 px gap and outlined so back-to-back requests stay distinct, stacked into rows so rows at any moment equal concurrent requests, with the peak concurrency labelled on the right'
           }),
-          hover
-            ? jsx('div', {
-                className: 'pointer-events-none absolute z-10 rounded px-2 py-1 shadow-lg',
-                style: {
-                  left: `${Math.min(hover.x + 10, Math.max(8, size.width - 350))}px`,
-                  top: `${Math.min(hover.y + 12, Math.max(8, size.height - 60))}px`,
-                  maxWidth: '340px',
-                  border: '1px solid var(--ui-stroke-secondary)',
-                  background: 'var(--ui-bg-tertiary)',
-                  fontSize: '0.6rem',
-                  lineHeight: 1.6,
-                  color: 'var(--ui-text-secondary)'
-                },
-                children: hover.text
-              })
-            : null
+          card
         ]
       }),
       jsxs('div', {
@@ -2564,6 +3257,7 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
           legend.map(entry =>
             jsxs('span', {
               className: 'inline-flex items-center gap-1',
+              title: entry.full !== entry.label ? entry.full : undefined,
               children: [
                 jsx('span', {
                   className: 'rounded-full',
@@ -2583,14 +3277,14 @@ function SwimLane({ snapshot, labels, windowSeconds, now }) {
 }
 
 // ---------------------------------------------------------------------------
-// By agent — profile → session → subagents and cron runs.
-
-function modelTone(laneId) {
-  const text = String(laneId || '')
-  let hash = 0
-  for (let i = 0; i < text.length; i += 1) hash = (hash * 31 + text.charCodeAt(i)) % 997
-  return AGENT_PALETTE[hash % AGENT_PALETTE.length]
-}
+// By agent (UI v2) — one card per root agent, not a wide table. A row is
+// dot · short name · kind badge on the left, big right-aligned numbers that
+// always fit (in flight, requests, tokens in/out) on the right, a muted
+// secondary line (source, activity, latency/TTFT p50, errors — each only when
+// known) and compact model chips under the name. Subagents nest under their
+// parent behind a left rule, at most AGENT_CHILD_LIMIT then '+N more'. The full
+// goal / title, session id and per-model breakdown live in the hover card,
+// never inline.
 
 function aggregateModels(rows) {
   const byLane = new Map()
@@ -2611,274 +3305,497 @@ function aggregateModels(rows) {
   return [...byLane.values()].sort((a, b) => (b.requests || 0) - (a.requests || 0))
 }
 
-const AGENT_COLUMNS = [
-  { key: 'flight', label: 'flight', width: 64 },
-  { key: 'req', label: 'req', width: 56 },
-  { key: 'tokens', label: 'tok in/out', width: 112 },
-  { key: 'lat', label: 'lat', width: 48 },
-  { key: 'ttft', label: 'ttft', width: 48 },
-  { key: 'err', label: 'err', width: 32 }
-]
-const MIX_WIDTH = 96
-
-// Fixed widths live in inline styles, not Tailwind classes: the desktop CSS
-// bundle does not compile plugin.js, so w-16 / w-12 / h-1.5 / lg:inline-flex
-// silently render nothing — which is why the chips and columns were invisible.
-function colStyle(width, extra) {
-  return {
-    width: `${width}px`,
-    flex: '0 0 auto',
-    textAlign: 'right',
-    fontSize: '0.6rem',
-    fontVariantNumeric: 'tabular-nums',
-    color: 'var(--ui-text-secondary)',
-    ...extra
-  }
-}
-
-function modelDotStyle(model) {
-  return {
-    width: '6px',
-    height: '6px',
-    borderRadius: '999px',
-    flex: '0 0 auto',
-    background: model.local ? 'var(--ui-accent)' : 'var(--ui-text-tertiary)'
-  }
-}
+// Right-hand number columns: fixed widths so the columns line up across every
+// row and nested subagent, and so the block's total width is known (≈250 px):
+// the name column takes the rest and ellipsises — nothing ever pushes the
+// numbers off-screen.
+const AGENT_STAT_W = { flight: 72, req: 60, tokens: 92 }
+const AGENT_STAT_GAP = 12
+const AGENT_CHILD_LIMIT = 4
+const AGENT_CARD_W = 340
 
 function cachedPctOf(node) {
-  return node.tokens_in ? Math.round(((node.cached_tokens || 0) / node.tokens_in) * 100) : null
+  return node && node.tokens_in ? Math.round(((node.cached_tokens || 0) / node.tokens_in) * 100) : null
 }
 
-function tokenColText(node) {
-  const pct = cachedPctOf(node)
-  return `${fmtTokens(node.tokens_in)}/${fmtTokens(node.tokens_out)}${pct != null ? ` (${pct}%)` : ''}`
+function tokenPairText(node) {
+  if (!node || (node.tokens_in == null && node.tokens_out == null)) return '—'
+  return `${fmtTokens(node.tokens_in)}/${fmtTokens(node.tokens_out)}`
 }
 
-// One indented sub-row per model an agent used in the window: a local/cloud
-// dot, the lane label, and the model's own columns. Per-model latency, TTFT and
-// errors come from the snapshot's model entries (null renders as "—"), using the
-// same formatters, data-col names and widths as the parent agent row.
-function ModelSubRow({ model, now, depth }) {
+function agentKindOf(row) {
+  return row && (row.kind === 'subagent' || row.kind === 'cron') ? row.kind : 'session'
+}
+
+// A model chip's name: a local lane by its server (the swim lane's gutter
+// label, so a chip reads against its lane), a cloud lane by its short model.
+function modelChipName(model) {
+  const label = String((model && model.label) || '')
+  if (model && model.local) {
+    const server = label.split(' · ')[0].trim()
+    if (server) return server
+  }
+  return modelDisplayName(label || (model && model.lane_id) || 'model')
+}
+
+function ModelChip({ model }) {
   const inFlight = model.in_flight || 0
-  return jsxs('div', {
+  const tone = model.local ? TONE_LOCAL : TONE_CLOUD
+  return jsxs('span', {
     'data-model-row': model.lane_id || model.label || 'model',
-    className: 'flex items-center gap-2',
+    'data-model-local': model.local ? 'local' : 'cloud',
     style: {
-      marginLeft: `${depth ? 20 : 12}px`,
-      paddingLeft: '8px',
-      paddingRight: '8px',
-      paddingTop: '1px',
-      paddingBottom: '1px',
-      borderLeft: '1px solid var(--ui-stroke-secondary)',
-      fontSize: '0.6rem'
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '5px',
+      minWidth: 0,
+      maxWidth: '100%',
+      height: '18px',
+      boxSizing: 'border-box',
+      padding: '0 7px',
+      borderRadius: '999px',
+      border: `1px solid ${inFlight > 0 ? tone : 'var(--ui-stroke-secondary)'}`,
+      fontSize: '0.65rem',
+      lineHeight: 1,
+      whiteSpace: 'nowrap',
+      color: 'var(--ui-text-secondary)'
     },
     children: [
       jsx('span', {
-        style: modelDotStyle(model),
-        title: model.local ? 'local model server' : 'cloud provider'
+        style: { width: '6px', height: '6px', borderRadius: '999px', flex: '0 0 auto', background: tone }
       }),
       jsx('span', {
-        className: 'min-w-0 flex-1 truncate',
-        style: {
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-          color: 'var(--ui-text-secondary)'
-        },
-        title: `${model.label} · ${model.local ? 'local' : 'cloud'}`,
-        children: model.label
+        style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 550 },
+        children: modelChipName(model)
       }),
       jsx('span', {
-        'data-col': 'flight',
-        className: cn(inFlight > 0 && 'animate-pulse'),
-        style: colStyle(64, inFlight > 0 ? { color: 'var(--ui-accent)', fontWeight: 600 } : null),
-        title: 'in flight',
-        children: inFlight ? String(inFlight) : '—'
-      }),
-      jsx('span', {
-        'data-col': 'req',
-        style: colStyle(56),
-        title: 'requests in the window',
-        children: `${fmtInt(model.requests)} req`
-      }),
-      jsx('span', {
-        'data-col': 'tokens',
-        style: colStyle(112),
-        title: 'tokens in / out (cached %)',
-        children: tokenColText(model)
-      }),
-      jsx('span', {
-        'data-col': 'lat',
-        style: colStyle(48),
-        title: 'latency p50',
-        children: fmtMs(model.latency_ms_p50)
-      }),
-      jsx('span', {
-        'data-col': 'ttft',
-        style: colStyle(48),
-        title: 'TTFT p50',
-        children: fmtMs(model.ttft_ms_p50)
-      }),
-      jsx('span', {
-        'data-col': 'err',
-        style: colStyle(32, {
-          color: (model.errors_5m || 0) > 0 ? 'var(--ui-destructive)' : 'var(--ui-text-quaternary)'
-        }),
-        title: 'errors in the window',
-        children: fmtInt(model.errors_5m)
+        style: { flex: '0 0 auto', color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums' },
+        children: `· ${fmtInt(model.requests)} req${inFlight ? ` · ${inFlight} live` : ''}`
       })
     ]
   })
 }
 
-function ModelMixBar({ models }) {
-  const total = (models || []).reduce((sum, model) => sum + (model.requests || 0), 0)
-  if (!total) return null
+function ModelChips({ models }) {
+  if (!models || !models.length) return null
   return jsx('div', {
-    className: 'flex shrink-0 overflow-hidden rounded-full',
-    style: { width: `${MIX_WIDTH}px`, height: '6px', background: 'var(--ui-bg-tertiary)' },
-    title: models.map(model => `${model.label}: ${model.requests}`).join(' · '),
-    children: models.map(model =>
-      jsx('span', {
-        style: {
-          width: `${((model.requests || 0) / total) * 100}%`,
-          background: modelTone(model.lane_id)
-        }
-      }, model.lane_id)
-    )
+    'data-model-chips': String(models.length),
+    style: { display: 'flex', flexWrap: 'wrap', gap: '4px', minWidth: 0 },
+    children: models.map(model => jsx(ModelChip, { model }, model.lane_id || model.label))
   })
 }
 
-// An agent row keeps only its totals across models; one model sub-row per model
-// sits under it, so two models never read as two chips for one agent.
-function AgentRow({ row, labels, now, depth }) {
-  const inFlight = row.in_flight || 0
-  const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
-  const models = Array.isArray(row.models) ? row.models : []
-  const label = agentLabel(row, labels)
-  // Row's own source from state.db first, session.list as fallback.
-  const source = rowSource(row) || (sessionMeta(labels, row.session_id) || {}).source || ''
-  // A stored session opens core-style through the SDK; subagent rows keep their
-  // own label (their stored row is not a chat the user opened).
-  const openable = row.kind !== 'subagent' && !!row.session_id && typeof host.openSession === 'function'
-  const open = openable
-    ? () => {
-        try {
-          host.openSession(row.session_id, { profile: row.profile })
-        } catch {
-          // A stale id leaves the row inert; the label still reads.
-        }
-      }
-    : undefined
-  const activity = row.kind === 'subagent' ? '' : sessionActivity(row, labels, now)
-  return jsxs('div', {
-    'data-agent-row': row.session_id || row.profile || 'agent',
-    className: 'flex flex-col',
-    children: [
-      jsxs('div', {
-        className: 'flex items-center gap-2',
-        onClick: open,
-        role: open ? 'button' : undefined,
-        title: open ? `Open ${row.session_id}` : undefined,
-        style: {
-          paddingLeft: `${depth ? 24 : 8}px`,
-          paddingRight: '8px',
-          paddingTop: '2px',
-          paddingBottom: '2px',
-          borderRadius: '4px',
-          fontSize: '0.75rem',
-          cursor: open ? 'pointer' : 'default',
-          background: inFlight > 0 ? 'var(--ui-row-hover-background)' : 'transparent'
-        },
+// The three big numbers. 'idle' (small, muted) instead of a zero in flight.
+function AgentNumbers({ node, inFlight, elapsed, compact }) {
+  const size = compact ? '0.95rem' : '1.15rem'
+  const flightValue = inFlight > 0
+    ? jsxs('span', {
         children: [
-          jsx(StatusDot, {
-            tone: inFlight > 0 ? 'good' : 'muted',
-            className: cn('size-2 shrink-0', inFlight > 0 && 'animate-pulse')
-          }),
-          jsx('span', {
-            className: 'min-w-0 flex-1 truncate',
-            style: {
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              // Root rows (session / cron) read bold whatever their kind;
-              // subagent rows keep the lighter weight of the tree's second level.
-              fontWeight: depth ? 400 : 600,
-              color: inFlight > 0 ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
-            },
-            title: row.kind === 'subagent' && row.goal ? `${label} — goal: ${row.goal}` : (row.session_id ? `${label} — ${row.session_id}` : label),
-            children: label
-          }),
-          row.kind === 'subagent' || row.kind === 'cron'
-            ? jsx(Badge, { variant: 'outline', size: 'xs', children: row.kind })
-            : source
-              ? jsx(Badge, { variant: 'outline', size: 'xs', children: source })
-              : null,
-          routedChip(row),
-          jsx(ModelMixBar, { models }),
-          jsx('span', {
-            'data-col': 'flight',
-            style: colStyle(64),
-            title: 'in flight · elapsed of the oldest in-flight request',
-            children: inFlight ? `${inFlight} · ${elapsed || '—'}` : '—'
-          }),
-          jsx('span', {
-            'data-col': 'req',
-            style: colStyle(56),
-            title: 'requests in the window',
-            children: `${fmtInt(row.requests_5m)} req`
-          }),
-          jsx('span', {
-            'data-col': 'tokens',
-            style: colStyle(112),
-            title: 'tokens in / out (cached %)',
-            children: tokenColText(row)
-          }),
-          jsx('span', {
-            'data-col': 'lat',
-            style: colStyle(48),
-            title: 'latency p50',
-            children: fmtMs(row.latency_ms_p50)
-          }),
-          jsx('span', {
-            'data-col': 'ttft',
-            style: colStyle(48),
-            title: 'TTFT p50',
-            children: fmtMs(row.ttft_ms_p50)
-          }),
-          jsx('span', {
-            'data-col': 'err',
-            style: colStyle(32, {
-              color: (row.errors_5m || 0) > 0 ? 'var(--ui-destructive)' : 'var(--ui-text-quaternary)'
-            }),
-            title: 'errors in the window',
-            children: fmtInt(row.errors_5m)
-          })
+          String(inFlight),
+          elapsed
+            ? jsx('span', {
+                style: { fontSize: '0.65rem', fontWeight: 500, marginLeft: '4px', color: 'var(--ui-text-tertiary)' },
+                children: elapsed
+              })
+            : null
         ]
+      })
+    : jsx('span', { style: { fontSize: '0.75rem', fontWeight: 500 }, children: 'idle' })
+  return jsxs('div', {
+    'data-agent-numbers': 'true',
+    style: { display: 'flex', alignItems: 'flex-start', gap: `${AGENT_STAT_GAP}px`, flex: '0 0 auto' },
+    children: [
+      jsx(BigStat, {
+        col: 'flight',
+        align: 'right',
+        width: AGENT_STAT_W.flight,
+        size,
+        value: flightValue,
+        tone: inFlight > 0 ? TONE_LOCAL : 'var(--ui-text-quaternary)',
+        label: inFlight > 0 && elapsed ? 'in flight · oldest' : 'in flight'
       }),
-      activity
-        ? jsx('span', {
-            'data-session-meta': row.session_id,
-            style: {
-              paddingLeft: `${depth ? 24 : 8}px`,
-              paddingRight: '8px',
-              fontSize: '0.625rem',
-              color: 'var(--ui-text-quaternary)',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap'
-            },
-            title: row.session_id,
-            children: activity
-          })
-        : null,
-      models.map(model => jsx(ModelSubRow, { model, now, depth: true }, model.lane_id))
+      jsx(BigStat, {
+        col: 'req',
+        align: 'right',
+        width: AGENT_STAT_W.req,
+        size,
+        value: fmtInt(node.requests_5m != null ? node.requests_5m : node.requests),
+        label: 'requests'
+      }),
+      jsx(BigStat, {
+        col: 'tokens',
+        align: 'right',
+        width: AGENT_STAT_W.tokens,
+        size,
+        value: tokenPairText(node),
+        label: 'tok in/out'
+      })
     ]
   })
 }
 
+// The muted line under the name: only parts that are known. Joined with
+// middots; one line, ellipsised.
+function agentSecondaryParts(row, labels, now, childCount) {
+  const parts = []
+  if (row.kind === 'subagent' && row.role && row.role !== 'leaf') {
+    parts.push(jsx('span', { children: row.role }))
+  }
+  const source = row.kind === 'subagent' ? '' : (rowSource(row) || (sessionMeta(labels, row.session_id) || {}).source || '')
+  if (source) parts.push(jsx('span', { 'data-agent-source': source, children: source }))
+  if (childCount) parts.push(jsx('span', { children: plural(childCount, 'subagent') }))
+  const activity = row.kind === 'subagent' ? '' : sessionActivity(row, labels, now)
+  if (activity) parts.push(jsx('span', { 'data-session-meta': row.session_id, children: activity }))
+  if (row.latency_ms_p50 != null) {
+    parts.push(jsx('span', { 'data-col': 'lat', children: `latency p50 ${fmtMs(row.latency_ms_p50)}` }))
+  }
+  if (row.ttft_ms_p50 != null) {
+    parts.push(jsx('span', { 'data-col': 'ttft', children: `TTFT p50 ${fmtMs(row.ttft_ms_p50)}` }))
+  }
+  if ((row.errors_5m || 0) > 0) {
+    parts.push(jsx('span', {
+      'data-col': 'err',
+      style: { color: TONE_QUEUED, fontWeight: 600 },
+      children: plural(row.errors_5m, 'error')
+    }))
+  }
+  return parts
+}
+
+function SecondaryLine({ parts }) {
+  if (!parts || !parts.length) return null
+  const children = []
+  parts.forEach((part, i) => {
+    if (i) children.push(' · ')
+    children.push(part)
+  })
+  return jsxs('div', {
+    'data-agent-secondary': 'true',
+    style: {
+      minWidth: 0,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      fontSize: '0.65rem',
+      lineHeight: 1.35,
+      color: 'var(--ui-text-tertiary)'
+    },
+    children
+  })
+}
+
+function agentOpener(row) {
+  // A stored session opens core-style through the SDK; a subagent's stored row
+  // is not a chat the user opened, so it stays inert.
+  const openable = row.kind !== 'subagent' && !!row.session_id && typeof host.openSession === 'function'
+  if (!openable) return undefined
+  return () => {
+    try {
+      host.openSession(row.session_id, { profile: row.profile })
+    } catch {
+      // A stale id leaves the row inert; the label still reads.
+    }
+  }
+}
+
+function AgentRow({ row, labels, now, depth, childCount, onHover, hovered }) {
+  const inFlight = row.in_flight || 0
+  const elapsed = inFlight ? elapsedOf(row.oldest_started_at, now) : null
+  const models = Array.isArray(row.models) ? row.models : []
+  const short = shortAgentLabel(row, labels)
+  const full = fullAgentText(row, labels)
+  const kind = agentKindOf(row)
+  const open = agentOpener(row)
+  const parts = agentSecondaryParts(row, labels, now, childCount)
+  const hoverProps = onHover
+    ? {
+        onMouseEnter: event => onHover(row, event),
+        onMouseMove: event => onHover(row, event),
+        onMouseLeave: () => onHover(null)
+      }
+    : {}
+  return jsx('div', {
+    'data-agent-row': row.session_id || row.profile || 'agent',
+    'data-agent-kind': kind,
+    style: { minWidth: 0 },
+    children: jsxs('div', {
+      onClick: open,
+      onKeyDown: open
+        ? event => {
+            if (event && (event.key === 'Enter' || event.key === ' ')) {
+              if (event.preventDefault) event.preventDefault()
+              open()
+            }
+          }
+        : undefined,
+      role: open ? 'button' : undefined,
+      tabIndex: open ? 0 : undefined,
+      'aria-label': open ? `Open ${full}` : full,
+      ...hoverProps,
+      style: {
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: `${AGENT_STAT_GAP}px`,
+        minWidth: 0,
+        padding: depth ? '5px 10px 5px 10px' : '9px 10px 8px 10px',
+        borderRadius: '6px',
+        cursor: open ? 'pointer' : 'default',
+        background: hovered ? 'var(--ui-row-hover-background)' : 'transparent'
+      },
+      children: [
+        jsxs('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0, flex: '1 1 auto' },
+          children: [
+            jsxs('div', {
+              style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 },
+              children: [
+                jsx('span', {
+                  'aria-hidden': 'true',
+                  style: {
+                    width: depth ? '6px' : '8px',
+                    height: depth ? '6px' : '8px',
+                    borderRadius: '999px',
+                    flex: '0 0 auto',
+                    background: inFlight > 0 ? TONE_LOCAL : 'var(--ui-text-quaternary)',
+                    boxShadow: inFlight > 0 ? `0 0 0 3px color-mix(in srgb, ${TONE_LOCAL} 22%, transparent)` : 'none'
+                  }
+                }),
+                jsx('span', {
+                  'data-agent-name': short,
+                  'data-agent-full': full,
+                  style: {
+                    minWidth: 0,
+                    flex: '0 1 auto',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontSize: depth ? '0.8rem' : '0.875rem',
+                    fontWeight: depth ? 550 : 650,
+                    color: inFlight > 0 || !depth ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
+                  },
+                  children: short
+                }),
+                jsx('span', {
+                  'data-agent-badge': kind,
+                  style: { flex: '0 0 auto', display: 'inline-flex' },
+                  children: jsx(Badge, { variant: kind === 'session' ? 'muted' : 'outline', size: 'xs', children: kind })
+                }),
+                row.routed
+                  ? jsx('span', {
+                      style: { flex: '0 1 auto', minWidth: 0, maxWidth: '45%', overflow: 'hidden', display: 'inline-flex' },
+                      children: routedChip(row)
+                    })
+                  : null
+              ]
+            }),
+            jsx(SecondaryLine, { parts }),
+            jsx(ModelChips, { models })
+          ]
+        }),
+        jsx(AgentNumbers, { node: row, inFlight, elapsed, compact: !!depth })
+      ]
+    })
+  })
+}
+
+// The hover card: everything the row leaves out — the full goal / title, the
+// session id, every number, and one line per model.
+function agentCardFacts(row, labels, now) {
+  const short = shortAgentLabel(row, labels)
+  const full = fullAgentText(row, labels)
+  const kind = agentKindOf(row)
+  const source = row.kind === 'subagent' ? '' : (rowSource(row) || (sessionMeta(labels, row.session_id) || {}).source || '')
+  const activity = row.kind === 'subagent' ? '' : sessionActivity(row, labels, now)
+  const inFlight = row.in_flight || 0
+  const cached = cachedPctOf(row)
+  return {
+    name: short,
+    full: full !== short ? full : null,
+    meta: [kind, source, row.session_id, activity].filter(Boolean).join(' · '),
+    stats: [
+      { label: 'in flight', value: inFlight ? `${inFlight}${row.oldest_started_at != null && elapsedOf(row.oldest_started_at, now) ? ` · ${elapsedOf(row.oldest_started_at, now)}` : ''}` : 'idle' },
+      { label: 'requests', value: fmtInt(row.requests_5m) },
+      { label: 'errors', value: fmtInt(row.errors_5m || 0) },
+      { label: cached ? `tokens in · ${cached}% cached` : 'tokens in', value: fmtTokens(row.tokens_in) },
+      { label: 'tokens out', value: fmtTokens(row.tokens_out) },
+      { label: 'latency p50', value: fmtMs(row.latency_ms_p50) },
+      { label: 'TTFT p50', value: fmtMs(row.ttft_ms_p50) }
+    ],
+    models: (Array.isArray(row.models) ? row.models : []).map(model => ({
+      key: model.lane_id || model.label,
+      local: !!model.local,
+      name: modelChipName(model),
+      full: model.label || model.lane_id || 'model',
+      line: [
+        `${fmtInt(model.requests)} req`,
+        model.in_flight ? `${model.in_flight} in flight` : null,
+        `${tokenPairText(model)} tok`,
+        model.latency_ms_p50 != null ? `p50 ${fmtMs(model.latency_ms_p50)}` : null,
+        model.ttft_ms_p50 != null ? `TTFT ${fmtMs(model.ttft_ms_p50)}` : null,
+        (model.errors_5m || 0) > 0 ? plural(model.errors_5m, 'error') : null
+      ].filter(Boolean).join(' · ')
+    })),
+    hint: agentOpener(row) ? 'click to open the session' : null
+  }
+}
+
+function AgentCard({ facts, left, top, above, width }) {
+  return jsxs('div', {
+    role: 'tooltip',
+    'data-agent-card': facts.name,
+    style: {
+      position: 'absolute',
+      zIndex: 20,
+      pointerEvents: 'none',
+      left: `${left}px`,
+      top: `${top}px`,
+      transform: above ? 'translateY(-100%)' : undefined,
+      width: `${width}px`,
+      boxSizing: 'border-box',
+      padding: '10px 12px',
+      borderRadius: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      background: 'var(--ui-bg-elevated, var(--ui-bg-editor))',
+      boxShadow: '0 8px 24px rgba(0, 0, 0, 0.18)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px'
+    },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 },
+        children: [
+          jsx('span', {
+            style: {
+              fontSize: '0.8125rem', fontWeight: 650, color: 'var(--ui-text-primary)',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+            },
+            children: facts.name
+          }),
+          jsx('span', {
+            style: {
+              fontSize: '0.625rem', color: 'var(--ui-text-tertiary)',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+            },
+            children: facts.meta
+          })
+        ]
+      }),
+      facts.full
+        ? jsx('span', {
+            'data-agent-card-full': 'true',
+            style: {
+              fontSize: '0.7rem', lineHeight: 1.4, color: 'var(--ui-text-secondary)',
+              display: '-webkit-box', WebkitLineClamp: 4, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+              overflowWrap: 'anywhere'
+            },
+            children: facts.full
+          })
+        : null,
+      jsx('div', {
+        style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', columnGap: '10px', rowGap: '6px' },
+        children: facts.stats.map(stat => jsx(BigStat, { value: stat.value, label: stat.label, size: '0.9rem' }, stat.label))
+      }),
+      facts.models.length
+        ? jsx('div', {
+            style: {
+              display: 'flex', flexDirection: 'column', gap: '3px',
+              borderTop: '1px solid var(--ui-stroke-secondary)', paddingTop: '6px'
+            },
+            children: facts.models.map(model =>
+              jsxs('div', {
+                'data-card-model': model.key,
+                style: { display: 'flex', alignItems: 'baseline', gap: '6px', minWidth: 0, fontSize: '0.65rem' },
+                children: [
+                  jsx('span', {
+                    style: {
+                      width: '6px', height: '6px', borderRadius: '999px', flex: '0 0 auto', alignSelf: 'center',
+                      background: model.local ? TONE_LOCAL : TONE_CLOUD
+                    }
+                  }),
+                  jsx('span', {
+                    style: { flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600, color: 'var(--ui-text-secondary)' },
+                    children: model.name
+                  }),
+                  jsx('span', {
+                    style: { flex: '0 0 auto', color: 'var(--ui-text-tertiary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' },
+                    children: model.line
+                  })
+                ]
+              }, model.key)
+            )
+          })
+        : null,
+      facts.hint
+        ? jsx('span', { style: { fontSize: '0.6rem', color: 'var(--ui-text-quaternary)' }, children: facts.hint })
+        : null
+    ]
+  })
+}
+
+// The profile summary above its cards: totals in the same number columns and
+// the profile's model chips (the old MIX bar, as words).
+function ProfileRow({ profile, roots }) {
+  const sum = key => roots.reduce((total, row) => total + (row[key] || 0), 0)
+  const subagents = roots.reduce((total, row) => total + ((row.children || []).length), 0)
+  const totals = {
+    requests_5m: sum('requests_5m'),
+    tokens_in: sum('tokens_in'),
+    tokens_out: sum('tokens_out'),
+    cached_tokens: sum('cached_tokens')
+  }
+  const inFlight = sum('in_flight')
+  const errors = sum('errors_5m')
+  const models = aggregateModels(roots)
+  const parts = [jsx('span', { children: plural(roots.length, 'session') })]
+  if (subagents) parts.push(jsx('span', { children: plural(subagents, 'subagent') }))
+  if (errors > 0) {
+    parts.push(jsx('span', { 'data-col': 'err', style: { color: TONE_QUEUED, fontWeight: 600 }, children: plural(errors, 'error') }))
+  }
+  return jsx('div', {
+    'data-agent-row': `profile:${profile}`,
+    'data-agent-kind': 'profile',
+    style: { minWidth: 0 },
+    children: jsxs('div', {
+      'aria-label': `${profile} · ${plural(roots.length, 'session')}`,
+      style: { display: 'flex', alignItems: 'flex-start', gap: `${AGENT_STAT_GAP}px`, minWidth: 0, padding: '2px 11px 4px 11px' },
+      children: [
+        jsxs('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0, flex: '1 1 auto' },
+          children: [
+            jsxs('div', {
+              style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 },
+              children: [
+                jsx('span', {
+                  'aria-hidden': 'true',
+                  style: { width: '8px', height: '8px', borderRadius: '2px', flex: '0 0 auto', background: profileTone(profile) }
+                }),
+                jsx('span', {
+                  'data-agent-name': profile,
+                  style: kickerStyle({ fontSize: '0.65rem', color: 'var(--ui-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }),
+                  children: profile
+                }),
+                jsx('span', {
+                  'data-agent-badge': 'profile',
+                  style: { flex: '0 0 auto', display: 'inline-flex' },
+                  children: jsx(Badge, { variant: 'outline', size: 'xs', children: 'profile' })
+                })
+              ]
+            }),
+            jsx(SecondaryLine, { parts }),
+            jsx(ModelChips, { models })
+          ]
+        }),
+        jsx(AgentNumbers, { node: totals, inFlight, elapsed: null, compact: true })
+      ]
+    })
+  })
+}
+
 function AgentTree({ agents, labels, now }) {
+  const [hover, setHover] = useState(null)
+  const [expanded, setExpanded] = useState(() => new Set())
+  const boxRef = useRef(null)
   const groups = useMemo(() => {
     const roots = agents.filter(row => !row.parent_session_id)
     const byProfile = new Map()
@@ -2886,10 +3803,12 @@ function AgentTree({ agents, labels, now }) {
       if (!byProfile.has(root.profile)) byProfile.set(root.profile, [])
       byProfile.get(root.profile).push(root)
     }
-    for (const rows of byProfile.values()) {
-      rows.sort((a, b) => (b.in_flight || 0) - (a.in_flight || 0) || (b.requests_5m || 0) - (a.requests_5m || 0))
-    }
-    return [...byProfile.entries()]
+    const busyFirst = (a, b) => (b.in_flight || 0) - (a.in_flight || 0) || (b.requests_5m || 0) - (a.requests_5m || 0)
+    for (const rows of byProfile.values()) rows.sort(busyFirst)
+    return [...byProfile.entries()].map(([profile, rows]) => [
+      profile,
+      rows.map(root => ({ root, children: [...(root.children || [])].sort(busyFirst) }))
+    ])
   }, [agents])
 
   if (!agents.length) {
@@ -2900,139 +3819,142 @@ function AgentTree({ agents, labels, now }) {
     })
   }
 
+  // Row-anchored hover card: under the row (or above it near the bottom of the
+  // window), following the pointer horizontally, clamped to the panel.
+  const onHover = (row, event) => {
+    if (!row) {
+      setHover(null)
+      return
+    }
+    const box = boxRef.current
+    const target = event && event.currentTarget
+    if (!box || !target || typeof target.getBoundingClientRect !== 'function') return
+    const b = box.getBoundingClientRect()
+    const r = target.getBoundingClientRect()
+    const x = (event.clientX != null ? event.clientX : r.left) - b.left
+    const viewH = typeof window !== 'undefined' && window.innerHeight ? window.innerHeight : Infinity
+    const above = r.bottom + 260 > viewH && r.top - 260 > 0
+    const next = { row, x, top: above ? r.top - b.top - 4 : r.bottom - b.top + 4, above, width: b.width }
+    setHover(prev =>
+      prev && prev.row === row && prev.above === above && Math.abs(prev.x - x) < 16 ? prev : next)
+  }
+  const toggle = id => setExpanded(prev => {
+    const nextSet = new Set(prev)
+    if (nextSet.has(id)) nextSet.delete(id)
+    else nextSet.add(id)
+    return nextSet
+  })
+
+  const cardW = hover ? Math.min(AGENT_CARD_W, Math.max(200, hover.width - 8)) : AGENT_CARD_W
+  const card = hover
+    ? jsx(AgentCard, {
+        facts: agentCardFacts(hover.row, labels, now),
+        left: Math.max(0, Math.min(hover.x - 40, hover.width - cardW)),
+        top: hover.top,
+        above: hover.above,
+        width: cardW
+      })
+    : null
+
   return jsxs('div', {
-    className: 'flex flex-col gap-3',
+    ref: boxRef,
+    'data-agent-tree': 'true',
+    style: { position: 'relative', display: 'flex', flexDirection: 'column', gap: '14px', minWidth: 0 },
     children: [
-      jsxs('div', {
-        className: 'flex items-center gap-2',
-        style: {
-          paddingLeft: '8px',
-          paddingRight: '8px',
-          fontSize: '0.55rem',
-          textTransform: 'uppercase',
-          letterSpacing: '0.08em',
-          color: 'var(--ui-text-quaternary)'
-        },
-        children: [
-          jsx('span', { className: 'min-w-0 flex-1', children: 'agent' }),
-          jsx('span', {
-            style: { width: `${MIX_WIDTH}px`, flex: '0 0 auto', textAlign: 'right' },
-            title: 'Share of this row\'s requests per model. Each model lane is assigned one colour from a fixed 8-colour palette by hashing its lane id, so the same model keeps the same colour in every row; segment width is that model\'s share of the row\'s requests.',
-            children: 'mix'
-          }),
-          ...AGENT_COLUMNS.map(col =>
-            jsx('span', {
-              style: { width: `${col.width}px`, flex: '0 0 auto', textAlign: 'right' },
-              children: col.label
-            }, col.key)
-          )
-        ]
-      }),
-      ...groups.map(([profile, roots]) => {
-        const inFlight = roots.reduce((sum, row) => sum + (row.in_flight || 0), 0)
-        const requests = roots.reduce((sum, row) => sum + (row.requests_5m || 0), 0)
-        const tokensIn = roots.reduce((sum, row) => sum + (row.tokens_in || 0), 0)
-        const tokensOut = roots.reduce((sum, row) => sum + (row.tokens_out || 0), 0)
-        const cachedTokens = roots.reduce((sum, row) => sum + (row.cached_tokens || 0), 0)
-        const models = aggregateModels(roots)
-        const totals = { in_flight: inFlight, requests_5m: requests, tokens_in: tokensIn, tokens_out: tokensOut, cached_tokens: cachedTokens }
-        return jsxs(
+      ...groups.map(([profile, entries]) =>
+        jsxs(
           'section',
           {
-            className: 'flex flex-col gap-1',
+            'data-agent-profile': profile,
+            style: { display: 'flex', flexDirection: 'column', gap: '8px', minWidth: 0 },
             children: [
-              jsxs('div', {
-                'data-agent-row': `profile:${profile}`,
-                className: 'flex flex-col',
-                children: [
-                  jsxs('div', {
-                    className: 'flex items-center gap-2',
-                    style: {
-                      paddingLeft: '8px',
-                      paddingRight: '8px',
-                      paddingTop: '2px',
-                      paddingBottom: '2px',
-                      fontSize: '0.75rem'
-                    },
-                    children: [
-                      jsx('span', {
-                        className: 'rounded-full',
-                        style: { width: '8px', height: '8px', flex: '0 0 auto', background: profileTone(profile) }
-                      }),
-                      jsx('span', {
-                        className: 'min-w-0 flex-1 truncate',
-                        style: {
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                          fontWeight: 600,
-                          color: 'var(--ui-text-primary)'
-                        },
-                        title: `${profile} · ${plural(roots.length, 'session')}`,
-                        children: `${profile} · ${plural(roots.length, 'session')}`
-                      }),
-                      jsx(ModelMixBar, { models }),
-                      jsx('span', {
-                        'data-col': 'flight',
-                        style: colStyle(64),
-                        title: 'in flight across every session',
-                        children: inFlight ? String(inFlight) : '—'
-                      }),
-                      jsx('span', {
-                        'data-col': 'req',
-                        style: colStyle(56),
-                        title: 'requests in the window',
-                        children: `${fmtInt(requests)} req`
-                      }),
-                      jsx('span', {
-                        'data-col': 'tokens',
-                        style: colStyle(112),
-                        title: 'tokens in / out (cached %)',
-                        children: tokenColText(totals)
-                      }),
-                      jsx('span', {
-                        'data-col': 'lat',
-                        style: colStyle(48),
-                        title: 'latency p50',
-                        children: '—'
-                      }),
-                      jsx('span', {
-                        'data-col': 'ttft',
-                        style: colStyle(48),
-                        title: 'TTFT p50',
-                        children: '—'
-                      }),
-                      jsx('span', {
-                        'data-col': 'err',
-                        style: colStyle(32),
-                        title: 'errors in the window',
-                        children: fmtInt(roots.reduce((sum, row) => sum + (row.errors_5m || 0), 0))
-                      })
-                    ]
-                  }),
-                  models.map(model => jsx(ModelSubRow, { model, now, depth: true }, `profile-${model.lane_id}`))
-                ]
-              }),
-              roots.map(root =>
-                jsxs(
+              jsx(ProfileRow, { profile, roots: entries.map(entry => entry.root) }),
+              ...entries.map(({ root, children }) => {
+                const id = root.session_id || root.profile
+                const open = expanded.has(id)
+                const shown = open ? children : children.slice(0, AGENT_CHILD_LIMIT)
+                const hidden = children.length - shown.length
+                const live = (root.in_flight || 0) > 0 || children.some(child => (child.in_flight || 0) > 0)
+                return jsxs(
                   'div',
                   {
-                    className: 'flex flex-col gap-1',
+                    'data-agent-card-row': id,
+                    style: {
+                      display: 'flex',
+                      flexDirection: 'column',
+                      minWidth: 0,
+                      borderRadius: '10px',
+                      border: '1px solid var(--ui-stroke-secondary)',
+                      boxShadow: live ? `inset 3px 0 0 ${TONE_LOCAL}` : 'none',
+                      background: 'var(--ui-bg-quinary, transparent)',
+                      paddingBottom: children.length ? '6px' : 0
+                    },
                     children: [
-                      jsx(AgentRow, { row: root, labels, now }),
-                      (root.children || []).map(child =>
-                        jsx(AgentRow, { row: child, labels, now, depth: true }, `${root.session_id}-${child.session_id}`)
-                      )
+                      jsx(AgentRow, {
+                        row: root,
+                        labels,
+                        now,
+                        childCount: children.length,
+                        onHover,
+                        hovered: !!hover && hover.row === root
+                      }),
+                      children.length
+                        ? jsxs('div', {
+                            'data-subagents': String(children.length),
+                            style: {
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '1px',
+                              minWidth: 0,
+                              marginLeft: '14px',
+                              marginRight: '0',
+                              paddingLeft: '4px',
+                              borderLeft: '2px solid var(--ui-stroke-secondary)'
+                            },
+                            children: [
+                              ...shown.map(child =>
+                                jsx(AgentRow, {
+                                  row: child,
+                                  labels,
+                                  now,
+                                  depth: true,
+                                  onHover,
+                                  hovered: !!hover && hover.row === child
+                                }, `${id}-${child.session_id}`)
+                              ),
+                              hidden > 0 || open
+                                ? jsx('button', {
+                                    type: 'button',
+                                    'data-more-subagents': hidden > 0 ? String(hidden) : 'less',
+                                    onClick: () => toggle(id),
+                                    style: {
+                                      alignSelf: 'flex-start',
+                                      margin: '2px 0 0 10px',
+                                      padding: '1px 8px',
+                                      borderRadius: '999px',
+                                      border: '1px solid var(--ui-stroke-secondary)',
+                                      background: 'transparent',
+                                      cursor: 'pointer',
+                                      fontSize: '0.65rem',
+                                      color: 'var(--ui-text-tertiary)'
+                                    },
+                                    children: hidden > 0 ? `+${hidden} more` : 'show fewer'
+                                  })
+                                : null
+                            ]
+                          })
+                        : null
                     ]
                   },
-                  root.session_id
+                  id
                 )
-              )
+              })
             ]
           },
           profile
         )
-      })
+      ),
+      card
     ]
   })
 }
@@ -3255,6 +4177,8 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
   }
   const orphan = models.filter(model => model.lane !== 'cloud' &&
     (model.metrics === 'none' || !model.server_name))
+  const activeServers = servers.filter(server => !isQuietServer(server))
+  const quietServers = servers.filter(isQuietServer)
   const queued = servers.reduce((sum, server) => sum + (server.waiting || 0), 0)
   const used = servers.reduce((sum, server) => sum + (server.running || 0), 0)
   const total = servers.reduce((sum, server) => sum + (server.slots || 0), 0)
@@ -3305,9 +4229,33 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
           className: 'flex flex-col gap-2',
           children: [
             servers.length
-              ? jsx('div', {
-                  className: 'grid gap-2 xl:grid-cols-2',
-                  children: servers.map(server => jsx(ServerCard, { server, models, labels, now }, server.base_url || server.name))
+              ? jsxs('div', {
+                  style: { display: 'flex', flexDirection: 'column', gap: '8px', minWidth: 0 },
+                  children: [
+                    // Servers with Hermes traffic get full cards, two-up when
+                    // the panel is wide; quiet ones fold to one line below.
+                    activeServers.length
+                      ? jsx('div', {
+                          'data-server-grid': activeServers.length,
+                          style: {
+                            display: 'grid', gap: '8px', minWidth: 0,
+                            gridTemplateColumns: 'repeat(auto-fill, minmax(min(520px, 100%), 1fr))'
+                          },
+                          children: activeServers.map(server => jsx(ServerCard, {
+                            server, models, labels, now, snapshot, windowSeconds
+                          }, server.base_url || server.name))
+                        })
+                      : null,
+                    quietServers.length
+                      ? jsx('div', {
+                          'data-quiet-servers': quietServers.length,
+                          style: { display: 'flex', flexDirection: 'column', gap: '6px', minWidth: 0 },
+                          children: quietServers.map(server => jsx(ServerCard, {
+                            server, models, labels, now, snapshot, windowSeconds
+                          }, server.base_url || server.name))
+                        })
+                      : null
+                  ]
                 })
               : jsx('div', {
                   className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-4 text-[0.75rem] text-(--ui-text-quaternary)',
@@ -3432,7 +4380,11 @@ function ModelView({ snapshot, labels, now, windowSeconds, onHide, usageMap }) {
             label: 'Cloud lanes',
             meta: "only this machine's Hermes requests; providers don't publish server load",
             children: jsx('div', {
-              className: 'grid gap-2 xl:grid-cols-2',
+              'data-cloud-grid': cloudCards.length,
+              style: {
+                display: 'grid', gap: '8px', minWidth: 0,
+                gridTemplateColumns: 'repeat(auto-fill, minmax(min(360px, 100%), 1fr))'
+              },
               children: cloudCards.map(card => jsx(CloudCard, {
                 model: card.model, labels, now, windowSeconds, snapshot,
                 planUsage: card.planUsage, usageMap,
