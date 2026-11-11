@@ -46,6 +46,22 @@ jobs:
           PY
           python -m pip install -r "$RUNNER_TEMP/hermes-deps.txt" -r tests/requirements.txt
 
+      - name: Prove PyYAML is absent
+        run: |
+          # The plugin parses config.yaml with ruamel.yaml (the only YAML parser
+          # Hermes ships). Uninstalling PyYAML before the tests means an accidental
+          # `import yaml` fails loudly here instead of passing on a dev machine
+          # that happens to have PyYAML installed.
+          python -m pip uninstall -y pyyaml || true
+          python - <<'PY'
+          try:
+              import yaml  # noqa: F401
+          except ImportError:
+              print("PyYAML is not installed — plugin must use ruamel.yaml")
+          else:
+              raise SystemExit("PyYAML is still importable; the uninstall did not take")
+          PY
+
       - name: pytest
         run: python -m pytest -q
 

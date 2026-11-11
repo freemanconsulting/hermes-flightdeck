@@ -1,6 +1,8 @@
 """Machine-wide discovery: every profile's config.yaml, not just the active one."""
 
 import json
+import logging
+import sys
 from pathlib import Path
 
 import config
@@ -262,3 +264,99 @@ def test_stale_discovery_cache_shape_is_ignored(tmp_path, monkeypatch):
         assert payload["servers"][0]["name"] == "qwen3.5-9b"
     finally:
         conn.close()
+
+
+# --- YAML parsing uses ruamel.yaml, not PyYAML --------------------------------
+# Hermes ships ruamel.yaml and NOT PyYAML, so the discovery path must work in an
+# environment where `import yaml` fails.  Blocking `sys.modules["yaml"]` makes
+# any PyYAML import raise ImportError exactly as it would on a real Hermes venv.
+
+_PY_YAML = """
+providers:
+  ds4:
+    api: http://127.0.0.1:18010/v1
+    name: Studio DeepSeek
+plugins:
+  entries:
+    flightdeck:
+      settings:
+        servers:
+          - name: ds4
+            base_url: http://127.0.0.1:18010/v1
+"""
+
+
+def _block_pyyaml(monkeypatch):
+    """Make `import yaml` raise ImportError even if PyYAML is installed."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+
+def test_read_yaml_config_parses_without_pyyaml(tmp_path, monkeypatch):
+    _block_pyyaml(monkeypatch)
+    path = tmp_path / "config.yaml"
+    path.write_text(_PY_YAML, encoding="utf-8")
+
+    data = config._read_yaml_config(path)
+
+    assert data["providers"]["ds4"]["api"] == "http://127.0.0.1:18010/v1"
+    servers = data["plugins"]["entries"]["flightdeck"]["settings"]["servers"]
+    assert servers[0]["base_url"] == "http://127.0.0.1:18010/v1"
+    # typ="safe" gives plain containers — callers do json.dumps/duck-typing on them
+    assert type(data) is dict
+    assert type(servers) is list
+    assert type(servers[0]) is dict
+
+
+def test_discovery_and_declared_servers_work_without_pyyaml(tmp_path, monkeypatch):
+    """The snapshot's server union yields the declared server with PyYAML blocked."""
+    _block_pyyaml(monkeypatch)
+    root = _root(tmp_path, monkeypatch)
+    _write(root / "config.yaml", _PY_YAML)
+
+    assert config._read_yaml_config(root / "config.yaml") != {}
+    # _declared_servers() is the union config.load()/the snapshot builds cards from
+    assert [server["name"] for server in config._declared_servers()] == ["ds4"]
+    assert config._declared_servers()[0]["base_url"] == "http://127.0.0.1:18010"
+
+    discovered = config.discover(config=None)
+    assert [server["name"] for server in discovered] == ["ds4"]
+
+
+def test_malformed_yaml_returns_empty_and_warns_once(tmp_path, monkeypatch, caplog):
+    """A broken config.yaml is {} — but never silently: one WARNING names the file."""
+    monkeypatch.setattr(config, "_WARNED_UNREADABLE", set())
+    path = tmp_path / "config.yaml"
+    path.write_text("providers:\n  ds4: [unclosed\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger=config.logger.name):
+        assert config._read_yaml_config(path) == {}
+        assert config._read_yaml_config(path) == {}  # second read stays quiet
+
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(path) in warnings[0].getMessage()
+    assert "invalid YAML" in warnings[0].getMessage()
+
+
+def test_non_mapping_yaml_returns_empty_and_warns(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(config, "_WARNED_UNREADABLE", set())
+    path = tmp_path / "config.yaml"
+    path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger=config.logger.name):
+        assert config._read_yaml_config(path) == {}
+
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "not a mapping" in warnings[0].getMessage()
+
+
+def test_missing_and_empty_config_files_are_silent(tmp_path, caplog):
+    """Absent and blank files are normal states: {} and no WARNING."""
+    with caplog.at_level(logging.WARNING, logger=config.logger.name):
+        assert config._read_yaml_config(tmp_path / "nope" / "config.yaml") == {}
+        empty = tmp_path / "config.yaml"
+        empty.write_text("   \n", encoding="utf-8")
+        assert config._read_yaml_config(empty) == {}
+    assert not [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+

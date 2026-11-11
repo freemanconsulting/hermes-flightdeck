@@ -63,7 +63,8 @@ subagent row carries a placement chip naming the lane it actually ran on.
 
 Four subagents filled ds4 (4/4); the fifth and sixth were placed on GN100.
 
-Demo video (89 s, recorded live on a real local fleet): [docs/img/demo.mp4](docs/img/demo.mp4).
+Demo video (89 s, recorded live on a real local fleet): [demo.mp4](https://github.com/freemanconsulting/hermes-flightdeck/releases/download/demo-video/demo.mp4)
+(a release asset, so installing the plugin does not download it).
 
 Requires Hermes **0.22.5** or newer (the delegation-provider seam used by capacity routing).
 

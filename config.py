@@ -274,35 +274,74 @@ def _hermes_root() -> Path:
         return Path(env).expanduser() if env else Path.home() / ".hermes"
 
 
+def _load_yaml(text: str) -> Any:
+    """Parse YAML text with ruamel's safe loader — the parser Hermes ships.
+
+    ``ruamel.yaml`` is a Hermes core dependency and a public package; we import
+    it directly rather than through a Hermes-internal shim (catalog rule 9:
+    public surfaces only). ``typ="safe"`` returns plain dict/list/scalar types.
+    Platforms without the libyaml C extension (e.g. Windows ARM64) raise at
+    construction/parse time, so retry with ``pure=True``.
+    """
+    from ruamel.yaml import YAML
+
+    try:
+        return YAML(typ="safe").load(text)
+    except Exception:
+        # Only a missing/broken C extension is retried pure; a parse error is
+        # raised identically by both parsers and re-raised by the retry.
+        return YAML(typ="safe", pure=True).load(text)
+
+
 def _read_yaml_config(path: Path) -> dict:
     """Parse one config.yaml read-only; unreadable or non-mapping files are {}.
 
-    PyYAML is a Hermes dependency, so it is the only parser used. If it is ever
-    missing, skip the YAML profiles rather than importing Hermes core (catalog
-    rule 9: public surfaces only).
+    A failure is never silent: every path that yields {} without the file simply
+    being absent/empty gets one WARNING (deduped per path) naming the file.
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        _warn_unreadable(path, f"unreadable ({exc.__class__.__name__})")
+        return {}
+    if not text.strip():
         return {}
     try:
-        import yaml
-    except ImportError:
-        logger.debug("flightdeck: PyYAML unavailable; skipping %s", path)
+        data = _load_yaml(text)
+    except Exception as exc:
+        _warn_unreadable(path, f"invalid YAML ({exc.__class__.__name__})")
         return {}
-    try:
-        data = yaml.safe_load(text)
-    except Exception:
+    if not isinstance(data, dict):
+        if data is not None:
+            _warn_unreadable(path, f"top-level is {type(data).__name__}, not a mapping")
         return {}
-    return data if isinstance(data, dict) else {}
+    return data
+
+
+_WARNED_UNREADABLE: set[str] = set()
+
+
+def _warn_unreadable(path: Path, why: str) -> None:
+    """One WARNING per path (then DEBUG) so a broken config is seen but not spammed."""
+    key = str(path)
+    if key in _WARNED_UNREADABLE:
+        logger.debug("flightdeck: config %s skipped: %s", path, why)
+        return
+    _WARNED_UNREADABLE.add(key)
+    logger.warning(
+        "flightdeck: skipping config file %s — %s; no server cards, fleet_status "
+        "lanes, or capacity routes will come from it", path, why)
 
 
 def _config_sources(config: Optional[dict] = None) -> list[tuple[str, dict]]:
     """(profile label, config) for the root and every profile, root first.
 
-    Reads the files directly with a YAML safe load — never ``load_config_readonly``,
-    which would touch the active profile's cache. A supplied *config* stands in for
-    the root config.yaml so callers and tests can pin it without touching disk.
+    Reads the files directly with the ruamel safe loader — never
+    ``load_config_readonly``, which would touch the active profile's cache. A
+    supplied *config* stands in for the root config.yaml so callers and tests can
+    pin it without touching disk.
     """
     root = _hermes_root()
     sources: list[tuple[str, dict]] = []
