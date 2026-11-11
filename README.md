@@ -32,10 +32,16 @@ who is waiting for it, and which agent is holding it.
   sparkline, which agents are holding it, and a quota line from `session.stats` for the
   focused session only.
 
+![Server cards](docs/img/server-cards.png)
+
+![Cloud lanes](docs/img/cloud-cards.png)
+
 **Swim lane.** One lane per local server with traffic, then one per cloud model. Each request
 is a stacked bar: dim prefill from start to first token, bright decode after it, and a
 uniform hatched bar for a whole response with no first chunk. In-flight bars grow with the
 clock; throughput history sits behind them.
+
+![Swim lane](docs/img/swim-lane.png)
 
 ![By agent](docs/img/by-agent.png)
 
@@ -53,7 +59,13 @@ slots, p50 TTFT and a recommended pick; `/fleet` returns the same as one line.
 `<backend>`, off or unavailable, plus the last five placements (from → to, reason, goal). A
 subagent row carries a placement chip naming the lane it actually ran on.
 
-![Demo](docs/img/demo.gif)
+![Routing](docs/img/routing.png)
+
+Four subagents filled ds4 (4/4); the fifth and sixth were placed on GN100.
+
+Demo video (89 s, recorded live on a real local fleet): [docs/img/demo.mp4](docs/img/demo.mp4).
+
+Requires Hermes **0.22.5** or newer (the delegation-provider seam used by capacity routing).
 
 ## How it compares
 
@@ -132,9 +144,26 @@ you declare in its settings, or that it auto-discovers from your own provider co
 and private addresses only by default), at most once per server per poll interval (5 s by
 default, 2 s floor, 2 s timeout). It reads every profile's `config.yaml` read-only — the root
 profile and every profile under `profiles/*` — to find those providers and its own declared
-server settings; it never writes to them. No telemetry, no network calls to third-party
-services, no shell commands, no credential reads. Quota shown on cloud cards comes from the
-public `session.stats` RPC for the focused session only, and is labelled as such.
+server settings; it never writes to them. Those files can contain provider `api_key` values:
+Flightdeck uses only provider base URLs, model names and its own settings from them, and never
+stores, logs or sends a key. On llama.cpp servers it also reads `/props` (context size).
+
+Reads outside its own data, all read-only and local:
+- every profile's `state.db` (`sessions` table: title, source, start time) to label agent rows;
+- Hermes RPCs from the Desktop page: `session.list` (titles and previews for labels),
+  `model.options` (provider plan-usage windows, the same data as `hermes usage`) and
+  `session.stats` (focused-session quota fallback);
+- request rows also keep a subagent's goal text (from the `subagent_start` hook) and a clipped
+  error message for failed requests.
+
+Writes outside its own data: the Desktop page saves the last good plan-usage reading in the
+renderer's `localStorage` (key `flightdeck.lastGoodUsage`, kept 15 minutes), and its "Hide"
+button writes the plugin's own `hidden_servers` setting through `plugins.manage`.
+
+No background process: server probes run in short-lived worker threads when the page or a tool
+asks for a snapshot. No telemetry, no network calls to third-party services, no shell commands,
+no credential files read. Setting `FLIGHTDECK_DEMO=1` (or `demo_mode`) serves seeded sample
+data instead of live readings.
 
 Capacity routing is opt-in and off by default. When enabled, it changes where `delegate_task`
 subagents run: each task is placed on a local server with free slots instead of the configured

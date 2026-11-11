@@ -23,12 +23,21 @@ def plugin_api():
     return module
 
 
+# ``time.monotonic()`` is uptime on Linux, so a freshly-booted CI runner can
+# report a moment smaller than the 60 s interval; resetting the rate-limits to
+# 0.0 then leaves the sweep/warn early-returned and the test silently captures
+# nothing.  A large negative sentinel opens the interval on any clock origin.
+_INTERVAL_OPEN = -1e9
+
+
 class _Recorder:
     def __init__(self, raises: bool = False):
         self.calls: list[tuple[str, object]] = []
+        self.attempts = 0
         self._raises = raises
 
     def warning(self, message, exc_info=None):
+        self.attempts += 1
         if self._raises:
             raise RuntimeError("logging backend is broken")
         self.calls.append((message, exc_info))
@@ -55,8 +64,8 @@ def test_maybe_sweep_logs_the_exception_and_never_raises(plugin_api, monkeypatch
     monkeypatch.setattr(plugin_api, "logger", recorder)
 
     for _ in range(2):  # a second sweep must not raise either
-        plugin_api._LAST_SWEEP = 0.0
-        plugin_api._WARN_AT = 0.0
+        plugin_api._LAST_SWEEP = _INTERVAL_OPEN
+        plugin_api._WARN_AT = _INTERVAL_OPEN
         plugin_api._maybe_sweep(None)
 
     assert [message for message, _ in recorder.calls] == [
@@ -65,10 +74,12 @@ def test_maybe_sweep_logs_the_exception_and_never_raises(plugin_api, monkeypatch
 
 
 def test_warn_survives_a_broken_logging_backend(plugin_api, monkeypatch):
-    monkeypatch.setattr(plugin_api, "logger", _Recorder(raises=True))
-    plugin_api._WARN_AT = 0.0
+    recorder = _Recorder(raises=True)
+    monkeypatch.setattr(plugin_api, "logger", recorder)
+    plugin_api._WARN_AT = _INTERVAL_OPEN
 
     plugin_api._warn("flightdeck: store sweep failed", ValueError("boom"))  # no raise
+    assert recorder.attempts == 1  # the broken backend was actually exercised
 
 
 @pytest.mark.parametrize("window, seconds", [
