@@ -114,6 +114,41 @@ def test_tensorfold_gn100_live():
     assert snap.memory_peak_bytes == 108580588870
 
 
+def test_tensorfold_running_excludes_queued_connections():
+    """live.connections counts every open request, queued ones included.
+
+    Live /health with max_batch_size=4 and connections=5 must not render as
+    5/4 slots: queued requests belong in waiting, not running.
+    """
+    base = load("tensorfold-ds4", "health.json")
+    metrics = load("tensorfold-ds4", "metrics.txt")
+
+    def snap_with(connections: int, waiting: int):
+        health = json.loads(json.dumps(base))
+        health["live"]["connections"] = connections
+        health["live"]["waiting"] = waiting
+        return normalize("tensorfold", {"/health": health, "/metrics": metrics})
+
+    snap = snap_with(connections=5, waiting=1)
+    assert snap.running == 4  # 5 open - 1 queued, capped at max_batch_size=4
+    assert snap.waiting == 1
+    assert snap.slots == 4
+
+    snap = snap_with(connections=5, waiting=2)
+    assert snap.running == 3  # 5 open - 2 queued
+    assert snap.waiting == 2
+
+    # Excess beyond slots is waiting, not running.
+    snap = snap_with(connections=7, waiting=0)
+    assert snap.running == 4
+    assert snap.waiting == 3
+
+    # connections < waiting clamps running at 0 instead of going negative.
+    snap = snap_with(connections=2, waiting=3)
+    assert snap.running == 0
+    assert snap.waiting == 3
+
+
 def test_tensorfold_metrics_only_still_reports_load():
     responses = {"metrics": load("tensorfold-ds4", "metrics.txt")}
     assert detect_kind(responses) == "tensorfold"

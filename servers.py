@@ -464,6 +464,15 @@ def _normalize_tensorfold(responses: dict[str, Any], snap: Snapshot) -> None:
     if snap.waiting is None:
         snap.waiting = _sum_int(metrics, "tensorfold:requests_waiting", "tensorfold:num_requests_waiting")
     snap.slots = _int(health.get("max_batch_size")) if isinstance(health, dict) else None
+    # TensorFold's live.connections counts every open request, queued ones
+    # included, so it is not "running".  Subtract the queue and cap at slots:
+    # anything beyond max_batch_size is waiting, not running.
+    if snap.running is not None and "connections" in live:
+        if snap.waiting is not None:
+            snap.running = max(0, snap.running - snap.waiting)
+        if snap.slots is not None and snap.slots >= 0:
+            snap.waiting = max(snap.waiting or 0, snap.running - snap.slots)
+            snap.running = min(snap.running, snap.slots)
     snap.decode_tps = _float(live.get("decode_tokens_per_second"))
     snap.prefill_tps = _float(live.get("prefill_tokens_per_second"))
     snap.prompt_tokens_total = _sum_int(metrics, "tensorfold:prompt_tokens_total")
