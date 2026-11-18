@@ -158,9 +158,75 @@ def test_close_own_stale_only_own_pid_and_host(conn):
     store.record_pre(conn, **pre_kwargs(api_request_id="other", pid=1, host="elsewhere",
                                         started_at=NOW - 10))
     assert store.close_own_stale(conn, now=NOW) == 1
-    rows = {row["api_request_id"]: row["status"] for row in conn.execute(
-        "SELECT api_request_id, status FROM requests").fetchall()}
-    assert rows == {"own": "abandoned", "other": "in-flight"}
+    rows = {row["api_request_id"]: (row["status"], row["ended_at"], row["updated_at"])
+            for row in conn.execute(
+                "SELECT api_request_id, status, ended_at, updated_at FROM requests").fetchall()}
+    # A closed row always gets ended_at: either a real end or, for a row
+    # closed while still in flight, the sweep moment — never NULL, so no UI
+    # ever draws it as running.
+    assert rows["own"][0] == "abandoned"
+    assert rows["own"][1] is not None
+    assert rows["other"] == ("in-flight", None, rows["other"][2])
+
+
+def _pid_gone():
+    """A pid that does not exist on this machine (pid 0 is invalid to os.kill;
+    scan upward from a high value for one that raises ProcessLookupError)."""
+    for candidate in range(4_000_000, 4_100_000):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except PermissionError:
+            continue
+        except OSError:
+            continue
+    pytest.skip("no dead pid found")
+
+
+def test_close_dead_pid_rows_closes_dead_pid_at_startup(conn):
+    """A dashboard restart leaves the OLD pid's rows in-flight forever; the new
+    process must close them at startup with ended_at set."""
+    dead = _pid_gone()
+    store.record_pre(conn, **pre_kwargs(api_request_id="ghost", pid=dead,
+                                        host=socket.gethostname(), started_at=NOW - 600))
+    assert store.close_dead_pid_rows(conn, now=NOW) == 1
+    row = conn.execute("SELECT status, ended_at FROM requests").fetchone()
+    assert row["status"] == "abandoned"
+    # ended_at is the row's last known activity (updated_at), not `now`.
+    assert row["ended_at"] is not None
+
+
+def test_close_dead_pid_rows_keeps_live_other_pid(conn):
+    """A genuinely live request from another live process is never reaped —
+    unlike the age-based close_stale, liveness is by pid, not age."""
+    store.record_pre(conn, **pre_kwargs(api_request_id="neighbour", pid=os.getppid(),
+                                        host=socket.gethostname(), started_at=NOW - 600))
+    assert store.close_dead_pid_rows(conn, now=NOW) == 0
+    row = conn.execute("SELECT status, ended_at FROM requests").fetchone()
+    assert row["status"] == "in-flight"
+    assert row["ended_at"] is None
+
+
+def test_close_dead_pid_rows_ignores_other_hosts(conn):
+    """Rows from another host are left to the age-based close_stale."""
+    dead = _pid_gone()
+    store.record_pre(conn, **pre_kwargs(api_request_id="remote", pid=dead,
+                                        host="some-other-box", started_at=NOW - 600))
+    assert store.close_dead_pid_rows(conn, now=NOW) == 0
+    row = conn.execute("SELECT status FROM requests").fetchone()
+    assert row["status"] == "in-flight"
+
+
+def test_sweep_closes_dead_pid_rows(conn):
+    """The page-poll sweeper also reaps dead-pid rows, not just aged ones."""
+    dead = _pid_gone()
+    store.record_pre(conn, **pre_kwargs(api_request_id="ghost", pid=dead,
+                                        host=socket.gethostname(), started_at=NOW - 60))
+    store.sweep(conn, now=NOW)
+    row = conn.execute("SELECT status, ended_at FROM requests").fetchone()
+    assert row["status"] == "abandoned"
+    assert row["ended_at"] is not None
 
 
 def test_sweep_rolls_up_minutes_and_prunes(conn):

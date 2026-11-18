@@ -2201,14 +2201,14 @@ function requestTooltip(request, labels, snapshot, lane) {
   const ttft = request.first_chunk_at != null && request.started_at != null
     ? Math.max(0, request.first_chunk_at - request.started_at) * 1000
     : null
-  const genEnd = request.ended_at != null ? request.ended_at : Date.now() / 1000
+  const genEnd = requestEnd(request, Date.now() / 1000)
   const genSpan = request.first_chunk_at != null ? Math.max(0, genEnd - request.first_chunk_at) : null
   // A generating span under half a second makes tok/s meaningless (a whole
   // response's span is ~0 s and once read as 60,337 tok/s); skip the rate.
   const generating = genSpan != null && genSpan >= 0.5 && request.completion_tokens != null
     ? request.completion_tokens / genSpan
     : null
-  const inFlightRow = request.ended_at == null
+  const inFlightRow = isLiveRequest(request)
   const whole = !inFlightRow && isWholeResponse(request)
   const waitingSoFar = inFlightRow && request.first_chunk_at == null && request.started_at != null
     ? Math.max(0, Date.now() / 1000 - request.started_at) * 1000
@@ -2220,7 +2220,7 @@ function requestTooltip(request, labels, snapshot, lane) {
     : (generating != null
         ? `first token after ${fmtMs(ttft)} · generated ${fmtInt(request.completion_tokens)} tok at ${fmtRate(generating)} tok/s`
         : `first token after ${fmtMs(ttft)}${request.completion_tokens != null ? ` · generated ${fmtInt(request.completion_tokens)} tok` : ''}`)
-  const inFlight = request.ended_at == null
+  const inFlight = isLiveRequest(request)
   const status = inFlight ? 'running' : (/error/i.test(String(request.status || '')) ? 'error' : 'finished')
   return [
     agent,
@@ -2239,11 +2239,11 @@ function requestCardFacts(request, labels, snapshot, lane, rowBySession) {
   const agentRow = map.get(request.session_id) ||
     { kind: request.kind, profile: request.profile, session_id: request.session_id }
   const nowS = Date.now() / 1000
-  const inFlight = request.ended_at == null
+  const inFlight = isLiveRequest(request)
   // 'Not streamed' is a verdict on a FINISHED row only. An in-flight row with
   // no first chunk yet is still waiting: its wait so far, generating '—'.
   const whole = !inFlight && isWholeResponse(request)
-  const end = inFlight ? nowS : request.ended_at
+  const end = requestEnd(request, nowS)
   const firstAt = request.first_chunk_at != null ? request.first_chunk_at : null
   const waited = request.started_at != null
     ? Math.max(0, (whole || firstAt == null ? end : firstAt) - request.started_at)
@@ -2377,6 +2377,26 @@ function isWholeResponse(request) {
   return first >= end - 0.25
 }
 
+// The single 'is this row actually running' predicate for the UI. A row is
+// live ONLY when the backend still reports it 'in-flight': a row abandoned by
+// the sweeper can still carry ended_at NULL (closed before any end was
+// recorded), and drawing such a row to `now` renders a dead request as a live,
+// pulsing bar. A non-in-flight row with null ended_at ends at its last known
+// activity (updated_at), or at started_at when even that is missing.
+function isLiveRequest(request) {
+  return !!request && request.status === 'in-flight' && request.ended_at == null
+}
+
+// Render end for a row: ended_at when set; `liveEnd` (win.end / now) only for
+// truly live rows; otherwise the last timestamp the store recorded.
+function requestEnd(request, liveEnd) {
+  if (!request) return liveEnd
+  if (request.ended_at != null) return request.ended_at
+  if (isLiveRequest(request)) return liveEnd
+  return request.updated_at != null ? request.updated_at
+    : (request.started_at != null ? request.started_at : liveEnd)
+}
+
 // The cloud card's decode/prefill series, derived from Hermes' OWN per-request
 // rows — the provider publishes no server throughput for a cloud lane, so this
 // is the only honest tok/s history a cloud card can show. Each row spreads its
@@ -2399,7 +2419,7 @@ function cloudSamplesFromRequests(requests, winStart, winEnd) {
   let hi = winEnd
   for (const row of rows) {
     if (row.started_at < lo) lo = row.started_at
-    const end = row.ended_at != null ? row.ended_at : winEnd
+    const end = requestEnd(row, winEnd)
     if (end > hi) hi = end
   }
   const span = Math.max(CLOUD_SAMPLE_SECONDS, hi - lo)
@@ -2424,7 +2444,7 @@ function cloudSamplesFromRequests(requests, winStart, winEnd) {
   }
   for (const row of rows) {
     const start = row.started_at
-    const end = row.ended_at != null ? row.ended_at : winEnd
+    const end = requestEnd(row, winEnd)
     if (!(end > start)) continue
     const streamed = !isWholeResponse(row)
     const genStart = streamed ? row.first_chunk_at : start
@@ -2460,7 +2480,7 @@ function stackBars(requests, win) {
   const rowEnds = []
   for (const request of requests || []) {
     const start = Math.max(win.start, request.started_at)
-    const end = request.ended_at != null ? Math.min(win.end, request.ended_at) : win.end
+    const end = Math.min(win.end, requestEnd(request, win.end))
     let slot = rowEnds.findIndex(ends => ends <= start)
     if (slot < 0) {
       slot = rowEnds.length
@@ -2551,7 +2571,7 @@ function swimLanes(snapshot, windowSeconds, now) {
   const models = Array.isArray(snapshot && snapshot.models) ? snapshot.models : []
   const lanes = []
   const requestRows = rows => (Array.isArray(rows) ? rows : [])
-    .filter(row => row && row.started_at != null && (row.ended_at == null || row.ended_at >= win.start))
+    .filter(row => row && row.started_at != null && (requestEnd(row, win.end) >= win.start || isLiveRequest(row)))
     .sort((a, b) => a.started_at - b.started_at)
     // Newest-first: backend caps can drop the oldest, never the most recent.
     .slice(-120)
@@ -2912,7 +2932,7 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
           ctx2.fillRect(x1, barY, Math.max(1, split - x1), rowH)
           ctx2.globalAlpha = 0.9
           ctx2.fillRect(split, barY, Math.max(1, x2 - split), rowH)
-          if (request.ended_at == null) {
+          if (isLiveRequest(request)) {
             // In-flight growing edge: a brighter cap that pulses with the clock.
             ctx2.globalAlpha = 0.55 + 0.35 * Math.abs(Math.sin(win.end / 420))
             ctx2.fillStyle = color
@@ -2939,7 +2959,7 @@ function drawSwimLane(ctx2, width, height, lanes, win, canvas, labels, rowBySess
         const chipH = rowH >= 12 ? 18 : 16
         const named = new Set()
         const candidates = hits.slice(laneHitStart)
-          .map(hit => ({ hit, live: hit.request.ended_at == null }))
+          .map(hit => ({ hit, live: isLiveRequest(hit.request) }))
           .sort((a, b) => (Number(b.live) - Number(a.live)) || (b.hit.w - a.hit.w))
         ctx2.font = theme.chipFont
         for (const { hit, live } of candidates) {

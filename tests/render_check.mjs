@@ -84,7 +84,7 @@ const factory = new Function(
   'Skeleton', 'StatusDot', 'cn', 'host', 'profileColor', 'useQuery', 'useValue',
   'PALETTE_AREA', 'ROUTES_AREA', 'SIDEBAR_NAV_AREA', 'STATUSBAR_AREAS',
   'useEffect', 'useMemo', 'useRef', 'useState', 'jsx', 'jsxs',
-  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, mergeProviderUsage, planFingerprint, requestTooltip, modelDisplayName }`
+  `${body}\nreturn { plugin, FlightdeckPage, ModelView, AgentView, SwimLane, ServerCard, CloudCard, PlanUsage, drawSwimLane, swimLanes, Section, unreachableReason, useProviderUsage, providerUsageToQuota, mergeProviderUsage, planFingerprint, requestTooltip, modelDisplayName, stackBars, isLiveRequest, requestEnd }`
 )
 const mod = factory(
   atom, Badge, Button, Component, EmptyState, Component, Component, Component,
@@ -154,6 +154,30 @@ check('swim lane has ≥1 cloud lane', cloudLanes.length >= 1, `${cloudLanes.len
 check('cloud lane draws its traffic (per-request bars, or bucket columns as fallback)', cloudLanes.length > 0 && cloudLanes.every(lane => lane.bars.length >= 1), cloudLanes.map(l => `${l.label}: ${l.bars.length} ${l.ticks ? 'buckets' : 'bars'}`).join(', '))
 check('cloud bucket fallback columns scale to the max bucket, not the total', cloudLanes.every(lane => !lane.ticks || lane.concurrency === Math.max(...lane.bars.map(b => b.count))), cloudLanes.filter(l => l.ticks).map(l => `peak ${l.concurrency}`).join(', ') || 'no fallback lane in fixture')
 check('non-streamed requests are whole-response bars', studio && studio.bars.some(bar => bar.whole), studio ? `${studio.bars.filter(b => b.whole).length} whole` : 'lane missing')
+// 1b. An abandoned row whose ended_at is still null (closed by the sweeper
+//     before any end was recorded) must NOT render as a live bar growing to
+//     `now`: stackBars ends it at its last known activity (updated_at).
+{
+  const nowS = fixture.generated_at
+  const ghost = { session_id: 'ghost', started_at: nowS - 500, first_chunk_at: null,
+    ended_at: null, updated_at: nowS - 300, status: 'abandoned', completion_tokens: 10 }
+  const live = { session_id: 'live', started_at: nowS - 30, first_chunk_at: null,
+    ended_at: null, updated_at: nowS, status: 'in-flight', completion_tokens: 5 }
+  const win = { start: nowS - 600, end: nowS, seconds: 600, since: nowS - 600 }
+  const bars = mod.stackBars([ghost, live], win)
+  const ghostBar = bars.find(b => b.request.session_id === 'ghost')
+  const liveBar = bars.find(b => b.request.session_id === 'live')
+  check('abandoned row with null ended_at stops at updated_at, not now',
+    ghostBar && ghostBar.end === nowS - 300 && !mod.isLiveRequest(ghost.request ?? ghost),
+    ghostBar ? `end ${ghostBar.end} (now ${nowS})` : 'bar missing')
+  check('in-flight row with null ended_at still grows to now',
+    liveBar && liveBar.end === nowS && mod.isLiveRequest(live),
+    liveBar ? `end ${liveBar.end}` : 'bar missing')
+  check('a non-in-flight row with null ended_at ends at updated_at via requestEnd',
+    mod.requestEnd(ghost, nowS) === nowS - 300
+      && mod.requestEnd(live, nowS) === nowS,
+    `${mod.requestEnd(ghost, nowS)} / ${mod.requestEnd(live, nowS)}`)
+}
 
 // 2. Swim lane draw: bars actually reach the canvas.
 globalThis.getComputedStyle = () => ({
@@ -1327,10 +1351,17 @@ const shortRequest = { ...streamedRequest, first_chunk_at: fixture.generated_at 
 const shortTooltip = mod.requestTooltip(shortRequest, labels, holderSnap, laneForTooltip)
 check('tok/s skipped when the generating span is under 0.5 s',
   !shortTooltip.includes('tok/s') && shortTooltip.includes('first token after'), shortTooltip)
-const runningRequest = { ...streamedRequest, ended_at: null }
+const runningRequest = { ...streamedRequest, status: 'in-flight', ended_at: null }
 const runningTooltip = mod.requestTooltip(runningRequest, labels, holderSnap, laneForTooltip)
 check('in-flight tooltip status is running, never done',
   runningTooltip.split('\n')[4] === 'running' && !runningTooltip.includes('done'), runningTooltip.split('\n')[4])
+const abandonedNullEnd = { ...streamedRequest, status: 'abandoned', ended_at: null,
+  updated_at: fixture.generated_at - 10 }
+const abandonedTooltip = mod.requestTooltip(abandonedNullEnd, labels, holderSnap, laneForTooltip)
+check('abandoned row with null ended_at is never rendered as running',
+  abandonedTooltip.split('\n')[4] === 'finished'
+    && !abandonedTooltip.includes('so far') && !abandonedTooltip.includes('running'),
+  abandonedTooltip.split('\n').join(' | '))
 const titleEl = elements(mod.CloudCard({ model: cloudModel, labels,
   now: fixture.generated_at * 1000, windowSeconds: 300, snapshot: cloudSnap }))
   .find(el => el.props.title === 'claude-subscription-directsdk-experimental/claude-opus-5-5[1m]')

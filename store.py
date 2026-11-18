@@ -497,16 +497,63 @@ def record_subagent_stop(conn: sqlite3.Connection, **kw: Any) -> None:
 # ─── stale closure ──────────────────────────────────────────────────────────
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if *pid* exists on this machine (ProcessLookupError → dead)."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except (OSError, ValueError, TypeError):
+        return True  # anything else: assume alive, never reap on a maybe
+
+
 def close_own_stale(conn: sqlite3.Connection, now: Optional[float] = None) -> int:
     """Mark this host+pid's crashed in-flight rows abandoned (started > 5 s ago)."""
     profile, pid, host = _identity()
     moment = float(now if now is not None else time.time())
     cursor = _write(conn, lambda: conn.execute(
-        "UPDATE requests SET status = 'abandoned', updated_at = ? "
+        "UPDATE requests SET status = 'abandoned', "
+        "ended_at = COALESCE(ended_at, updated_at), updated_at = ? "
         "WHERE status = 'in-flight' AND host = ? AND pid = ? AND started_at < ?",
         (moment, host, pid, moment - 5.0),
     ))
     return cursor.rowcount
+
+
+def close_dead_pid_rows(conn: sqlite3.Connection, now: Optional[float] = None) -> int:
+    """Close this host's in-flight rows whose recording process is dead.
+
+    After a restart the previous pid's rows would otherwise stay ``in-flight``
+    forever: ``close_own_stale`` only sees the *current* pid, and the age-based
+    ``close_stale`` would also kill genuinely long-running live requests. Here
+    only rows from a *different* pid on *this* host are probed with
+    ``os.kill(pid, 0)``; a dead pid's row is abandoned with ``ended_at`` set to
+    its last known activity (``updated_at``) so no UI treats it as running.
+    Rows from other hosts are left to the age-based ``close_stale``.
+    """
+    _, pid, host = _identity()
+    moment = float(now if now is not None else time.time())
+    rows = conn.execute(
+        "SELECT DISTINCT pid FROM requests "
+        "WHERE status = 'in-flight' AND host = ? AND pid != ?",
+        (host, pid),
+    ).fetchall()
+    closed = 0
+    for row in rows:
+        other = int(row[0])
+        if _pid_alive(other):
+            continue
+        cursor = _write(conn, lambda other=other: conn.execute(
+            "UPDATE requests SET status = 'abandoned', "
+            "ended_at = COALESCE(ended_at, updated_at), updated_at = ? "
+            "WHERE status = 'in-flight' AND host = ? AND pid = ?",
+            (moment, host, other),
+        ))
+        closed += cursor.rowcount
+    return closed
 
 
 def close_stale(conn: sqlite3.Connection, stale_after: float = 300.0,
@@ -514,7 +561,8 @@ def close_stale(conn: sqlite3.Connection, stale_after: float = 300.0,
     """Mark every in-flight row older than *stale_after* abandoned (any pid)."""
     moment = float(now if now is not None else time.time())
     cursor = _write(conn, lambda: conn.execute(
-        "UPDATE requests SET status = 'abandoned', updated_at = ? "
+        "UPDATE requests SET status = 'abandoned', "
+        "ended_at = COALESCE(ended_at, updated_at), updated_at = ? "
         "WHERE status = 'in-flight' AND started_at < ?",
         (moment, moment - float(stale_after)),
     ))
@@ -575,6 +623,7 @@ def sweep(conn: sqlite3.Connection, retention_hours: float = 24, rollup_days: fl
     The 60 s cadence guard lives in the backend (``meta.last_sweep``).
     """
     moment = float(now if now is not None else time.time())
+    dead_closed = close_dead_pid_rows(conn, now=moment)
     closed = close_stale(conn, stale_after, now=moment)
     cursor = _write(conn, lambda: conn.execute(_ROLLUP_SQL, (moment - 120.0,)))
     rolled = cursor.rowcount
@@ -606,7 +655,7 @@ def sweep(conn: sqlite3.Connection, retention_hours: float = 24, rollup_days: fl
     meta_set(conn, "last_sweep", moment)
     return {
         "rolled_up": rolled,
-        "closed_stale": closed,
+        "closed_stale": closed + dead_closed,
         "deleted_rows": deleted_rows,
         "deleted_samples": deleted_samples,
         "deleted_rollups": deleted_rollups,
@@ -927,7 +976,7 @@ __all__ = [
     "record_subagent_start", "record_subagent_stop",
     "record_server_sample", "record_server_samples",
     "record_decision", "decisions_since", "last_decision", "decisions_for_links",
-    "close_own_stale", "close_stale", "sweep",
+    "close_own_stale", "close_dead_pid_rows", "close_stale", "sweep",
     "window_rows", "in_flight_rows", "agent_nodes", "model_nodes",
     "server_samples_since", "health",
 ]

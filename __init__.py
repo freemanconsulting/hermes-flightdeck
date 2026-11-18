@@ -45,6 +45,7 @@ def register(ctx) -> None:
     """Called once by the plugin loader."""
     conn = store.open_store()
     store.close_own_stale(conn)
+    store.close_dead_pid_rows(conn)
     hooks.register_all(ctx, conn, None)
     ctx.register_tool(
         name="fleet_status", toolset="flightdeck", schema=schemas.FLEET_STATUS_SCHEMA,
